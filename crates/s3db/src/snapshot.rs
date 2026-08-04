@@ -21,9 +21,7 @@
 use crate::backend::Backend;
 use crate::cipher::Cipher;
 use crate::collection::Collection;
-#[cfg(test)]
-use crate::payload::get_json;
-use crate::payload::{delete_object, put_json};
+use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -143,6 +141,22 @@ impl ReadSnapshot {
         }
         Ok(value)
     }
+}
+
+/// Every currently-registered lease, for [`crate::gc::sweep`] to check
+/// before pruning a `.history/` entry -- a lease past its own
+/// `max_duration_ms` is excluded (its `ReadSnapshot` was only ever entitled
+/// to protection for that long, whether or not `close` was ever called).
+pub async fn list_leases(backend: &dyn Backend, cipher: &Cipher) -> Result<Vec<SnapshotLease>> {
+    let now = now_ms();
+    let mut leases = Vec::new();
+    for key in list_all_keys(backend, &format!("{SNAPSHOT_PREFIX}/")).await? {
+        let (lease, etag) = get_json::<SnapshotLease>(backend, &key, cipher).await?;
+        if etag.is_some() && now.saturating_sub(lease.timestamp_ms) <= lease.max_duration_ms {
+            leases.push(lease);
+        }
+    }
+    Ok(leases)
 }
 
 #[cfg(test)]

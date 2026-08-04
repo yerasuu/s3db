@@ -372,6 +372,69 @@ impl Collection {
         bail!("restore: too many CAS conflicts writing {name} (giving up after 3 attempts)")
     }
 
+    /// Every tombstone this collection currently has, with the name it
+    /// shadows -- what [`crate::gc::sweep`] scans to retry [`PurgeState::Pending`]
+    /// deletes and age out old [`PurgeState::Purged`] ones. A separate scan
+    /// from [`Self::list_names`] on purpose: tombstones live under
+    /// `.deleted/`, a namespace `list_names` explicitly excludes.
+    pub async fn list_tombstones(&self, backend: &dyn Backend, cipher: &Cipher) -> Result<Vec<(String, Tombstone)>> {
+        let scan_prefix = format!("{}/.deleted/", self.prefix);
+        let mut out = Vec::new();
+        for key in list_all_keys(backend, &scan_prefix).await? {
+            let Some(name) = key.strip_prefix(&scan_prefix).and_then(|s| s.strip_suffix(".json")) else { continue };
+            let (tombstone, etag) = get_json::<Tombstone>(backend, &key, cipher).await?;
+            if etag.is_some() {
+                out.push((name.to_string(), tombstone));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Retries the underlying delete for a [`PurgeState::Pending`]
+    /// tombstone -- the same second half [`Self::delete`] itself runs, for
+    /// a maintenance sweep to call later instead of the caller who
+    /// originally deleted `name` being the only one who ever gets to try
+    /// again. Returns `true` if `name`'s tombstone is `Purged` by the time
+    /// this returns (already was, or just became so).
+    pub async fn retry_pending_purge(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<bool> {
+        let tombstone_key = self.tombstone_key(name);
+        let (tombstone, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
+        if tomb_etag.is_none() {
+            return Ok(false); // nothing to retry
+        }
+        if tombstone.purge_state == PurgeState::Purged {
+            return Ok(true);
+        }
+        let confirmed = backend.delete(&self.key(name)).await.map(|o| o.confirmed == o.attempted).unwrap_or(false);
+        if confirmed {
+            let purged = Tombstone { purge_state: PurgeState::Purged, ..tombstone };
+            put_json(backend, &tombstone_key, &purged, tomb_etag.as_deref(), cipher).await?;
+        }
+        Ok(confirmed)
+    }
+
+    /// Removes a [`PurgeState::Purged`] tombstone record entirely -- call
+    /// once it's old enough nobody needs the audit trail anymore. A no-op
+    /// on a `Pending` tombstone: removing the record while the underlying
+    /// delete still isn't confirmed would destroy the one durable sign that
+    /// a retry is still owed.
+    pub async fn forget_tombstone(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
+        let tombstone_key = self.tombstone_key(name);
+        let (tombstone, etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
+        if etag.is_some() && tombstone.purge_state == PurgeState::Purged {
+            delete_object(backend, &tombstone_key).await;
+        }
+        Ok(())
+    }
+
+    /// Best-effort removal of one archived history version and its
+    /// companion timestamp -- for a maintenance sweep pruning old
+    /// versions. Never touches `name`'s live object.
+    pub async fn forget_history_version(&self, backend: &dyn Backend, name: &str, version: &str) {
+        delete_object(backend, &format!("{}/{version}.json", self.history_prefix(name))).await;
+        delete_object(backend, &self.history_timestamp_key(name, version)).await;
+    }
+
     /// Every name currently stored, sorted.
     pub async fn list_names(&self, backend: &dyn Backend) -> Result<Vec<String>> {
         let scan_prefix = format!("{}/", self.prefix);

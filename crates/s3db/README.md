@@ -221,6 +221,19 @@ snap.close(backend).await; // best-effort, releases the lease early
 
 `Collection::version_timestamp` (the timestamp behind this) records when a `.history/` entry was *retired* (overwritten by the next write), stored in a companion `{etag}.meta.json` object alongside the archive itself — orthogonal to `T`, so both `put_versioned`'s typed archiving and `Collection::delete`'s raw-byte archiving write one the same way.
 
+## Garbage collection / maintenance (opt-in)
+
+`gc::sweep` runs one collection's cleanup: retries `PurgeState::Pending` tombstones' underlying delete once they're older than `tombstone_retry_age`, forgets `PurgeState::Purged` tombstone records past `tombstone_purge_age`, and (if `history_max_age` is set) prunes `.history/` entries past that age — checking `snapshot::list_leases` first, so a live `ReadSnapshot` never loses a version it still needs.
+
+```rust
+let report = s3db::gc::sweep(backend, &cipher, &USERS, &GcConfig::default()).await?;
+// or, across every collection an app registers:
+let scanner = s3db::MaintenanceScanner::new(GcConfig::default());
+scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;
+```
+
+`MaintenanceScanner` is narrower than a single-scan-many-conditions design might suggest: there's no schema-migration or key-rotation rescan in this crate to fuse in (see `maintenance`'s own module doc for why neither applies today), so what it actually consolidates is running `gc::sweep` over every registered collection from one call and one config, not fusing separate scans into a single read per object.
+
 ## Write-ahead log (opt-in)
 
 `txn::run` already recovers a crashed multi-key transaction; `wal` covers the gap that leaves — a single `put_cas` outside a transaction whose response never arrives, so nobody can tell "never attempted" from "attempted, landed or not, we don't know" from the outside:
