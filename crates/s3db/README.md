@@ -60,6 +60,24 @@ let cipher = s3db::bootstrap::get_or_create_cipher(backend.as_ref(), &passphrase
 
 On first use, `get_or_create_cipher` generates the salt and writes it — **unencrypted, on purpose** — to `.conf/encryption.json`, alongside a sealed verifier. On every later start it re-derives the key from `passphrase` and opens that verifier: a wrong passphrase fails right here, as one clear startup error, instead of turning into scattered decrypt failures deeper in the app.
 
+## Key rotation (opt-in)
+
+`bootstrap::get_or_create_cipher` and a bare `Cipher` are all that most callers need. `key_rotation` is additive on top, for a caller that wants to rotate its passphrase without losing access to everything already encrypted under the old one — `Collection`/`SecondaryIndex`/`txn::run`/`payload` are untouched, still `&Cipher`-only.
+
+```rust
+let mut ring = s3db::key_rotation::get_or_create_keyring(backend, &passphrase, &retired_passphrases).await?;
+// writes always use the active key:
+let sealed = ring.active().seal("k", &plain, CompressionStrategy::None);
+// reads try the active key, then retired keys most-recently-retired first:
+let plain = ring.open("k", &sealed)?;
+
+let new_key_id = s3db::key_rotation::rotate(backend, &mut ring, &new_passphrase).await?;
+```
+
+`EncryptionConfig` (at `.conf/encryption.json`, replacing the single-key `bootstrap` format) holds one `active_key_id` plus every `KeyMaterial` generation, retired ones flagged with `retired_at_ms`. Argon2id only runs once per key, at bootstrap/rotate time — `KeyRing::open`'s dual-read is cheap AEAD verification per attempt, not a repeated KDF, so falling back through several retired keys never becomes a latency cliff. Surviving a process restart mid-rotation still needs every retired key's original passphrase supplied via `retired_passphrases` (`key_id -> passphrase`) — there's no master-key-wraps-data-keys scheme here, so that map is the caller's own bookkeeping, same as its `passphrase` config field, never persisted in the bucket.
+
+`KeyRing::forget_retired(key_id)` drops a retired key from process memory as soon as the caller's own accounting confirms it's unneeded, ahead of `key_rotation::forget_key`'s slower on-disk removal from `EncryptionConfig` — the trade-off this widens (derived key material now lives in memory as long as `EncryptionConfig` still lists it, not just for the duration of one `open` call) is deliberate, not an oversight: it's what makes dual-read cheap in the first place.
+
 ## Typed storage primitives
 
 **`Collection`** — one object per entity, keyed `<prefix>/<name><suffix>` (default suffix `.json`, but the object itself is MessagePack on the wire, not literal JSON — see [Raw primitive](#raw-primitive)):

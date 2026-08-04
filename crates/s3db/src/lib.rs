@@ -26,6 +26,7 @@ pub mod cipher;
 pub mod collection;
 pub mod config;
 pub mod index;
+pub mod key_rotation;
 pub mod payload;
 pub mod request_cache;
 pub mod txn;
@@ -40,6 +41,7 @@ pub use cipher::{Cipher, CompressionStrategy};
 pub use collection::{Collection, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
 pub use index::{Segment, SecondaryIndex};
+pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
 pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_json};
 pub use request_cache::RequestCache;
 
