@@ -9,6 +9,15 @@
 //! driver); [`cipher::Cipher`]/[`bootstrap`] handle mandatory encryption at
 //! rest; [`json`] is the raw encrypted-JSON-object primitive everything
 //! else builds on.
+//!
+//! One entry format, transparent backend: every layer above `Backend`
+//! ([`json`], [`collection::Collection`]/[`collection::Singleton`],
+//! [`index::SecondaryIndex`], [`txn::run`], [`request_cache::RequestCache`])
+//! codes only against `&dyn Backend` — get/put_cas/delete/list_prefix/
+//! put_stream/get_stream, same CAS-etag semantics from every driver. None of
+//! it ever touches a provider SDK, a key format, or a request shape
+//! directly, so swapping drivers ([`build_backend`]) changes nothing above
+//! this line.
 
 pub mod backend;
 pub mod bootstrap;
