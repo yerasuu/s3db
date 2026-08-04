@@ -9,17 +9,27 @@ use crate::json::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::Result;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
-#[derive(Debug, Clone, Copy)]
+/// `Cow` rather than a plain `&'static str`: most collections (users,
+/// groups, ...) have a fixed prefix known at compile time, but a few are
+/// scoped per-call to some runtime value (e.g. "every permission grant
+/// under this one repo uid") — same CRUD/list shape either way, so both get
+/// to share it instead of the runtime-scoped ones reimplementing it by hand.
+#[derive(Debug, Clone)]
 pub struct Collection {
-    pub prefix: &'static str,
+    pub prefix: Cow<'static, str>,
 }
 
 impl Collection {
     pub const fn new(prefix: &'static str) -> Self {
-        Collection { prefix }
+        Collection { prefix: Cow::Borrowed(prefix) }
+    }
+
+    pub fn new_owned(prefix: String) -> Self {
+        Collection { prefix: Cow::Owned(prefix) }
     }
 
     pub fn key(&self, name: &str) -> String {
@@ -77,16 +87,13 @@ impl Collection {
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
-        let prefix = self.prefix;
         let names = self.list_names(backend.as_ref()).await?;
         let mut set = JoinSet::new();
         for name in names {
+            let key = self.key(&name);
             let backend = Arc::clone(backend);
             let cipher = Arc::clone(cipher);
-            set.spawn(async move {
-                let key = format!("{prefix}/{name}.json");
-                get_json::<T>(backend.as_ref(), &key, &cipher).await
-            });
+            set.spawn(async move { get_json::<T>(backend.as_ref(), &key, &cipher).await });
         }
         let mut items = Vec::new();
         while let Some(result) = set.join_next().await {
