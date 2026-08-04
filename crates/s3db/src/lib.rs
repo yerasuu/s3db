@@ -57,7 +57,7 @@ pub use cipher::{Cipher, CompressionStrategy};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
-pub use index::{Segment, SecondaryIndex};
+pub use index::{IndexKey, Segment, SecondaryIndex};
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};

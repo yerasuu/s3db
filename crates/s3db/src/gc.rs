@@ -165,6 +165,7 @@ mod tests {
         let coll = Collection::new("widgets");
         coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
         coll.delete(&backend, &cipher, "a").await; // LocalBackend confirms -> tombstone is Purged
+        tokio::time::sleep(Duration::from_millis(5)).await; // ensure strictly past a zero-width grace period
 
         let config = GcConfig { tombstone_purge_age: Duration::ZERO, ..GcConfig::default() };
         let report = sweep(&backend, &cipher, &coll, &config).await.unwrap();
@@ -181,6 +182,10 @@ mod tests {
         let (_, etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, etag.as_deref()).await.unwrap();
         assert_eq!(coll.list_versions(&backend, "a").await.unwrap().len(), 1);
+        // Millisecond-resolution timestamps: make sure the archive's own
+        // timestamp is strictly in the past relative to the sweep below,
+        // rather than racing to land in the same millisecond.
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let config = GcConfig { history_max_age: Some(Duration::ZERO), ..GcConfig::default() };
         let report = sweep(&backend, &cipher, &coll, &config).await.unwrap();

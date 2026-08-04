@@ -167,6 +167,20 @@ let (pointer, _etag) = PUBKEY_INDEX.resolve::<UsernamePointer>(backend, &cipher,
 
 `claim_self_healing` handles the "name squatted by something since-deleted" case: on conflict it re-fetches the existing pointer and calls a caller-supplied `is_genuine` check before deciding to refuse or reclaim.
 
+`claim_once_typed`/`resolve_typed`/`release_typed` are the same operations for a field that already has a natural byte representation (a `u64`, raw bytes, ...) via the `IndexKey` trait, instead of paying a `.to_string()` allocation just to satisfy the `&str`-shaped API:
+
+```rust
+impl IndexKey for MyUid { fn key_bytes(&self) -> Cow<'_, [u8]> { Cow::Borrowed(self.as_bytes()) } }
+idx.claim_once_typed(backend, &cipher, &my_uid, &pointer).await?;
+```
+
+`claim_inline`/`resolve_inline` are the opt-in alternative to `claim_once`/`resolve`: the pointer entry carries a denormalized copy of the target value itself, so `resolve_inline` is one `get` instead of pointer-then-fetch's two round trips — at the cost of every update to the real entity needing a matching `claim_inline` call to keep the copy from going stale (no automatic propagation). Worth it only where lookup volume dominates over update volume.
+
+```rust
+idx.claim_inline(backend, &cipher, &fingerprint, &pointer, &user).await?;
+let user: Option<User> = idx.resolve_inline(backend, &cipher, &fingerprint).await?;
+```
+
 **`ShardedIndex`** — `SecondaryIndex`, but the key spreads across `2^prefix_bits` shards instead of one flat prefix, for an index hot enough to hit a single S3 partition's throughput ceiling:
 
 ```rust
