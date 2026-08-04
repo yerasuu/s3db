@@ -164,7 +164,13 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let field_ident = &index.ident;
         let const_name = format_ident!("{}_INDEX", field_ident.to_string().to_uppercase());
         let pointer_name = format_ident!("__{struct_name}{}Pointer", to_camel(&field_ident.to_string()));
-        let root = index.root.clone().unwrap_or_else(|| collection_prefix.clone());
+        // Never bare `collection_prefix`: `Collection::list_names` scans its
+        // whole prefix *recursively* (no directory boundary in an S3-style
+        // key space), so an index nested directly under the entity's own
+        // collection would get silently swept up by `list_keys`/`list_all`
+        // as if it were a real stored entity. `.index` is a sibling prefix,
+        // structurally outside that scan, not a subpath of it.
+        let root = index.root.clone().unwrap_or_else(|| format!("{collection_prefix}.index"));
         let kind = index.kind.clone().unwrap_or_else(|| field_ident.to_string());
         let pointer_field = format_ident!("{}", index.pointer_field.clone().unwrap_or_else(|| "key".to_string()));
         let segment_tokens = match index.segment {

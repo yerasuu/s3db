@@ -129,6 +129,25 @@ async fn list_keys_returns_every_stored_username_sorted() {
     assert_eq!(Account::list_keys(&backend).await.unwrap(), vec!["alice".to_string(), "bob".to_string()]);
 }
 
+#[tokio::test]
+async fn default_index_root_never_leaks_into_list_keys_or_list_all() {
+    // Regression check: an index whose root nests under the entity's own
+    // collection prefix would get swept up by `list_names`/`list_all`'s
+    // recursive scan as if it were a stored entity -- the default root must
+    // land on a sibling prefix, never inside `Account::COLLECTION`'s own.
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let account = Account { username: "alice".into(), email: Some("alice@example.com".into()), fingerprint: None, is_admin: false };
+    account.put(&backend, &cipher, None).await.unwrap();
+    account.claim_email(&backend, &cipher).await.unwrap();
+
+    assert_eq!(Account::list_keys(&backend).await.unwrap(), vec!["alice".to_string()]);
+    let backend: std::sync::Arc<dyn s3db::Backend> = std::sync::Arc::new(backend);
+    let cipher = std::sync::Arc::new(cipher);
+    let all: Vec<Account> = Account::COLLECTION.list_all(&backend, &cipher).await.unwrap();
+    assert_eq!(all, vec![account]);
+}
+
 #[test]
 fn index_root_kind_and_pointer_field_overrides_match_a_hand_written_index() {
     // Same key shape `SecondaryIndex::new(".conf/index", "widget-owner", Segment::Raw)`
