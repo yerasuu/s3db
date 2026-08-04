@@ -17,7 +17,9 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+#[cfg(feature = "streaming")]
+use anyhow::bail;
 use fs4::tokio::AsyncFileExt;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
@@ -101,6 +103,7 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Same discipline as [`write_atomic`], but streams `source`'s bytes into
 /// `path` (via `tokio::io::copy`) instead of taking them as an in-memory
 /// buffer — bounded memory regardless of `source`'s size.
+#[cfg(feature = "streaming")]
 async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
     fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
@@ -223,6 +226,7 @@ impl Backend for LocalBackend {
         Ok(out)
     }
 
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         let lock_file = lock_key(&self.lock_path(key)).await?;
         let rev_path = self.rev_path(key);
@@ -233,6 +237,7 @@ impl Backend for LocalBackend {
         Ok(())
     }
 
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         let data_path = self.data_path(key);
         match fs::copy(&data_path, dest).await {
@@ -364,6 +369,7 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    #[cfg(feature = "streaming")]
     #[tokio::test]
     async fn put_stream_then_get_stream_roundtrips_and_bumps_the_etag() {
         let dir = tempfile::tempdir().unwrap();
@@ -389,6 +395,7 @@ mod tests {
         assert_eq!(tokio::fs::read(&source).await.unwrap(), b"content v2, longer");
     }
 
+    #[cfg(feature = "streaming")]
     #[tokio::test]
     async fn get_stream_errors_on_a_missing_key() {
         let dir = tempfile::tempdir().unwrap();

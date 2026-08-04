@@ -6,7 +6,7 @@
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
-use crate::json::{delete_object, get_json, put_json};
+use crate::payload::{delete_object, get_json, put_json};
 use anyhow::Result;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

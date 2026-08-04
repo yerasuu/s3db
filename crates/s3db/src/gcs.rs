@@ -18,13 +18,17 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::GcsParams;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+#[cfg(feature = "streaming")]
+use anyhow::bail;
 use futures::stream::{self, StreamExt};
 use google_cloud_auth::credentials::service_account;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_storage::client::{Storage, StorageControl};
+#[cfg(feature = "streaming")]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "streaming")]
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 
@@ -188,6 +192,7 @@ impl Backend for GcsBackend {
         Ok(out)
     }
 
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         let (storage, _) = self.client_pair().await?;
         // The crate accepts a `tokio::fs::File` directly as the upload
@@ -204,6 +209,7 @@ impl Backend for GcsBackend {
         Ok(())
     }
 
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         let (storage, _) = self.client_pair().await?;
         let mut resp = match storage.read_object(self.bucket_resource(), key).send().await {

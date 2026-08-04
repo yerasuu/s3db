@@ -7,16 +7,22 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::AzureParams;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+#[cfg(feature = "streaming")]
+use anyhow::bail;
 use azure_core::StatusCode;
 use azure_core::error::ErrorKind;
 use azure_core::prelude::IfMatchCondition;
 use azure_storage::StorageCredentials;
-use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockId, BlockList, ClientBuilder, ContainerClient};
+#[cfg(feature = "streaming")]
+use azure_storage_blobs::prelude::{BlobBlockType, BlockId, BlockList};
+use azure_storage_blobs::prelude::{BlobClient, ClientBuilder, ContainerClient};
 use futures::StreamExt;
 use futures::stream;
+#[cfg(feature = "streaming")]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "streaming")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How many keys [`AzureBackend::delete_many`] deletes at once — this API
@@ -28,6 +34,7 @@ const DELETE_CONCURRENCY: usize = 8;
 /// of its size. Doesn't need to match `crypto`'s own chunk size (`source`
 /// here is already-sealed ciphertext, this is just how big a piece this
 /// driver hands to one `Put Block` call at a time).
+#[cfg(feature = "streaming")]
 const UPLOAD_BLOCK_LEN: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -136,6 +143,7 @@ impl Backend for AzureBackend {
         Ok(out)
     }
 
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         let total_len = tokio::fs::metadata(source)
             .await
@@ -182,6 +190,7 @@ impl Backend for AzureBackend {
         Ok(())
     }
 
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         let mut stream = self.blob(key).get().into_stream();
         let mut file = tokio::fs::File::create(dest)

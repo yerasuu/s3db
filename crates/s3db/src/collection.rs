@@ -4,8 +4,8 @@
 //! hand-written once per entity.
 
 use crate::backend::{Backend, Cas};
-use crate::cipher::Cipher;
-use crate::json::{delete_object, get_json, list_all_keys, put_json};
+use crate::cipher::{Cipher, CompressionStrategy};
+use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -234,7 +234,7 @@ impl Collection {
             }
         };
         let history_key = format!("{}/{etag}.json", self.history_prefix(name));
-        let resealed = cipher.seal(&history_key, &plaintext);
+        let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None);
         // Create-only, but idempotent in practice: the same etag always
         // archives the same content, so a `Cas::Conflict` here just means
         // this exact archive entry already exists (a prior delete attempt

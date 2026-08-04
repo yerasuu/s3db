@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
+use std::borrow::Cow;
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroize;
@@ -39,6 +40,67 @@ const STREAM_CHUNK_LEN: usize = 4 * 1024 * 1024;
 /// least one chunk frame.
 fn stream_chunk_count(total_len: u64) -> u64 {
     if total_len == 0 { 1 } else { total_len.div_ceil(STREAM_CHUNK_LEN as u64) }
+}
+
+/// [`Cipher::seal`]'s one-byte compression header: `0` for stored-raw, `1`
+/// for zstd. Deliberately not touching [`Cipher::seal_stream`]'s own format
+/// -- what goes through there is always an already-compressed git pack, a
+/// second compression pass over already-compressed bytes buys nothing but
+/// CPU, so streaming has no compression header of its own to add.
+const COMPRESSION_NONE: u8 = 0;
+const COMPRESSION_ZSTD: u8 = 1;
+
+/// How [`Cipher::seal`] decides whether to zstd-compress `plaintext` before
+/// encrypting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionStrategy {
+    /// Never compress. This crate's own default profile (small, uniform
+    /// objects -- see [`crate::payload::MAX_OBJECT_BYTES`]) fixes this
+    /// statically: the size check `Auto` would otherwise run on every write
+    /// almost never trips at this scale, so the branch is cut from the hot
+    /// path entirely rather than evaluated per call.
+    None,
+    /// Compress plaintext at or above `threshold_bytes`, zstd default level.
+    /// Falls back to storing raw if compression doesn't actually shrink the
+    /// input (already-compressed or high-entropy data) -- [`Cipher::open`]
+    /// doesn't need to know or care which happened, the header says.
+    Auto { threshold_bytes: usize },
+}
+
+/// Binds the one-byte compression header into the AEAD associated data,
+/// alongside the caller's own `aad` (the object's S3 key). The header sits
+/// unencrypted next to the nonce ([`Cipher::open`] needs to read it before
+/// it can even attempt to decrypt) -- without this, a malicious storage
+/// provider could flip it undetected and make `open` misinterpret
+/// compressed bytes as raw, or vice versa. The `\0` separator is cheap
+/// insurance against `aad` + header colliding with some other `aad` that
+/// happens to already end in that same byte.
+fn header_bound_aad(aad: &str, header: u8) -> Vec<u8> {
+    let mut bound = aad.as_bytes().to_vec();
+    bound.push(0);
+    bound.push(header);
+    bound
+}
+
+/// The `(header byte, payload bytes)` [`Cipher::seal`] actually encrypts --
+/// `payload` is `plaintext` itself for [`CompressionStrategy::None`] (or an
+/// `Auto` that decided not to compress), or its zstd-compressed form.
+fn compress_for_seal(plaintext: &[u8], compression: CompressionStrategy) -> (u8, Cow<'_, [u8]>) {
+    let threshold_bytes = match compression {
+        CompressionStrategy::None => return (COMPRESSION_NONE, Cow::Borrowed(plaintext)),
+        CompressionStrategy::Auto { threshold_bytes } => threshold_bytes,
+    };
+    if plaintext.len() < threshold_bytes {
+        return (COMPRESSION_NONE, Cow::Borrowed(plaintext));
+    }
+    match zstd::encode_all(plaintext, 0) {
+        Ok(compressed) if compressed.len() < plaintext.len() => (COMPRESSION_ZSTD, Cow::Owned(compressed)),
+        // Didn't actually help (already-compressed/high-entropy input) or
+        // the compressor itself failed -- store raw either way rather than
+        // pay decode cost for zero benefit, or fail a write over what's
+        // fundamentally an optional optimization.
+        _ => (COMPRESSION_NONE, Cow::Borrowed(plaintext)),
+    }
 }
 
 #[derive(Clone)]
@@ -76,18 +138,24 @@ impl Cipher {
     /// ciphertext onto another and passing it off as valid: `open` with an
     /// `aad` different from the one used in `seal` fails authentication.
     ///
-    /// Format: `nonce(24 bytes) || ciphertext+tag`.
-    pub fn seal(&self, aad: &str, plaintext: &[u8]) -> Vec<u8> {
+    /// Format: `nonce(24 bytes) || compression_header(1 byte) ||
+    /// ciphertext+tag` -- `compression` decides whether the plaintext gets
+    /// zstd-compressed first (see [`CompressionStrategy`]); the header
+    /// records which happened and is itself bound into the AEAD associated
+    /// data, so it can't be tampered with independently of the ciphertext.
+    pub fn seal(&self, aad: &str, plaintext: &[u8], compression: CompressionStrategy) -> Vec<u8> {
+        let (header, payload) = compress_for_seal(plaintext, compression);
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).expect("system RNG unavailable");
         let nonce = XNonce::from(nonce_bytes);
+        let combined_aad = header_bound_aad(aad, header);
         let mut ciphertext = self
             .0
             .encrypt(
                 &nonce,
                 Payload {
-                    msg: plaintext,
-                    aad: aad.as_bytes(),
+                    msg: &payload,
+                    aad: &combined_aad,
                 },
             )
             // The only way this fails in this API is a plaintext bigger than
@@ -95,25 +163,31 @@ impl Cipher {
             // the key or the content itself.
             .expect("XChaCha20Poly1305::encrypt never fails at these sizes");
         let mut sealed = nonce.to_vec();
+        sealed.push(header);
         sealed.append(&mut ciphertext);
         sealed
     }
 
-    /// Opens what [`Self::seal`] sealed. Fails if the key, the `aad`, or the
-    /// content aren't the originals — a single generic error on purpose, to
-    /// avoid giving an attacker an "almost" signal (padding oracle).
+    /// Opens what [`Self::seal`] sealed (decompressing first if its header
+    /// says so). Fails if the key, the `aad`, or the content aren't the
+    /// originals — a single generic error on purpose, to avoid giving an
+    /// attacker an "almost" signal (padding oracle).
     pub fn open(&self, aad: &str, sealed: &[u8]) -> Result<Vec<u8>> {
-        if sealed.len() < NONCE_LEN {
+        if sealed.len() < NONCE_LEN + 1 {
             bail!("invalid ciphertext (too short)");
         }
-        let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
+        let (nonce, rest) = sealed.split_at(NONCE_LEN);
+        let (header, ciphertext) = rest.split_at(1);
+        let header = header[0];
         let nonce = XNonce::try_from(nonce).context("nonce has invalid length")?;
-        self.0
+        let combined_aad = header_bound_aad(aad, header);
+        let payload = self
+            .0
             .decrypt(
                 &nonce,
                 Payload {
                     msg: ciphertext,
-                    aad: aad.as_bytes(),
+                    aad: &combined_aad,
                 },
             )
             .map_err(|_| {
@@ -121,7 +195,12 @@ impl Cipher {
                     "couldn't decrypt (wrong passphrase, or data was modified/moved \
                      from a different key)"
                 )
-            })
+            })?;
+        match header {
+            COMPRESSION_NONE => Ok(payload),
+            COMPRESSION_ZSTD => zstd::decode_all(&payload[..]).context("decompressing"),
+            other => bail!("invalid ciphertext (unknown compression header {other})"),
+        }
     }
 
     /// Streaming counterpart of [`Self::seal`], for objects too big to want
@@ -351,14 +430,14 @@ mod tests {
     #[test]
     fn roundtrips() {
         let c = test_cipher();
-        let sealed = c.seal("repo/refs.json", b"secret content");
+        let sealed = c.seal("repo/refs.json", b"secret content", CompressionStrategy::None);
         let opened = c.open("repo/refs.json", &sealed).unwrap();
         assert_eq!(opened, b"secret content");
     }
 
     #[test]
     fn rejects_wrong_passphrase() {
-        let sealed = test_cipher().seal("k", b"x");
+        let sealed = test_cipher().seal("k", b"x", CompressionStrategy::None);
         let other = Cipher::derive("another passphrase", &[7u8; SALT_LEN]).unwrap();
         assert!(other.open("k", &sealed).is_err());
     }
@@ -366,7 +445,7 @@ mod tests {
     #[test]
     fn rejects_wrong_aad() {
         let c = test_cipher();
-        let sealed = c.seal("repo-a/refs.json", b"x");
+        let sealed = c.seal("repo-a/refs.json", b"x", CompressionStrategy::None);
         // Simulates a storage provider moving ciphertext to another key.
         assert!(c.open("repo-b/refs.json", &sealed).is_err());
     }
@@ -374,7 +453,7 @@ mod tests {
     #[test]
     fn rejects_truncated_or_tampered() {
         let c = test_cipher();
-        let mut sealed = c.seal("k", b"test content");
+        let mut sealed = c.seal("k", b"test content", CompressionStrategy::None);
         assert!(c.open("k", &sealed[..10]).is_err());
         let last = sealed.len() - 1;
         sealed[last] ^= 0xff;
@@ -385,8 +464,64 @@ mod tests {
     fn different_salts_give_different_keys() {
         let a = Cipher::derive("pw", &[1u8; SALT_LEN]).unwrap();
         let b = Cipher::derive("pw", &[2u8; SALT_LEN]).unwrap();
-        let sealed = a.seal("k", b"x");
+        let sealed = a.seal("k", b"x", CompressionStrategy::None);
         assert!(b.open("k", &sealed).is_err());
+    }
+
+    #[test]
+    fn compression_none_roundtrips() {
+        let c = test_cipher();
+        let plaintext = b"repeat repeat repeat repeat repeat repeat".repeat(50);
+        let sealed = c.seal("k", &plaintext, CompressionStrategy::None);
+        assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn compression_auto_shrinks_and_roundtrips_compressible_data() {
+        let c = test_cipher();
+        let plaintext = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
+        let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+        assert!(sealed.len() < plaintext.len(), "highly repetitive data should compress smaller");
+        assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn compression_auto_below_threshold_stores_raw() {
+        let c = test_cipher();
+        let plaintext = b"short";
+        let sealed = c.seal("k", plaintext, CompressionStrategy::Auto { threshold_bytes: 1000 });
+        assert_eq!(sealed[NONCE_LEN], COMPRESSION_NONE);
+        assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn compression_auto_falls_back_to_raw_when_compression_does_not_help() {
+        let c = test_cipher();
+        // Already-compressed bytes: a second zstd pass can't shrink this
+        // further (if anything it's a hair bigger, framing overhead), so
+        // the header should read "raw" even though `Auto`'s threshold was
+        // crossed.
+        let repetitive = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
+        let plaintext = zstd::encode_all(&repetitive[..], 0).unwrap();
+        let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+        assert_eq!(sealed[NONCE_LEN], COMPRESSION_NONE);
+        assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn tampering_with_the_compression_header_is_detected() {
+        let c = test_cipher();
+        let plaintext = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
+        let mut sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+        assert_eq!(sealed[NONCE_LEN], COMPRESSION_ZSTD);
+        sealed[NONCE_LEN] = COMPRESSION_NONE; // flip the header without re-encrypting
+        assert!(c.open("k", &sealed).is_err(), "header is bound into the AAD, tampering must fail auth");
+    }
+
+    #[test]
+    fn rejects_a_sealed_blob_too_short_to_contain_a_header() {
+        let c = test_cipher();
+        assert!(c.open("k", &[0u8; NONCE_LEN]).is_err());
     }
 
     /// Splits a `seal_stream`-produced file into `(total_len, chunk_frames)`
@@ -567,7 +702,7 @@ mod tests {
         assert!(c.open_stream("repo/pack", &sealed_path, &opened_path).await.is_err());
 
         // Long enough, but it's a plain `seal`-format blob (no magic at all).
-        let legacy = c.seal("repo/pack", b"test content");
+        let legacy = c.seal("repo/pack", b"test content", CompressionStrategy::None);
         tokio::fs::write(&sealed_path, &legacy).await.unwrap();
         assert!(c.open_stream("repo/pack", &sealed_path, &opened_path).await.is_err());
     }

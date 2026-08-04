@@ -8,14 +8,18 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::{R2Params, S3Params};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+#[cfg(feature = "streaming")]
+use anyhow::bail;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
 use aws_smithy_runtime_api::client::result::SdkError;
+#[cfg(feature = "streaming")]
 use std::path::Path;
 use std::time::Duration;
+#[cfg(feature = "streaming")]
 use tokio::io::AsyncWriteExt;
 
 /// Default region: many S3-compatibles ignore it, but the SDK requires one.
@@ -207,6 +211,7 @@ impl Backend for S3Backend {
         Ok(objects)
     }
 
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         let expected_len = tokio::fs::metadata(source)
             .await
@@ -252,6 +257,7 @@ impl Backend for S3Backend {
         Ok(())
     }
 
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         let resp = self.client.get_object().bucket(&self.bucket).key(key).send().await;
         let mut out = match resp {

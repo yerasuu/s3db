@@ -12,8 +12,8 @@
 //! shows up once updates are in scope, which they explicitly aren't.
 
 use crate::backend::{Backend, Cas};
-use crate::cipher::Cipher;
-use crate::json::{delete_object, get_json, list_all_keys, put_json};
+use crate::cipher::{Cipher, CompressionStrategy};
+use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,15 +119,18 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
     let (_, record_etag) = get_json::<TxnRecord>(backend, &record_key, cipher).await?;
 
     for op in &ops {
-        let plain = serde_json::to_vec(&op.value)?;
-        let sealed = cipher.seal(&op.key, &plain);
+        // MessagePack, not JSON -- matches `payload::put_json`'s wire format,
+        // since a `Collection`/entity elsewhere in the app reads this exact
+        // key back through `get_json`/`Collection::get`.
+        let plain = rmp_serde::to_vec_named(&op.value)?;
+        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
         match backend.put_cas(&op.key, sealed, None).await? {
             Cas::Ok => continue,
             Cas::Conflict => {
                 let (existing_sealed, existing_etag) = backend.get(&op.key).await?;
                 let is_ours = if existing_etag.is_some() {
                     let existing_plain = cipher.open(&op.key, &existing_sealed)?;
-                    let existing_value: serde_json::Value = serde_json::from_slice(&existing_plain)?;
+                    let existing_value: serde_json::Value = rmp_serde::from_slice(&existing_plain)?;
                     existing_value == op.value
                 } else {
                     false
@@ -176,7 +179,7 @@ async fn rollback(backend: &dyn Backend, cipher: &Cipher, record: &TxnRecord) ->
             continue; // never got created (or something already cleaned it up)
         }
         let plain = cipher.open(&op.key, &sealed)?;
-        let value: serde_json::Value = serde_json::from_slice(&plain)?;
+        let value: serde_json::Value = rmp_serde::from_slice(&plain)?;
         if value == op.value {
             delete_object(backend, &op.key).await;
         }
@@ -299,7 +302,7 @@ mod tests {
         // Simulates a crash after a previous `run` applied only this one op
         // directly, bypassing `run`'s own txn record entirely -- the exact
         // content `run` would have produced, so this must read as "ours".
-        let sealed = cipher.seal(&ops[0].key, &serde_json::to_vec(&ops[0].value).unwrap());
+        let sealed = cipher.seal(&ops[0].key, &rmp_serde::to_vec_named(&ops[0].value).unwrap(), CompressionStrategy::None);
         assert_eq!(backend.put_cas(&ops[0].key, sealed, None).await.unwrap(), Cas::Ok);
 
         let cas = run(&backend, &cipher, ops).await.unwrap();
@@ -325,7 +328,7 @@ mod tests {
         };
         put_json(&backend, &txn_key(&record.txn_id), &record, None, &cipher).await.unwrap();
         // Simulates the real partial-apply a crashed `run` would leave behind.
-        let sealed = cipher.seal(&op.key, &serde_json::to_vec(&op.value).unwrap());
+        let sealed = cipher.seal(&op.key, &rmp_serde::to_vec_named(&op.value).unwrap(), CompressionStrategy::None);
         assert_eq!(backend.put_cas(&op.key, sealed, None).await.unwrap(), Cas::Ok);
 
         let recovered = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();

@@ -12,8 +12,8 @@
 //! the middle of a push.
 
 use crate::backend::{Backend, Cas};
-use crate::cipher::{Cipher, SALT_LEN};
-use crate::json::{get_json_plain, put_json_plain};
+use crate::cipher::{Cipher, CompressionStrategy, SALT_LEN};
+use crate::payload::{get_json_plain, put_json_plain};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -48,7 +48,7 @@ pub async fn get_or_create_cipher(backend: &dyn Backend, passphrase: &str) -> Re
             let cipher = Cipher::derive(passphrase, &salt)?;
             let meta = EncryptionMeta {
                 salt: BASE64.encode(salt),
-                verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT)),
+                verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
             };
             match put_json_plain(backend, ENCRYPTION_META_KEY, &meta, None).await? {
                 Cas::Ok => return Ok(cipher),
@@ -100,7 +100,7 @@ mod tests {
         let cipher = Cipher::derive("correct", &[3u8; SALT_LEN]).unwrap();
         let meta = EncryptionMeta {
             salt: BASE64.encode([3u8; SALT_LEN]),
-            verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT)),
+            verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
         };
         assert!(derive_and_verify("correct", &meta).is_ok());
         let err = derive_and_verify("incorrect", &meta).unwrap_err();

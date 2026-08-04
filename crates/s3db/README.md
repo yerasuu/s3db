@@ -4,7 +4,7 @@ Typed, encrypted, CAS-consistent database over S3-compatible object storage (S3,
 
 ## Design
 
-One trait, one entry format, transparent backend: everything above `Backend` (`Collection`/`Singleton`, `SecondaryIndex`, `txn::run`, `RequestCache`, the raw `json` primitives) codes only against `&dyn Backend`. None of it ever touches a provider SDK, a key format, or a request shape directly — swap the driver, nothing above it changes.
+One trait, one entry format, transparent backend: everything above `Backend` (`Collection`/`Singleton`, `SecondaryIndex`, `txn::run`, `RequestCache`, the raw `payload` primitives) codes only against `&dyn Backend`. None of it ever touches a provider SDK, a key format, or a request shape directly — swap the driver, nothing above it changes.
 
 ```rust
 #[async_trait::async_trait]
@@ -24,6 +24,8 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
 `delete`/`delete_many` stay best-effort (a single key's own failure never aborts the call, and nothing in the crate depends on either actually landing), but both now report a `DeleteOutcome { attempted, confirmed }` instead of swallowing the result — informative bookkeeping for a caller that does want to know (`Collection::delete`'s tombstone, a future GC sweep), never a business-logic failure signal.
 
 Deliberately small surface: no presign, multipart, byte-range, or ACLs — derived from an audit of every call the original codebase actually made, not a speculative superset.
+
+`put_stream`/`get_stream` sit behind this crate's `streaming` cargo feature (off by default). This crate's own default profile assumes small, uniform objects (see `payload::MAX_OBJECT_BYTES`), so every driver's chunked-upload code is otherwise dead weight, never exercised. Without the feature both are provided methods that return an error instead of required ones each driver has to stub out; a caller that does need large blobs (git packs, LFS objects, ...) just enables the feature in its own `Cargo.toml`.
 
 ## Backends
 
@@ -46,7 +48,9 @@ let backend: Arc<dyn Backend> = build_backend(&cfg);
 
 Mandatory, no opt-out. XChaCha20Poly1305 (24-byte nonce), key derived with Argon2id at fixed params (19 MiB / 2 iterations / 1 thread — OWASP's low-memory profile), one random 16-byte salt per bucket.
 
-`Cipher::seal(aad, plaintext)` / `open(aad, sealed)` bind ciphertext to `aad` as AEAD associated data — every caller passes the object's own S3 key as `aad`, so ciphertext copied onto a different key fails to decrypt. Sealed format: `nonce(24) || ciphertext+tag`.
+`Cipher::seal(aad, plaintext, compression)` / `open(aad, sealed)` bind ciphertext to `aad` as AEAD associated data — every caller passes the object's own S3 key as `aad`, so ciphertext copied onto a different key fails to decrypt. Sealed format: `nonce(24) || compression_header(1) || ciphertext+tag`, header bound into the AAD alongside `aad` so it can't be flipped independently of the ciphertext.
+
+`compression: CompressionStrategy` is `None` (this crate's own default — see `payload::MAX_OBJECT_BYTES`, small uniform objects rarely compress worth the CPU) or `Auto { threshold_bytes }` (zstd above that size, falling back to raw if compression doesn't actually shrink the input). `seal_stream`/`open_stream` (below) deliberately don't compress at all — what goes through them is already-compressed git pack data, a second pass buys nothing.
 
 Streaming variants (`seal_stream`/`open_stream`, for `put_stream`/`get_stream`-sized payloads) chunk at 4 MiB, each chunk's AAD binding the base `aad`, the declared total length, and the chunk index — reordering, truncating, or duplicating chunks is detectable.
 
@@ -58,7 +62,7 @@ On first use, `get_or_create_cipher` generates the salt and writes it — **unen
 
 ## Typed storage primitives
 
-**`Collection`** — one JSON object per entity, keyed `<prefix>/<name><suffix>` (default suffix `.json`):
+**`Collection`** — one object per entity, keyed `<prefix>/<name><suffix>` (default suffix `.json`, but the object itself is MessagePack on the wire, not literal JSON — see [Raw primitive](#raw-primitive)):
 
 ```rust
 const USERS: Collection = Collection::new(".conf/users"); // .conf/users/<name>.json
@@ -150,4 +154,8 @@ let cached: Arc<dyn Backend> = Arc::new(RequestCache::new(Arc::clone(&backend)))
 
 ## Raw primitive
 
-Everything above builds on `json::{get_json, put_json}` — encrypt/decrypt plus a single `Backend::get`/`put_cas` call — and `delete_object`/`list_all_keys` as thin wrappers over `Backend::delete`/`list_prefix`.
+Everything above builds on `payload::{get_json, put_json}` — encrypt/decrypt plus a single `Backend::get`/`put_cas` call — and `delete_object`/`list_all_keys` as thin wrappers over `Backend::delete`/`list_prefix`.
+
+The wire format is MessagePack (`rmp-serde`), not JSON: this crate's own entities are always Rust structs with `serde`, and the object is *always* encrypted, so JSON's "it's readable if you squint at the raw bytes" benefit never applied in the first place — MessagePack is smaller and faster to parse for the same schema-evolution story (`#[entity(...)]`'s migrations tolerate added/removed fields the same way either format). `.conf/encryption.json` is the one deliberate exception, via `get_json_plain`/`put_json_plain`: unencrypted and plain JSON on purpose, since it's the one object meant to be read by hand during an incident.
+
+`put_json` rejects anything over `payload::MAX_OBJECT_BYTES` (256 KiB) before it ever reaches `Cipher::seal` — a guard against an application bug accidentally serializing a large blob through the small-object path instead of `put_stream`.

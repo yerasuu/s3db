@@ -9,6 +9,7 @@
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use anyhow::Result;
 use std::collections::HashMap;
+#[cfg(any(test, feature = "streaming"))]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -74,10 +75,12 @@ impl Backend for RequestCache {
         self.inner.list_prefix(prefix).await
     }
 
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         self.inner.put_stream(key, source).await
     }
 
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         self.inner.get_stream(key, dest).await
     }
@@ -132,10 +135,12 @@ mod tests {
             self.inner.list_prefix(prefix).await
         }
 
+        #[cfg(feature = "streaming")]
         async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
             self.inner.put_stream(key, source).await
         }
 
+        #[cfg(feature = "streaming")]
         async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
             self.inner.get_stream(key, dest).await
         }

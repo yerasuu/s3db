@@ -1,5 +1,7 @@
 use crate::config::BackendConfig;
 use anyhow::Result;
+#[cfg(not(feature = "streaming"))]
+use anyhow::bail;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -75,14 +77,35 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// ciphertext) to `key`, streaming — bounded memory regardless of the
     /// file's size, unlike a buffered `put`. Deliberately no CAS variant:
     /// nothing that streams ever needs conditional-write semantics.
+    ///
+    /// Gated behind the `streaming` feature (off by default, see this
+    /// crate's `Cargo.toml`): this crate's own default profile assumes small,
+    /// uniformly-sized objects (see `json`'s `MAX_OBJECT_BYTES` guard), so
+    /// every driver's real chunked-upload code is dead weight, never
+    /// exercised, under that profile. Without the feature this is a provided
+    /// method returning [`anyhow::Error`] ("streaming disabled") instead of a
+    /// required one — a caller that does need it (large blobs: packs, LFS
+    /// objects, ...) just enables the feature, no driver has to implement a
+    /// stub for the other case.
+    #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()>;
+    #[cfg(not(feature = "streaming"))]
+    async fn put_stream(&self, _key: &str, _source: &Path) -> Result<()> {
+        bail!("streaming is disabled (enable s3db's `streaming` cargo feature)")
+    }
     /// Downloads `key`'s raw bytes to `dest`, streaming — the other half of
     /// [`Self::put_stream`]. Missing key is a hard error (`bail`) here,
     /// unlike [`Self::get`]'s empty-bytes-plus-`None`: every real caller of
     /// this already treats "the object exists" as an invariant (a pack the
     /// manifest lists), so this just gives that a clear message instead of
-    /// failing later, confusingly, at the decrypt step.
+    /// failing later, confusingly, at the decrypt step. Same feature-gating
+    /// as [`Self::put_stream`].
+    #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()>;
+    #[cfg(not(feature = "streaming"))]
+    async fn get_stream(&self, _key: &str, _dest: &Path) -> Result<()> {
+        bail!("streaming is disabled (enable s3db's `streaming` cargo feature)")
+    }
 }
 
 /// Builds the right [`Backend`] for `cfg` — the single place that turns
