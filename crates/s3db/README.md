@@ -271,6 +271,34 @@ s3db::wal::recover_stale(backend, &cipher, Duration::from_secs(60)).await?;
 
 A WAL entry at `.conf/wal/<op_id>.json` records the write's intent (a hash of the exact sealed bytes) before attempting it, and is cleared once the outcome is definitively known (`Cas::Ok` or `Cas::Conflict` — both are answers). `recover_stale` resolves entries older than a threshold by comparing the object currently at that key against the recorded hash — diagnostic and cleanup only, never a delivery guarantee: it clears the WAL entry either way and never retries the write itself or touches the data key, since a stale retry the original caller never asked for could clobber something newer.
 
+## BatchLoader, HealthProbe, WriteCoalescer (all opt-in)
+
+`batch_loader::BatchLoader` fans a key list out concurrently, bounded by a `MemoryBudget` (`max_buffer_bytes / MAX_OBJECT_BYTES` concurrent fetches — every object is capped, so that's exactly how many can be in flight without risking more than the configured buffer):
+
+```rust
+let loader = BatchLoader::new(MemoryBudget::default());
+let results: HashMap<String, Result<Option<User>>> = loader.load_many(&backend, &cipher, keys).await;
+```
+
+`Ok(None)` means the key doesn't exist — the same parity `Collection::get` already has, not conflated with `Err` (reserved for a real backend/deserialization failure).
+
+`health::HealthProbe` does a real `get` every time `ready()` is called — the one rule it needs its `Backend` to follow is no response-caching decorator anywhere in it (`CachedBackend` in particular), or `ready()` ends up measuring "do I have a copy in RAM" instead of "can I reach the backend right now", exactly backwards from what an orchestrator's restart/routing decisions need:
+
+```rust
+let probe = HealthProbe::new(probe_backend); // built without CachedBackend
+probe.ready().await; // real network round trip
+probe.last_ready();   // cheap, last-known state between probes
+```
+
+`coalescer::WriteCoalescer` debounces repeated writes to the same key into one real `put_cas` after `flush_interval`:
+
+```rust
+let coalescer = WriteCoalescer::new(backend.clone(), Duration::from_millis(200));
+coalescer.write(key, sealed_bytes); // remembers the latest value, schedules a flush if none is pending
+```
+
+`flush` never does a blind CAS against the etag captured when the debounce window started — it re-reads and retries (CAS-with-reread, same discipline as `Collection::restore`'s own write), so a write that landed elsewhere during the debounce window can't cause the coalesced write to be silently dropped.
+
 ## RequestCache
 
 A decorator over `Backend` that caches `get()` results for the lifetime of one request or connection — never process-wide, since multiple server instances share one bucket and a stale cached permission record must not outlive its revocation. `put_cas`/`delete`/`delete_many` invalidate the touched keys regardless of outcome; `list_prefix`/`put_stream`/`get_stream` pass through uncached.

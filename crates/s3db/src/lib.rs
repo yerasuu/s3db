@@ -22,12 +22,15 @@
 
 pub mod backend;
 pub mod backup;
+pub mod batch_loader;
 pub mod bootstrap;
 pub mod cache;
 pub mod cipher;
+pub mod coalescer;
 pub mod collection;
 pub mod config;
 pub mod gc;
+pub mod health;
 pub mod index;
 pub mod key_rotation;
 pub mod maintenance;
@@ -48,12 +51,15 @@ mod s3;
 
 pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
 pub use backup::{BackupConsistency, BackupManifest};
+pub use batch_loader::{BatchLoader, MemoryBudget};
 pub use cache::{CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CompressionStrategy};
+pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
 pub use index::{Segment, SecondaryIndex};
 pub use gc::{GcConfig, GcReport};
+pub use health::HealthProbe;
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
