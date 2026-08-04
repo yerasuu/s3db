@@ -227,6 +227,24 @@ snap.close(backend).await; // best-effort, releases the lease early
 
 `Collection::version_timestamp` (the timestamp behind this) records when a `.history/` entry was *retired* (overwritten by the next write), stored in a companion `{etag}.meta.json` object alongside the archive itself — orthogonal to `T`, so both `put_versioned`'s typed archiving and `Collection::delete`'s raw-byte archiving write one the same way.
 
+## Backup / restore (opt-in)
+
+`backup::backup_collection`/`restore_collection` do a logical backup of one `Collection` at a time — a `scroll` (list + read every entity) copied to a destination, not a storage-level snapshot, so it works identically across every `Backend`:
+
+```rust
+let manifest = s3db::backup::backup_collection(
+    src_backend, &src_cipher, dest_backend, &dest_cipher, &USERS, "2026-01-15", /* include_tombstones */ true,
+).await?;
+// ... later, onto a live destination:
+s3db::backup::restore_collection(backup_backend, &backup_cipher, dest_backend, &dest_cipher, &USERS, "2026-01-15").await?;
+```
+
+Source and destination backend/cipher can be the same (a backup alongside the live data) or genuinely different (a separate bucket, a different encryption key) — every entity is decrypted under its source key and re-sealed under its destination key, never copied as raw ciphertext, which would carry the wrong AAD for its new location.
+
+`BackupManifest.consistency` is always `BackupConsistency::FuzzySnapshot` today, and says so explicitly: the scroll runs with no coordination against concurrent writes, so while any individual entity is read whole, the overall backup can mix states from different instants within `[started_at_ms, finished_at_ms]` — not a cross-entity atomic point-in-time (the same honesty `snapshot::ReadSnapshot` commits to at single-entity scale). `restore_collection` returns the same manifest, so a caller restoring from a backup inherits the identical caveat rather than assuming more precision than the mechanism gives.
+
+Tombstones are included by default (`include_tombstones: true`) — omitting them silently loses the entire soft-delete audit/recovery trail at exactly the moment (disaster recovery) it's most needed; `manifest.includes_tombstones` records whichever way a caller chose.
+
 ## Garbage collection / maintenance (opt-in)
 
 `gc::sweep` runs one collection's cleanup: retries `PurgeState::Pending` tombstones' underlying delete once they're older than `tombstone_retry_age`, forgets `PurgeState::Purged` tombstone records past `tombstone_purge_age`, and (if `history_max_age` is set) prunes `.history/` entries past that age — checking `snapshot::list_leases` first, so a live `ReadSnapshot` never loses a version it still needs.

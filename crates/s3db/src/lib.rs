@@ -21,6 +21,7 @@
 //! this line.
 
 pub mod backend;
+pub mod backup;
 pub mod bootstrap;
 pub mod cache;
 pub mod cipher;
@@ -46,6 +47,7 @@ mod local;
 mod s3;
 
 pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
+pub use backup::{BackupConsistency, BackupManifest};
 pub use cache::{CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CompressionStrategy};
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
