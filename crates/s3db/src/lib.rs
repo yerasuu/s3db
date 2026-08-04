@@ -17,6 +17,7 @@ pub mod collection;
 pub mod config;
 pub mod index;
 pub mod json;
+pub mod request_cache;
 
 mod azure;
 mod gcs;
@@ -29,6 +30,7 @@ pub use collection::{Collection, Singleton};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
 pub use index::{Segment, SecondaryIndex};
 pub use json::{delete_object, get_json, list_all_keys, put_json};
+pub use request_cache::RequestCache;
 
 pub use azure::AzureBackend;
 pub use gcs::GcsBackend;
