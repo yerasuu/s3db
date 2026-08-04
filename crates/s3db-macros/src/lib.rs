@@ -23,15 +23,35 @@ struct ContainerArgs {
 /// One `#[entity(index)]`/`#[entity(index(segment = "base64"))]` field —
 /// `segment` defaults to `Segment::Raw`, same default shape as every
 /// hand-written index in `auth::access` that isn't base64-encoding a
-/// fingerprint/email.
+/// fingerprint/email. `root`/`kind`/`pointer_field` default to the
+/// collection's own prefix, the field's own name, and `"key"` respectively
+/// (matching a brand-new index with no prior on-disk shape); set them
+/// explicitly to land on the exact key/pointer-field-name an existing
+/// hand-written `SecondaryIndex` already uses, so migrating a real entity
+/// onto this derive doesn't silently move or reshape any already-stored data.
 struct IndexField {
     ident: syn::Ident,
     is_optional: bool,
     segment: Segment,
+    root: Option<String>,
+    kind: Option<String>,
+    pointer_field: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+/// Parsed `#[entity(index(...))]` args, before the `is_optional` check
+/// (which needs the field's own type, not available at parse time) turns
+/// one of these plus a field into an [`IndexField`].
+#[derive(Default)]
+struct IndexArgs {
+    segment: Segment,
+    root: Option<String>,
+    kind: Option<String>,
+    pointer_field: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
 enum Segment {
+    #[default]
     Raw,
     Base64,
 }
@@ -61,7 +81,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     for field in &fields.named {
         let ident = field.ident.clone().expect("named field");
         let mut has_key = false;
-        let mut index_args: Option<Segment> = None;
+        let mut index_args: Option<IndexArgs> = None;
         for attr in &field.attrs {
             if !attr.path().is_ident("entity") {
                 continue;
@@ -74,6 +94,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 if meta.path.is_ident("index") {
                     if meta.input.peek(syn::token::Paren) {
                         let mut segment = Segment::Raw;
+                        let mut root = None;
+                        let mut kind = None;
+                        let mut pointer_field = None;
                         meta.parse_nested_meta(|inner| {
                             if inner.path.is_ident("segment") {
                                 let value = inner.value()?;
@@ -90,14 +113,25 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                                         }
                                     };
                                 }
-                                Ok(())
-                            } else {
-                                Err(inner.error("unsupported #[entity(index(...))] key"))
+                                return Ok(());
                             }
+                            if inner.path.is_ident("root") {
+                                root = Some(parse_str_value(&inner)?);
+                                return Ok(());
+                            }
+                            if inner.path.is_ident("kind") {
+                                kind = Some(parse_str_value(&inner)?);
+                                return Ok(());
+                            }
+                            if inner.path.is_ident("pointer_field") {
+                                pointer_field = Some(parse_str_value(&inner)?);
+                                return Ok(());
+                            }
+                            Err(inner.error("unsupported #[entity(index(...))] key, expected \"segment\", \"root\", \"kind\", or \"pointer_field\""))
                         })?;
-                        index_args = Some(segment);
+                        index_args = Some(IndexArgs { segment, root, kind, pointer_field });
                     } else {
-                        index_args = Some(Segment::Raw);
+                        index_args = Some(IndexArgs::default());
                     }
                     return Ok(());
                 }
@@ -110,9 +144,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
             key_field = Some(ident.clone());
         }
-        if let Some(segment) = index_args {
+        if let Some(IndexArgs { segment, root, kind, pointer_field }) = index_args {
             let is_optional = is_option_type(&field.ty);
-            index_fields.push(IndexField { ident, is_optional, segment });
+            index_fields.push(IndexField { ident, is_optional, segment, root, kind, pointer_field });
         }
     }
 
@@ -130,7 +164,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let field_ident = &index.ident;
         let const_name = format_ident!("{}_INDEX", field_ident.to_string().to_uppercase());
         let pointer_name = format_ident!("__{struct_name}{}Pointer", to_camel(&field_ident.to_string()));
-        let kind = field_ident.to_string();
+        let root = index.root.clone().unwrap_or_else(|| collection_prefix.clone());
+        let kind = index.kind.clone().unwrap_or_else(|| field_ident.to_string());
+        let pointer_field = format_ident!("{}", index.pointer_field.clone().unwrap_or_else(|| "key".to_string()));
         let segment_tokens = match index.segment {
             Segment::Raw => quote! { s3db::Segment::Raw },
             Segment::Base64 => quote! { s3db::Segment::Base64 },
@@ -138,18 +174,19 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         let find_by = format_ident!("find_by_{field_ident}");
         let claim = format_ident!("claim_{field_ident}");
         let release = format_ident!("release_{field_ident}");
+        let claim_op = format_ident!("{field_ident}_claim_op");
 
         index_items.push(quote! {
             #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
             struct #pointer_name {
-                key: String,
+                #pointer_field: String,
             }
 
             impl #struct_name {
                 /// Generated from `#[entity(index)]` on `#field_ident` —
                 /// same `{root}/{kind}/{segment}.json -> pointer` shape every
                 /// hand-written secondary index in this codebase already uses.
-                pub const #const_name: s3db::SecondaryIndex = s3db::SecondaryIndex::new(#collection_prefix, #kind, #segment_tokens);
+                pub const #const_name: s3db::SecondaryIndex = s3db::SecondaryIndex::new(#root, #kind, #segment_tokens);
             }
         });
 
@@ -166,7 +203,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// field is `None` on an optional index.
             pub async fn #claim(&self, backend: &dyn s3db::Backend, cipher: &s3db::Cipher) -> anyhow::Result<bool> {
                 match #value_expr {
-                    Some(raw) => Self::#const_name.claim_once(backend, cipher, raw, &#pointer_name { key: self.#key_field.clone() }).await,
+                    Some(raw) => Self::#const_name.claim_once(backend, cipher, raw, &#pointer_name { #pointer_field: self.#key_field.as_str().to_string() }).await,
                     None => Ok(true),
                 }
             }
@@ -177,7 +214,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             pub async fn #find_by(backend: &dyn s3db::Backend, cipher: &s3db::Cipher, raw: &str) -> anyhow::Result<Option<Self>> {
                 let (pointer, _etag) = Self::#const_name.resolve::<#pointer_name>(backend, cipher, raw).await?;
                 let Some(pointer) = pointer else { return Ok(None) };
-                Ok(Self::get(backend, cipher, &pointer.key).await?.0)
+                Ok(Self::get(backend, cipher, &pointer.#pointer_field).await?.0)
             }
 
             /// Best-effort release of this `#field_ident` claim — a no-op if
@@ -185,6 +222,23 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             pub async fn #release(&self, backend: &dyn s3db::Backend) {
                 if let Some(raw) = #value_expr {
                     Self::#const_name.release(backend, raw).await;
+                }
+            }
+
+            /// Builds (but doesn't send) a create-only claim of this entity's
+            /// `#field_ident` in its index, for a caller assembling a
+            /// cross-entity [`s3db::txn::run`] batch — the atomic-multi-key
+            /// path can't call [`Self::#claim`] directly since that issues
+            /// its own standalone write. `Ok(None)` if the field is `None` on
+            /// an optional index — nothing to claim, so nothing to add to
+            /// the batch.
+            pub fn #claim_op(&self) -> anyhow::Result<Option<s3db::txn::TxnOp>> {
+                match #value_expr {
+                    Some(raw) => Ok(Some(s3db::txn::TxnOp::create(
+                        Self::#const_name.key(raw),
+                        &#pointer_name { #pointer_field: self.#key_field.as_str().to_string() },
+                    )?)),
+                    None => Ok(None),
                 }
             }
         });
@@ -211,7 +265,18 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             where
                 Self: serde::Serialize,
             {
-                Self::COLLECTION.put(backend, cipher, &self.#key_field, self, expected_etag).await
+                Self::COLLECTION.put(backend, cipher, self.#key_field.as_str(), self, expected_etag).await
+            }
+
+            /// Builds (but doesn't send) a create-only write of this entity
+            /// itself, for a caller assembling a cross-entity
+            /// [`s3db::txn::run`] batch (see `#field_claim_op` on each
+            /// `#[entity(index)]` field for the matching index-claim half).
+            pub fn create_op(&self) -> anyhow::Result<s3db::txn::TxnOp>
+            where
+                Self: serde::Serialize,
+            {
+                s3db::txn::TxnOp::create(Self::COLLECTION.key(self.#key_field.as_str()), self)
             }
 
             /// Soft-delete by key -- see [`s3db::Collection::delete`].
@@ -238,6 +303,14 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     };
 
     Ok(expanded)
+}
+
+/// Parses `key = "value"` inside an `#[entity(index(...))]` list —
+/// `root`/`kind`/`pointer_field` all share this shape.
+fn parse_str_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<String> {
+    let value = meta.value()?;
+    let lit: syn::LitStr = value.parse()?;
+    Ok(lit.value())
 }
 
 fn is_option_type(ty: &syn::Type) -> bool {

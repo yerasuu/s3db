@@ -16,6 +16,19 @@ struct Account {
     is_admin: bool,
 }
 
+/// Mirrors a hand-written index whose root/kind/pointer-field don't follow
+/// the macro's own defaults (collection prefix / field name / `"key"`) — the
+/// shape a real migration of an already-deployed entity needs, so an
+/// existing on-disk index doesn't silently move or reshape underneath it.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize, Entity)]
+#[entity(collection = ".conf/widgets")]
+struct Widget {
+    #[entity(key)]
+    id: String,
+    #[entity(index(root = ".conf/index", kind = "widget-owner", pointer_field = "owner_id"))]
+    owner: Option<String>,
+}
+
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
     let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
     let cipher = Cipher::derive("test passphrase", &[3u8; s3db::cipher::SALT_LEN]).unwrap();
@@ -114,4 +127,47 @@ async fn list_keys_returns_every_stored_username_sorted() {
     Account { username: "bob".into(), email: None, fingerprint: None, is_admin: false }.put(&backend, &cipher, None).await.unwrap();
     Account { username: "alice".into(), email: None, fingerprint: None, is_admin: false }.put(&backend, &cipher, None).await.unwrap();
     assert_eq!(Account::list_keys(&backend).await.unwrap(), vec!["alice".to_string(), "bob".to_string()]);
+}
+
+#[test]
+fn index_root_kind_and_pointer_field_overrides_match_a_hand_written_index() {
+    // Same key shape `SecondaryIndex::new(".conf/index", "widget-owner", Segment::Raw)`
+    // would build by hand -- proves the override lands on an arbitrary
+    // root/kind, not just the macro's own collection-prefix/field-name defaults.
+    assert_eq!(Widget::OWNER_INDEX.key("alice"), ".conf/index/widget-owner/alice.json");
+}
+
+#[tokio::test]
+async fn claim_op_builds_a_txn_creating_the_override_shaped_pointer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let widget = Widget { id: "w1".into(), owner: Some("alice".into()) };
+
+    let ops = vec![widget.create_op().unwrap(), widget.owner_claim_op().unwrap().unwrap()];
+    assert_eq!(s3db::txn::run(&backend, &cipher, ops).await.unwrap(), s3db::Cas::Ok);
+
+    let (fetched, _) = Widget::get(&backend, &cipher, "w1").await.unwrap();
+    assert_eq!(fetched, Some(widget.clone()));
+    let found = Widget::find_by_owner(&backend, &cipher, "alice").await.unwrap();
+    assert_eq!(found, Some(widget));
+}
+
+#[tokio::test]
+async fn claim_op_is_none_for_an_unset_optional_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let widget = Widget { id: "w2".into(), owner: None };
+    assert!(widget.owner_claim_op().unwrap().is_none());
+    widget.put(&backend, &cipher, None).await.unwrap();
+    assert_eq!(Widget::find_by_owner(&backend, &cipher, "").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn create_op_matches_a_plain_put_for_the_same_entity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let account = Account { username: "alice".into(), email: None, fingerprint: None, is_admin: true };
+    assert_eq!(s3db::txn::run(&backend, &cipher, vec![account.create_op().unwrap()]).await.unwrap(), s3db::Cas::Ok);
+    let (fetched, _) = Account::get(&backend, &cipher, "alice").await.unwrap();
+    assert_eq!(fetched, Some(account));
 }
