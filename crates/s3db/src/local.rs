@@ -15,11 +15,10 @@
 //! machines' `gitquarry.toml` at the same NFS-mounted root and expect the
 //! same safety S3/R2/Azure/GCS give.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
 use anyhow::{Context, Result, bail};
 use fs4::tokio::AsyncFileExt;
-use futures::stream::{self, StreamExt};
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 
@@ -182,24 +181,27 @@ impl Backend for LocalBackend {
         Ok(Cas::Ok)
     }
 
-    async fn delete(&self, key: &str) {
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         let lock_file = match lock_key(&self.lock_path(key)).await {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: couldn't delete {key}: {e:#}");
-                return;
+                return Ok(DeleteOutcome { attempted: 1, confirmed: 0 });
             }
         };
         let _ = fs::remove_file(self.data_path(key)).await;
         let _ = fs::remove_file(self.rev_path(key)).await;
         drop(lock_file);
+        Ok(DeleteOutcome { attempted: 1, confirmed: 1 })
     }
 
-    async fn delete_many(&self, keys: &[String]) -> Result<()> {
-        stream::iter(keys)
-            .for_each_concurrent(Some(DELETE_CONCURRENCY), |key| self.delete(key))
-            .await;
-        Ok(())
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
+        let mut outcome = DeleteOutcome::default();
+        for chunk in keys.chunks(DELETE_CONCURRENCY) {
+            let results: Vec<DeleteOutcome> = futures::future::try_join_all(chunk.iter().map(|key| self.delete(key))).await?;
+            outcome = DeleteOutcome::combine([outcome].into_iter().chain(results));
+        }
+        Ok(outcome)
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
@@ -329,8 +331,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
         b.put_cas("k", b"v".to_vec(), None).await.unwrap();
-        b.delete("k").await;
-        b.delete("k").await; // second delete of an already-gone key: no error
+        b.delete("k").await.unwrap();
+        b.delete("k").await.unwrap(); // second delete of an already-gone key: no error
         let (bytes, etag) = b.get("k").await.unwrap();
         assert!(bytes.is_empty());
         assert!(etag.is_none());

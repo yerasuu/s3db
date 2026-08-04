@@ -10,6 +10,32 @@ pub enum Cas {
     Conflict,
 }
 
+/// Outcome of a best-effort delete. Informative bookkeeping, never a
+/// business-logic failure signal — nothing here changes the underlying
+/// contract that a caller never depends on a delete actually landing. But it
+/// gives a caller that *does* want to know (an orphan-purge retry, a GC
+/// sweep) a real answer instead of silently guessing: `confirmed < attempted`
+/// means some keys are still out there, `confirmed == attempted` means every
+/// one of them is gone (or was already gone — a 404 on delete counts as
+/// confirmed, same as a 200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeleteOutcome {
+    pub attempted: usize,
+    pub confirmed: usize,
+}
+
+impl DeleteOutcome {
+    /// Sums a batch of per-key outcomes into one — every driver's
+    /// `delete_many` fans out to individual deletes and needs to fold the
+    /// results back into a single [`DeleteOutcome`].
+    pub(crate) fn combine(results: impl IntoIterator<Item = DeleteOutcome>) -> Self {
+        results.into_iter().fold(DeleteOutcome::default(), |acc, o| DeleteOutcome {
+            attempted: acc.attempted + o.attempted,
+            confirmed: acc.confirmed + o.confirmed,
+        })
+    }
+}
+
 /// One storage provider, bound to a single bucket/container/root at
 /// construction time — every method below takes just a `key`, never a
 /// bucket, because there's nothing left to disambiguate once a `Backend` is
@@ -30,14 +56,19 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// from silently clobbering another one.
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas>;
     /// Best-effort delete: missing-already isn't an error (the caller's
-    /// goal, "this key is gone", already holds), and nothing here ever
-    /// propagates a failure — never used for anything a caller actually
-    /// depends on succeeding, that's what [`Self::put_cas`] is for.
-    async fn delete(&self, key: &str);
+    /// goal, "this key is gone", already holds), and a single key's own
+    /// delete failure never aborts the call — never used for anything a
+    /// caller actually depends on succeeding, that's what [`Self::put_cas`]
+    /// is for. The returned [`DeleteOutcome`] is that "best-effort" made
+    /// legible instead of silently swallowed.
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome>;
     /// Same as [`Self::delete`], batched — each driver chunks internally to
     /// its own provider-side limit (S3's `DeleteObjects` caps at 1000, for
-    /// instance), so callers never have to know it.
-    async fn delete_many(&self, keys: &[String]) -> Result<()>;
+    /// instance), so callers never have to know it. Same signature as
+    /// [`Self::delete`] on purpose (see [`DeleteOutcome`]'s doc comment) —
+    /// there's no reason one of the two should be able to report what
+    /// happened and the other not.
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome>;
     /// Every `(key, size)` under `prefix`, fully paginated internally.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>>;
     /// Uploads `source` (a file already on local disk, already-sealed

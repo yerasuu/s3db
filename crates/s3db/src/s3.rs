@@ -6,7 +6,7 @@
 //! from an account id instead of typed in by hand — same `aws-sdk-s3`
 //! client either way.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::{R2Params, S3Params};
 use anyhow::{Context, Result, bail};
 use aws_sdk_s3::Client;
@@ -131,16 +131,21 @@ impl Backend for S3Backend {
         }
     }
 
-    async fn delete(&self, key: &str) {
-        if let Err(err) = self.client.delete_object().bucket(&self.bucket).key(key).send().await
-            && !is_not_found(&err)
-        {
-            eprintln!("gitquarry: warning: couldn't delete {key} from S3: {err}");
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        match self.client.delete_object().bucket(&self.bucket).key(key).send().await {
+            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(err) if is_not_found(&err) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(err) => {
+                eprintln!("gitquarry: warning: couldn't delete {key} from S3: {err}");
+                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+            }
         }
     }
 
-    async fn delete_many(&self, keys: &[String]) -> Result<()> {
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
+        let mut outcome = DeleteOutcome::default();
         for chunk in keys.chunks(DELETE_BATCH_SIZE) {
+            outcome.attempted += chunk.len();
             let objects: Vec<aws_sdk_s3::types::ObjectIdentifier> = chunk
                 .iter()
                 .map(|k| {
@@ -154,15 +159,24 @@ impl Backend for S3Backend {
                 .set_objects(Some(objects))
                 .build()
                 .context("building the delete request")?;
-            self.client
+            let out = self
+                .client
                 .delete_objects()
                 .bucket(&self.bucket)
                 .delete(delete)
                 .send()
                 .await
                 .context("deleting objects from S3")?;
+            outcome.confirmed += out.deleted().len();
+            for err in out.errors() {
+                eprintln!(
+                    "gitquarry: warning: couldn't delete {} from S3: {}",
+                    err.key().unwrap_or("?"),
+                    err.message().unwrap_or("unknown error")
+                );
+            }
         }
-        Ok(())
+        Ok(outcome)
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {

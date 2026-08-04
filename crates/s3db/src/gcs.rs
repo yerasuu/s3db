@@ -16,14 +16,15 @@
 //! where building the client handle itself, not only the first request,
 //! needs `.await`.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::GcsParams;
 use anyhow::{Context, Result, bail};
-use futures::stream::{self, TryStreamExt};
+use futures::stream::{self, StreamExt};
 use google_cloud_auth::credentials::service_account;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_storage::client::{Storage, StorageControl};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::OnceCell;
 
@@ -127,46 +128,46 @@ impl Backend for GcsBackend {
         }
     }
 
-    async fn delete(&self, key: &str) {
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         let clients = match self.client_pair().await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e:#}");
-                return;
+                return Ok(DeleteOutcome { attempted: 1, confirmed: 0 });
             }
         };
         let (_, control) = clients;
-        if let Err(e) = control
-            .delete_object()
-            .set_bucket(self.bucket_resource())
-            .set_object(key)
-            .send()
-            .await
-            && status_code(&e) != Some(404)
-        {
-            eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}");
+        match control.delete_object().set_bucket(self.bucket_resource()).set_object(key).send().await {
+            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(e) if status_code(&e) == Some(404) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(e) => {
+                eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}");
+                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+            }
         }
     }
 
-    async fn delete_many(&self, keys: &[String]) -> Result<()> {
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
         // No batch-delete in this API — bounded concurrency instead of one
-        // request at a time.
+        // request at a time. A single key's failure only counts against
+        // `confirmed`, it never aborts the keys still in flight.
         let (_, control) = self.client_pair().await?;
-        stream::iter(keys.iter().map(Ok::<_, anyhow::Error>))
-            .try_for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
-                if let Err(e) = control
-                    .delete_object()
-                    .set_bucket(self.bucket_resource())
-                    .set_object(key.as_str())
-                    .send()
-                    .await
-                    && status_code(&e) != Some(404)
-                {
-                    return Err(e).with_context(|| format!("deleting {key} from Google Cloud Storage"));
+        let confirmed = AtomicUsize::new(0);
+        let confirmed_ref = &confirmed;
+        stream::iter(keys)
+            .for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
+                match control.delete_object().set_bucket(self.bucket_resource()).set_object(key.as_str()).send().await {
+                    Ok(_) => {
+                        confirmed_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if status_code(&e) == Some(404) => {
+                        confirmed_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}"),
                 }
-                Ok(())
             })
-            .await
+            .await;
+        Ok(DeleteOutcome { attempted: keys.len(), confirmed: confirmed.load(Ordering::Relaxed) })
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {

@@ -5,7 +5,7 @@
 //! `If-None-Match`) map directly onto [`Backend::put_cas`], same as S3 —
 //! this driver doesn't need the local driver's flock emulation.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::AzureParams;
 use anyhow::{Context, Result, bail};
 use azure_core::StatusCode;
@@ -14,8 +14,9 @@ use azure_core::prelude::IfMatchCondition;
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::prelude::{BlobBlockType, BlobClient, BlockId, BlockList, ClientBuilder, ContainerClient};
 use futures::StreamExt;
-use futures::stream::{self, TryStreamExt};
+use futures::stream;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How many keys [`AzureBackend::delete_many`] deletes at once — this API
@@ -91,28 +92,38 @@ impl Backend for AzureBackend {
         }
     }
 
-    async fn delete(&self, key: &str) {
-        if let Err(e) = self.blob(key).delete().await
-            && !is_not_found(&e)
-        {
-            eprintln!("warning: couldn't delete {key} from Azure Blob Storage: {e}");
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        match self.blob(key).delete().await {
+            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(e) if is_not_found(&e) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Err(e) => {
+                eprintln!("warning: couldn't delete {key} from Azure Blob Storage: {e}");
+                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+            }
         }
     }
 
-    async fn delete_many(&self, keys: &[String]) -> Result<()> {
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
         // No S3-style batch-delete in this crate (Azure's own "Blob Batch"
         // REST call isn't exposed here) — bounded concurrency instead of
-        // one request at a time.
-        stream::iter(keys.iter().map(Ok::<_, anyhow::Error>))
-            .try_for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
-                if let Err(e) = self.blob(key).delete().await
-                    && !is_not_found(&e)
-                {
-                    return Err(e).with_context(|| format!("deleting {key} from Azure Blob Storage"));
+        // one request at a time. A single key's failure only counts against
+        // `confirmed`, it never aborts the keys still in flight.
+        let confirmed = AtomicUsize::new(0);
+        let confirmed_ref = &confirmed;
+        stream::iter(keys)
+            .for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
+                match self.blob(key).delete().await {
+                    Ok(_) => {
+                        confirmed_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if is_not_found(&e) => {
+                        confirmed_ref.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => eprintln!("warning: couldn't delete {key} from Azure Blob Storage: {e}"),
                 }
-                Ok(())
             })
-            .await
+            .await;
+        Ok(DeleteOutcome { attempted: keys.len(), confirmed: confirmed.load(Ordering::Relaxed) })
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {

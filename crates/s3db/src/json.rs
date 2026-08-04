@@ -68,7 +68,7 @@ pub(crate) async fn put_json_plain<T: Serialize>(
 /// as [`get_json`]/[`put_json`] instead of needing the trait itself in
 /// scope.
 pub async fn delete_object(backend: &dyn Backend, key: &str) {
-    backend.delete(key).await
+    let _ = backend.delete(key).await;
 }
 
 /// [`Backend::list_prefix`], keys only — what most prefix-scans need.

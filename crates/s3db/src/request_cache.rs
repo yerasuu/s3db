@@ -6,7 +6,7 @@
 //! should. Callers are expected to build one `RequestCache` per connection
 //! or request and drop it afterward — never stash it somewhere long-lived.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, DeleteOutcome};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -54,12 +54,13 @@ impl Backend for RequestCache {
         result
     }
 
-    async fn delete(&self, key: &str) {
-        self.inner.delete(key).await;
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        let result = self.inner.delete(key).await;
         self.reads.lock().unwrap().remove(key);
+        result
     }
 
-    async fn delete_many(&self, keys: &[String]) -> Result<()> {
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
         let result = self.inner.delete_many(keys).await;
         let mut reads = self.reads.lock().unwrap();
         for key in keys {
@@ -119,11 +120,11 @@ mod tests {
             self.inner.put_cas(key, body, expected_etag).await
         }
 
-        async fn delete(&self, key: &str) {
+        async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
             self.inner.delete(key).await
         }
 
-        async fn delete_many(&self, keys: &[String]) -> Result<()> {
+        async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
             self.inner.delete_many(keys).await
         }
 
@@ -190,7 +191,7 @@ mod tests {
         assert_eq!(bytes1, b"v1");
         assert_eq!(counting.get_count(), 1);
 
-        cache.delete("k").await;
+        cache.delete("k").await.unwrap();
 
         let (bytes2, etag2) = cache.get("k").await.unwrap();
         assert!(bytes2.is_empty());
