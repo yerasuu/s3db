@@ -1,0 +1,364 @@
+//! Create-only multi-key transactions: applies a batch of independent
+//! CAS-create writes so either every key ends up created, or none do,
+//! surviving a process crash mid-transaction.
+//!
+//! Deliberately narrow: every op's `expected_etag` is implicitly `None` (no
+//! updates in this version). That's what makes the rest of this module
+//! simple -- because every write is a create, the target object *is* its own
+//! lock: whoever's `put_cas` lands first owns that key, permanently, with no
+//! window for someone else to later steal it out from under a live holder.
+//! There's no staleness/liveness protocol here (unlike, say, a lock that can
+//! be released and re-acquired) because none is needed; that complexity only
+//! shows up once updates are in scope, which they explicitly aren't.
+
+use crate::backend::{Backend, Cas};
+use crate::cipher::Cipher;
+use crate::json::{delete_object, get_json, list_all_keys, put_json};
+use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Where in-flight transaction records live -- deliberately under `.conf/`,
+/// alongside every other piece of server-side bookkeeping, never inside a
+/// repo's own storage prefix.
+const TXN_PREFIX: &str = ".conf/txn";
+
+/// One create-only write inside a [`run`] batch. `value` is already a
+/// `serde_json::Value` (not generic `T`) so a batch can freely mix ops for
+/// different concrete types -- `TxnRecord` itself has to serialize the whole
+/// `Vec<TxnOp>` as one JSON document, which a generic `T` couldn't do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxnOp {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+impl TxnOp {
+    pub fn create<T: Serialize>(key: String, value: &T) -> Result<Self> {
+        Ok(TxnOp { key, value: serde_json::to_value(value)? })
+    }
+}
+
+/// `Preparing`: ops may or may not all be applied yet -- [`recover_stale`]
+/// only ever touches records in this state. `Committed`: every op landed;
+/// the record is deleted right after reaching this state, so in practice
+/// this value is only ever observed transiently, if at all. `Aborting`:
+/// [`recover_stale`] has claimed ownership of a stale `Preparing` record and
+/// is (or already did) roll it back -- this is what stops the original
+/// `run` call, if it's actually still alive and slow rather than dead, from
+/// also trying to commit the same record out from under the sweep.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+enum TxnStatus {
+    #[default]
+    Preparing,
+    Committed,
+    Aborting,
+}
+
+/// Durable record of one in-flight transaction, at `.conf/txn/<txn_id>.json`.
+/// `Default` only exists to satisfy [`get_json`]'s `T: DeserializeOwned +
+/// Default` bound for the "doesn't exist yet" case -- every real caller here
+/// checks the returned etag for existence, never branches on a
+/// `Default`-constructed record's `status`, so `TxnStatus`'s default variant
+/// is an implementation detail, not something anyone needs to reason about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TxnRecord {
+    txn_id: String,
+    status: TxnStatus,
+    started_at_ms: u64,
+    ops: Vec<TxnOp>,
+}
+
+fn txn_key(txn_id: &str) -> String {
+    format!("{TXN_PREFIX}/{txn_id}.json")
+}
+
+/// Real wall-clock time, not a deterministic-replay clock: this is only ever
+/// compared against `max_age` on this same process's later wall-clock time,
+/// never persisted anywhere that needs reproducibility.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
+}
+
+/// 128 bits from the system RNG, lowercase hex -- same technique
+/// [`crate::bootstrap::random_salt`] already uses for the encryption salt.
+fn random_txn_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating transaction id: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Applies `ops` atomically: every key ends up created, or none do.
+pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) -> Result<Cas> {
+    // Sorting first means any two transactions racing over an overlapping
+    // key set always hit their first shared key in the same order -- one of
+    // them deterministically loses there, so there's never a cycle where
+    // each is waiting on a key the other already grabbed.
+    ops.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let txn_id = random_txn_id()?;
+    let record_key = txn_key(&txn_id);
+    let record = TxnRecord {
+        txn_id: txn_id.clone(),
+        status: TxnStatus::Preparing,
+        started_at_ms: now_ms(),
+        ops: ops.clone(),
+    };
+    match put_json(backend, &record_key, &record, None, cipher).await? {
+        Cas::Ok => {}
+        // A random 128-bit id colliding with another in-flight transaction
+        // is astronomically unlikely -- not worth a retry-with-new-id loop.
+        Cas::Conflict => bail!("transaction id collision on {txn_id} (should never happen)"),
+    }
+    // `put_cas`/`put_json` only ever return `Cas`, never the etag of what
+    // they just wrote -- this extra read is what step 4 below needs to
+    // CAS the record from `Preparing` to `Committed`.
+    let (_, record_etag) = get_json::<TxnRecord>(backend, &record_key, cipher).await?;
+
+    for op in &ops {
+        let plain = serde_json::to_vec(&op.value)?;
+        let sealed = cipher.seal(&op.key, &plain);
+        match backend.put_cas(&op.key, sealed, None).await? {
+            Cas::Ok => continue,
+            Cas::Conflict => {
+                let (existing_sealed, existing_etag) = backend.get(&op.key).await?;
+                let is_ours = if existing_etag.is_some() {
+                    let existing_plain = cipher.open(&op.key, &existing_sealed)?;
+                    let existing_value: serde_json::Value = serde_json::from_slice(&existing_plain)?;
+                    existing_value == op.value
+                } else {
+                    false
+                };
+                if is_ours {
+                    // Our own prior attempt at this exact transaction,
+                    // re-running after a crash between this op and the next.
+                    continue;
+                }
+                // A genuinely different write got there first -- undo
+                // whatever this attempt already created and give up.
+                rollback(backend, cipher, &record).await?;
+                return Ok(Cas::Conflict);
+            }
+        }
+    }
+
+    let committed = TxnRecord { status: TxnStatus::Committed, ..record };
+    match put_json(backend, &record_key, &committed, record_etag.as_deref(), cipher).await? {
+        Cas::Ok => {
+            delete_object(backend, &record_key).await;
+            Ok(Cas::Ok)
+        }
+        // The record's etag moved out from under us since step 2's read --
+        // the only thing that can do that is `recover_stale` flipping it to
+        // `Aborting`, meaning it already decided this transaction was dead
+        // and is (or just did) roll it back. Doing so ourselves too is safe:
+        // rollback only ever deletes a key if its content still matches
+        // this transaction's own op, so a second pass over the same ops is
+        // a no-op wherever the sweep's pass already ran.
+        Cas::Conflict => {
+            rollback(backend, cipher, &committed).await?;
+            Ok(Cas::Conflict)
+        }
+    }
+}
+
+/// Undoes whatever `record`'s ops actually got applied, then removes the
+/// record itself. Idempotent, and safe to call more than once concurrently
+/// (from [`run`] and [`recover_stale`] both) -- every delete is gated on the
+/// current content still matching exactly what this transaction wrote.
+async fn rollback(backend: &dyn Backend, cipher: &Cipher, record: &TxnRecord) -> Result<()> {
+    for op in &record.ops {
+        let (sealed, etag) = backend.get(&op.key).await?;
+        if etag.is_none() {
+            continue; // never got created (or something already cleaned it up)
+        }
+        let plain = cipher.open(&op.key, &sealed)?;
+        let value: serde_json::Value = serde_json::from_slice(&plain)?;
+        if value == op.value {
+            delete_object(backend, &op.key).await;
+        }
+        // Else: something else legitimately claimed this key after this
+        // transaction gave up on it -- never blind-delete on a mismatch,
+        // that would destroy someone else's real data.
+    }
+    delete_object(backend, &txn_key(&record.txn_id)).await;
+    Ok(())
+}
+
+/// Sweeps `.conf/txn/` for transactions that have been `Preparing` for
+/// longer than `max_age` and rolls them back -- the recovery path for a
+/// process that crashed mid-[`run`] and never got to either commit or abort
+/// its own record. Returns how many this call actually rolled back.
+pub async fn recover_stale(backend: &dyn Backend, cipher: &Cipher, max_age: Duration) -> Result<usize> {
+    let keys = list_all_keys(backend, &format!("{TXN_PREFIX}/")).await?;
+    let cutoff_ms = max_age.as_millis() as u64;
+    let now = now_ms();
+    let mut recovered = 0;
+    for key in keys {
+        let (record, etag) = get_json::<TxnRecord>(backend, &key, cipher).await?;
+        let Some(etag) = etag else { continue };
+        if record.status != TxnStatus::Preparing {
+            continue;
+        }
+        if now.saturating_sub(record.started_at_ms) <= cutoff_ms {
+            continue;
+        }
+        let aborting = TxnRecord { status: TxnStatus::Aborting, ..record };
+        match put_json(backend, &key, &aborting, Some(&etag), cipher).await? {
+            Cas::Ok => {
+                // Ownership has now cleanly transferred to this sweep: the
+                // original `run` call's own step-4 CAS is guaranteed to
+                // lose from here, since the record's etag just changed.
+                rollback(backend, cipher, &aborting).await?;
+                recovered += 1;
+            }
+            // Someone else (the original caller mid-commit, or another
+            // concurrent sweep) already moved this record -- leave it alone.
+            Cas::Conflict => continue,
+        }
+    }
+    Ok(recovered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local::LocalBackend;
+
+    fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
+        let backend = LocalBackend::new(&crate::config::LocalParams { bucket: root.to_string_lossy().to_string() });
+        let cipher = Cipher::derive("test passphrase", &[11u8; crate::cipher::SALT_LEN]).unwrap();
+        (backend, cipher)
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    struct Widget {
+        count: u32,
+    }
+
+    #[tokio::test]
+    async fn happy_path_creates_all_keys_and_no_leftover_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+            TxnOp::create("c.json".to_string(), &Widget { count: 3 }).unwrap(),
+        ];
+        let cas = run(&backend, &cipher, ops).await.unwrap();
+        assert_eq!(cas, Cas::Ok);
+
+        for (key, expected) in [("a.json", 1), ("b.json", 2), ("c.json", 3)] {
+            let (value, etag) = get_json::<Widget>(&backend, key, &cipher).await.unwrap();
+            assert_eq!(value.count, expected);
+            assert!(etag.is_some());
+        }
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conflicting_op_aborts_and_rolls_back_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        // Pre-created with content different from what the transaction below
+        // will try to write -- a genuine collision, not our own retry.
+        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher).await.unwrap();
+
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+            TxnOp::create("c.json".to_string(), &Widget { count: 3 }).unwrap(),
+        ];
+        let cas = run(&backend, &cipher, ops).await.unwrap();
+        assert_eq!(cas, Cas::Conflict);
+
+        // "a.json" (sorts before "b.json") got created by this attempt, then
+        // rolled back; "c.json" never got created in the first place.
+        let (_, a_etag) = get_json::<Widget>(&backend, "a.json", &cipher).await.unwrap();
+        assert!(a_etag.is_none());
+        let (_, c_etag) = get_json::<Widget>(&backend, "c.json", &cipher).await.unwrap();
+        assert!(c_etag.is_none());
+        // "b.json" keeps its original content untouched -- never blind-deleted.
+        let (b, _) = get_json::<Widget>(&backend, "b.json", &cipher).await.unwrap();
+        assert_eq!(b.count, 99);
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rerun_after_partial_crash_treats_the_already_applied_op_as_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+            TxnOp::create("c.json".to_string(), &Widget { count: 3 }).unwrap(),
+        ];
+        // Simulates a crash after a previous `run` applied only this one op
+        // directly, bypassing `run`'s own txn record entirely -- the exact
+        // content `run` would have produced, so this must read as "ours".
+        let sealed = cipher.seal(&ops[0].key, &serde_json::to_vec(&ops[0].value).unwrap());
+        assert_eq!(backend.put_cas(&ops[0].key, sealed, None).await.unwrap(), Cas::Ok);
+
+        let cas = run(&backend, &cipher, ops).await.unwrap();
+        assert_eq!(cas, Cas::Ok);
+        for (key, expected) in [("a.json", 1), ("b.json", 2), ("c.json", 3)] {
+            let (value, etag) = get_json::<Widget>(&backend, key, &cipher).await.unwrap();
+            assert_eq!(value.count, expected);
+            assert!(etag.is_some());
+        }
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recover_stale_rolls_back_an_abandoned_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let op = TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap();
+        let record = TxnRecord {
+            txn_id: "deadbeef".to_string(),
+            status: TxnStatus::Preparing,
+            started_at_ms: 0, // arbitrarily old
+            ops: vec![op.clone()],
+        };
+        put_json(&backend, &txn_key(&record.txn_id), &record, None, &cipher).await.unwrap();
+        // Simulates the real partial-apply a crashed `run` would leave behind.
+        let sealed = cipher.seal(&op.key, &serde_json::to_vec(&op.value).unwrap());
+        assert_eq!(backend.put_cas(&op.key, sealed, None).await.unwrap(), Cas::Ok);
+
+        let recovered = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();
+        assert_eq!(recovered, 1);
+        let (_, etag) = get_json::<Widget>(&backend, &op.key, &cipher).await.unwrap();
+        assert!(etag.is_none());
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_overlapping_transactions_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let ops_a = vec![
+            TxnOp::create("shared.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("only_a.json".to_string(), &Widget { count: 10 }).unwrap(),
+        ];
+        let ops_b = vec![
+            TxnOp::create("shared.json".to_string(), &Widget { count: 2 }).unwrap(),
+            TxnOp::create("only_b.json".to_string(), &Widget { count: 20 }).unwrap(),
+        ];
+
+        let cas_a = run(&backend, &cipher, ops_a).await.unwrap();
+        let cas_b = run(&backend, &cipher, ops_b).await.unwrap();
+        assert_eq!(cas_a, Cas::Ok);
+        assert_eq!(cas_b, Cas::Conflict);
+
+        let (shared, _) = get_json::<Widget>(&backend, "shared.json", &cipher).await.unwrap();
+        assert_eq!(shared.count, 1);
+        let (_, only_a_etag) = get_json::<Widget>(&backend, "only_a.json", &cipher).await.unwrap();
+        assert!(only_a_etag.is_some());
+        let (_, only_b_etag) = get_json::<Widget>(&backend, "only_b.json", &cipher).await.unwrap();
+        assert!(only_b_etag.is_none(), "the loser's non-conflicting op must have been rolled back too");
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+}

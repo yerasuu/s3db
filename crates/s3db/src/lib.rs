@@ -18,6 +18,7 @@ pub mod config;
 pub mod index;
 pub mod json;
 pub mod request_cache;
+pub mod txn;
 
 mod azure;
 mod gcs;
