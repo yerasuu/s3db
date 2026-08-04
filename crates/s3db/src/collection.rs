@@ -57,6 +57,13 @@ pub enum PurgeState {
     Purged,
 }
 
+/// Companion record for one `.history/{name}/{etag}.json` archive -- see
+/// [`Collection::archive_history_timestamp`]/[`Collection::version_timestamp`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct HistoryTimestamp {
+    archived_at_ms: u64,
+}
+
 /// `Cow` rather than a plain `&'static str`: most collections (users,
 /// groups, ...) have a fixed prefix known at compile time, but a few are
 /// scoped per-call to some runtime value (e.g. "every permission grant
@@ -210,9 +217,40 @@ impl Collection {
                 // genuine `Err` (backend/serialization failure) needs to
                 // propagate.
                 put_json(backend, &format!("{}/{etag}.json", self.history_prefix(name)), &current_value, None, cipher).await?;
+                self.archive_history_timestamp(backend, cipher, name, etag).await;
             }
         }
         self.put(backend, cipher, name, value, expected_etag).await
+    }
+
+    fn history_timestamp_key(&self, name: &str, etag: &str) -> String {
+        format!("{}/{etag}.meta.json", self.history_prefix(name))
+    }
+
+    /// Records when the `etag` version of `name` was archived, alongside
+    /// the archive itself -- a companion object, not a field on the
+    /// archive's own payload, so this stays entirely orthogonal to what `T`
+    /// is (both [`Self::put_versioned`]'s typed archiving and
+    /// [`Self::archive_for_delete`]'s raw-byte archiving can write one the
+    /// same way). Best-effort and create-only: same idempotency reasoning
+    /// as the archive write itself (the same `etag` always archives at
+    /// close to the same moment in practice; a lost race here just means
+    /// [`Self::version_timestamp`] returns `None` for this version, which
+    /// [`crate::snapshot::ReadSnapshot`] already treats as "can't place
+    /// this version in time, skip it").
+    async fn archive_history_timestamp(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, etag: &str) {
+        let record = HistoryTimestamp { archived_at_ms: now_ms() };
+        let _ = put_json(backend, &self.history_timestamp_key(name, etag), &record, None, cipher).await;
+    }
+
+    /// When the `etag` version of `name` was archived, if that's known --
+    /// `None` if no companion timestamp was ever written (a lost race on
+    /// [`Self::archive_history_timestamp`]) or the version itself doesn't
+    /// exist. [`crate::snapshot::ReadSnapshot`] uses this to find the
+    /// version that was live as of a given moment.
+    pub async fn version_timestamp(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, etag: &str) -> Result<Option<u64>> {
+        let (record, found) = get_json::<HistoryTimestamp>(backend, &self.history_timestamp_key(name, etag), cipher).await?;
+        Ok(found.map(|_| record.archived_at_ms))
     }
 
     /// Soft-delete: archives whatever value currently lives at `name` (so
@@ -281,7 +319,10 @@ impl Collection {
         // this exact archive entry already exists (a prior delete attempt
         // that got this far but failed later) -- fine either way.
         match backend.put_cas(&history_key, resealed, None).await {
-            Ok(_) => Some(etag.to_string()),
+            Ok(_) => {
+                self.archive_history_timestamp(backend, cipher, name, etag).await;
+                Some(etag.to_string())
+            }
             Err(e) => {
                 eprintln!("warning: couldn't archive {name} before deleting it: {e:#}");
                 None
@@ -371,7 +412,15 @@ impl Collection {
         let mut etags: Vec<String> = list_all_keys(backend, &scan_prefix)
             .await?
             .into_iter()
-            .filter_map(|key| key.strip_prefix(&scan_prefix)?.strip_suffix(".json").map(str::to_string))
+            .filter_map(|key| {
+                let rest = key.strip_prefix(&scan_prefix)?;
+                // `.meta.json` companions carry `Self::version_timestamp`,
+                // not an archived value themselves.
+                if rest.ends_with(".meta.json") {
+                    return None;
+                }
+                rest.strip_suffix(".json").map(str::to_string)
+            })
             .collect();
         etags.sort();
         Ok(etags)

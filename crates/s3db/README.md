@@ -207,6 +207,20 @@ match s3db::txn::run(backend, &cipher, ops).await? {
 
 A `Preparing` record at `.conf/txn/<txn_id>.json` survives a crash mid-transaction; `txn::recover_stale(backend, &cipher, max_age)` — run at server startup — sweeps records older than `max_age` still `Preparing`, aborts and rolls them back, and returns how many it cleaned up.
 
+## Point-in-time reads (opt-in)
+
+`snapshot::ReadSnapshot` gives a best-effort, time-bounded view over a `Collection`'s `.history/` archive — **not** real MVCC, no cross-entity atomicity, same honesty `backup::BackupConsistency::FuzzySnapshot` already commits to for a full-bucket backup, just at single-entity scale:
+
+```rust
+let snap = s3db::snapshot::ReadSnapshot::open(backend, &cipher, Duration::from_secs(300)).await?;
+let value: Option<User> = snap.get(backend, &cipher, &USERS, "alice").await?;
+snap.close(backend).await; // best-effort, releases the lease early
+```
+
+`open`'s `max_duration` is a hard cap, not a suggestion — this isn't for long-lived snapshots (that's a real point-in-time backup restore's job), it only exists so a GC/maintenance sweep that happens to prune `.history/` mid-read doesn't yank a version out from under an in-flight snapshot. It registers a `SnapshotLease` at `.conf/snapshots/<snapshot_id>.json`; a sweep is expected to check `now - timestamp_ms < max_duration_ms` before pruning any history entry whose own timestamp falls inside that window.
+
+`Collection::version_timestamp` (the timestamp behind this) records when a `.history/` entry was *retired* (overwritten by the next write), stored in a companion `{etag}.meta.json` object alongside the archive itself — orthogonal to `T`, so both `put_versioned`'s typed archiving and `Collection::delete`'s raw-byte archiving write one the same way.
+
 ## Write-ahead log (opt-in)
 
 `txn::run` already recovers a crashed multi-key transaction; `wal` covers the gap that leaves — a single `put_cas` outside a transaction whose response never arrives, so nobody can tell "never attempted" from "attempted, landed or not, we don't know" from the outside:

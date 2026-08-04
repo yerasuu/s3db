@@ -34,6 +34,7 @@ pub mod request_cache;
 pub mod resilience;
 mod shard;
 pub mod sharded_index;
+pub mod snapshot;
 pub mod txn;
 pub mod wal;
 
@@ -54,6 +55,7 @@ pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_
 pub use request_cache::RequestCache;
 pub use resilience::{CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend};
 pub use sharded_index::{ShardEpoch, ShardedIndex};
+pub use snapshot::{ReadSnapshot, SnapshotLease};
 
 /// ORM-style shortcut: `#[derive(Entity)]` generates the `Collection`/
 /// `SecondaryIndex` boilerplate a hand-written entity would otherwise repeat
