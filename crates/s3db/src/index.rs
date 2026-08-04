@@ -51,6 +51,15 @@ impl SecondaryIndex {
         format!("{}/{}/{}.json", self.root, self.kind, self.segment.encode(raw))
     }
 
+    /// Raw CAS write against an arbitrary `expected_etag` — the primitive
+    /// [`Self::claim_once`]/[`Self::claim_self_healing`] build on. For a
+    /// caller that already has an etag in hand (e.g. reclaiming after its
+    /// own liveness check) and wants the real [`Cas`] outcome rather than a
+    /// collapsed bool.
+    pub async fn put_raw<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str, value: &T, expected_etag: Option<&str>) -> Result<Cas> {
+        put_json(backend, &self.key(raw), value, expected_etag, cipher).await
+    }
+
     pub async fn resolve<T: DeserializeOwned + Default>(
         &self,
         backend: &dyn Backend,
