@@ -6,12 +6,56 @@
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
 use crate::json::{delete_object, get_json, list_all_keys, put_json};
-use anyhow::Result;
-use serde::Serialize;
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinSet;
+
+/// Real wall-clock time, not a deterministic-replay clock -- only ever
+/// stored for humans/audits to read later, same reasoning as
+/// `crate::txn::now_ms`.
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+}
+
+/// Soft-delete marker for one [`Collection`] entry, at
+/// `{prefix}/.deleted/{name}.json`. Decoupled on purpose from whether the
+/// real object's bytes have actually been scrubbed from the backend yet --
+/// [`Backend::delete`] is best-effort and can fail to land, and without this
+/// there'd be no durable record that a retry is still owed.
+///
+/// Deliberately NOT consulted by [`Collection::get`]: checking it on every
+/// read would double every `get`'s round-trip cost forever, to serve a retry
+/// mechanism that doesn't exist in this crate yet (no GC sweep reads
+/// `PurgeState::Pending` today). In the narrow window between a
+/// [`Collection::delete`] call and its underlying [`Backend::delete`]
+/// actually landing, `get` still faithfully reports the real backend state,
+/// not the tombstone's intent -- the same "self-healing, not immediately
+/// consistent" tolerance every other best-effort index in this codebase
+/// already has, not a new one invented here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub deleted_at_ms: u64,
+    pub purge_state: PurgeState,
+    /// The archived-history etag ([`Collection::get_version`]) that held
+    /// this entry's value at the moment it was deleted -- `None` if the
+    /// entry either didn't exist or couldn't be archived, in which case
+    /// [`Collection::restore`] has nothing to bring back.
+    pub restore_etag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PurgeState {
+    /// Tombstone written; [`Backend::delete`] on the real object hasn't
+    /// confirmed yet (either not attempted, or attempted and failed).
+    #[default]
+    Pending,
+    /// The underlying delete confirmed (or the object was already gone).
+    Purged,
+}
 
 /// `Cow` rather than a plain `&'static str`: most collections (users,
 /// groups, ...) have a fixed prefix known at compile time, but a few are
@@ -51,6 +95,14 @@ impl Collection {
     /// `suffix` this collection uses for its main entries.
     fn history_prefix(&self, name: &str) -> String {
         format!("{}/.history/{name}", self.prefix)
+    }
+
+    /// Where [`Self::delete`]'s tombstone for `name` lives -- parallel to
+    /// (not nested inside) `name`'s own [`Self::key`] and [`Self::history_prefix`],
+    /// same reasoning as both: independent of whatever `suffix` this
+    /// collection uses for its main entries.
+    fn tombstone_key(&self, name: &str) -> String {
+        format!("{}/.deleted/{name}.json", self.prefix)
     }
 
     /// Reads `name`. `None` (not `T::default()`) is the "doesn't exist"
@@ -122,9 +174,120 @@ impl Collection {
         self.put(backend, cipher, name, value, expected_etag).await
     }
 
-    /// Best-effort delete — same contract as [`Backend::delete`].
-    pub async fn delete(&self, backend: &dyn Backend, name: &str) {
-        delete_object(backend, &self.key(name)).await;
+    /// Soft-delete: archives whatever value currently lives at `name` (so
+    /// [`Self::restore`] has something to bring back), writes a `Pending`
+    /// tombstone recording that archive's etag, then best-effort-deletes the
+    /// real object -- marking the tombstone `Purged` only once that
+    /// underlying delete actually confirms (or the object was already
+    /// gone). A delete that fails to land leaves the tombstone `Pending`: a
+    /// durable, inspectable record that this key still owes a real purge,
+    /// instead of a lost fire-and-forget with no trace anyone could act on.
+    pub async fn delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) {
+        let key = self.key(name);
+        let (sealed, etag) = match backend.get(&key).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warning: couldn't read {name} before deleting it: {e:#}");
+                (Vec::new(), None)
+            }
+        };
+        let restore_etag = self.archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref()).await;
+
+        let tombstone_key = self.tombstone_key(name);
+        let (_, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await.unwrap_or_default();
+        let pending = Tombstone { deleted_at_ms: now_ms(), purge_state: PurgeState::Pending, restore_etag };
+        if put_json(backend, &tombstone_key, &pending, tomb_etag.as_deref(), cipher).await.is_err() {
+            return; // couldn't even record intent -- nothing to retry from, bail
+        }
+
+        let confirmed = backend.delete(&key).await.map(|o| o.confirmed == o.attempted).unwrap_or(false);
+        if confirmed {
+            // Re-read for a fresh etag rather than reusing the one from the
+            // `put_json` above (which only returns `Cas`, never the etag it
+            // just wrote) -- same technique `txn::run` uses for its own
+            // record.
+            if let Ok((_, fresh_etag)) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await {
+                let purged = Tombstone { purge_state: PurgeState::Purged, ..pending };
+                let _ = put_json(backend, &tombstone_key, &purged, fresh_etag.as_deref(), cipher).await;
+            }
+        }
+        // Else: leave `Pending` -- there's no GC sweep to retry it yet, but
+        // the record is there for whenever one exists.
+    }
+
+    /// Re-encrypts `name`'s current sealed bytes under its own
+    /// `.history/{etag}.json` key (new AAD, since AAD binds to the exact S3
+    /// key) and returns that etag on success -- the exact archive
+    /// [`Self::restore`] later reads back by way of the tombstone's
+    /// `restore_etag`. `None` if there was nothing to archive (`etag` is
+    /// `None`, i.e. `name` didn't exist) or the archive write/decrypt
+    /// failed -- either way, best-effort, same tolerance as everywhere else
+    /// in this method: a failure to archive just means a later `restore` on
+    /// this particular delete won't have anything to bring back.
+    async fn archive_for_delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, key: &str, sealed: &[u8], etag: Option<&str>) -> Option<String> {
+        let etag = etag?;
+        let plaintext = match cipher.open(key, sealed) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: couldn't decrypt {name} to archive it before deleting: {e:#}");
+                return None;
+            }
+        };
+        let history_key = format!("{}/{etag}.json", self.history_prefix(name));
+        let resealed = cipher.seal(&history_key, &plaintext);
+        // Create-only, but idempotent in practice: the same etag always
+        // archives the same content, so a `Cas::Conflict` here just means
+        // this exact archive entry already exists (a prior delete attempt
+        // that got this far but failed later) -- fine either way.
+        match backend.put_cas(&history_key, resealed, None).await {
+            Ok(_) => Some(etag.to_string()),
+            Err(e) => {
+                eprintln!("warning: couldn't archive {name} before deleting it: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Undoes a [`Self::delete`]: re-writes `name` from the archived
+    /// version its tombstone points at, then removes the tombstone that's
+    /// been hiding it. In that order deliberately -- if the tombstone
+    /// removal (best-effort, same as everywhere else) doesn't land, the
+    /// worst case is "restored but still hidden" (recoverable by retrying
+    /// just the tombstone delete); the reverse order could lose the object
+    /// being restored.
+    pub async fn restore<T: Serialize + DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
+        let tombstone_key = self.tombstone_key(name);
+        let (tombstone, _) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
+        let etag = tombstone.restore_etag.context("nothing to restore: no archived version for this name")?;
+        let value: T = self
+            .get_version(backend, cipher, name, &etag)
+            .await?
+            .context("archived version vanished mid-restore")?;
+        self.write_object_for_restore(backend, cipher, name, &value).await?;
+        delete_object(backend, &tombstone_key).await;
+        Ok(())
+    }
+
+    /// CAS-with-reread instead of a blind create-only write: the key
+    /// `name` restores to may still be occupied by an orphaned object a
+    /// failed [`Backend::delete`] never actually cleared (see
+    /// [`PurgeState::Pending`]) -- in that case the restored value should
+    /// win, not bounce off a CAS conflict against bytes that were already
+    /// supposed to be gone. Also makes a repeated [`Self::restore`] call
+    /// idempotent instead of failing the second time on "already exists".
+    async fn write_object_for_restore<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, value: &T) -> Result<()> {
+        let key = self.key(name);
+        let (_, mut expected_etag) = backend.get(&key).await?;
+        for _ in 0..3 {
+            match put_json(backend, &key, value, expected_etag.as_deref(), cipher).await? {
+                Cas::Ok => return Ok(()),
+                Cas::Conflict => {
+                    let (_, etag) = backend.get(&key).await?;
+                    expected_etag = etag;
+                }
+            }
+        }
+        bail!("restore: too many CAS conflicts writing {name} (giving up after 3 attempts)")
     }
 
     /// Every name currently stored, sorted.
@@ -133,7 +296,19 @@ impl Collection {
         let mut names: Vec<String> = list_all_keys(backend, &scan_prefix)
             .await?
             .into_iter()
-            .filter_map(|key| key.strip_prefix(&scan_prefix)?.strip_suffix(self.suffix).map(str::to_string))
+            .filter_map(|key| {
+                let rest = key.strip_prefix(&scan_prefix)?;
+                // `.history/`/`.deleted/` are this collection's own internal
+                // bookkeeping (archived versions, tombstones — see
+                // `Self::history_prefix`/`Self::tombstone_key`), not real
+                // entries; a real `name` never starts with `.` in practice
+                // (usernames, uids, ...), but this checks the exact two
+                // reserved prefixes rather than relying on that.
+                if rest.starts_with(".history/") || rest.starts_with(".deleted/") {
+                    return None;
+                }
+                rest.strip_suffix(self.suffix).map(str::to_string)
+            })
             .collect();
         names.sort();
         Ok(names)
@@ -286,9 +461,67 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
         coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
-        coll.delete(&backend, "a").await;
+        coll.delete(&backend, &cipher, "a").await;
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         assert_eq!(value, None);
+    }
+
+    #[tokio::test]
+    async fn delete_writes_a_purged_tombstone_with_a_restore_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets");
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.delete(&backend, &cipher, "a").await;
+
+        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher).await.unwrap();
+        assert_eq!(tombstone.purge_state, PurgeState::Purged);
+        assert!(tombstone.restore_etag.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_of_a_never_written_name_leaves_nothing_to_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets");
+        coll.delete(&backend, &cipher, "ghost").await;
+
+        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("ghost"), &cipher).await.unwrap();
+        assert_eq!(tombstone.restore_etag, None);
+        assert!(coll.restore::<Widget>(&backend, &cipher, "ghost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restore_brings_back_the_deleted_value_and_clears_the_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets");
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.delete(&backend, &cipher, "a").await;
+
+        coll.restore::<Widget>(&backend, &cipher, "a").await.unwrap();
+
+        let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
+        assert_eq!(value, Some(Widget { count: 1 }));
+        let (_, tomb_etag) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher).await.unwrap();
+        assert!(tomb_etag.is_none(), "tombstone must be gone after a successful restore");
+    }
+
+    #[tokio::test]
+    async fn restore_overwrites_whatever_object_currently_occupies_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets");
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.delete(&backend, &cipher, "a").await;
+        // Something re-occupies the now-empty key before the restore runs
+        // -- `write_object_for_restore`'s CAS-with-reread must still win,
+        // not bounce off a stale-etag conflict against it.
+        coll.put(&backend, &cipher, "a", &Widget { count: 99 }, None).await.unwrap();
+
+        coll.restore::<Widget>(&backend, &cipher, "a").await.unwrap();
+        let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
+        assert_eq!(value, Some(Widget { count: 1 }));
     }
 
     #[tokio::test]

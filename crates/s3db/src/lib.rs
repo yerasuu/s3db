@@ -34,9 +34,9 @@ mod gcs;
 mod local;
 mod s3;
 
-pub use backend::{Backend, Cas, build_backend};
+pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
 pub use cipher::Cipher;
-pub use collection::{Collection, Singleton};
+pub use collection::{Collection, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
 pub use index::{Segment, SecondaryIndex};
 pub use json::{delete_object, get_json, list_all_keys, put_json};

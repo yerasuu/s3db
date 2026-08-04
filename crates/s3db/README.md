@@ -11,8 +11,8 @@ One trait, one entry format, transparent backend: everything above `Backend` (`C
 pub trait Backend: Send + Sync + std::fmt::Debug {
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)>;
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas>;
-    async fn delete(&self, key: &str);
-    async fn delete_many(&self, keys: &[String]) -> Result<()>;
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome>;
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome>;
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>>;
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()>;
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()>;
@@ -20,6 +20,8 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
 ```
 
 `put_cas` is the one operation every driver must give real compare-and-swap semantics for — `expected_etag: None` means "must not exist yet" — even a driver with no native conditional-write support (e.g. a shared filesystem) has to fake it properly, not best-effort. That single guarantee is what every other layer in the crate (claims, transactions, versioned writes) is built on top of.
+
+`delete`/`delete_many` stay best-effort (a single key's own failure never aborts the call, and nothing in the crate depends on either actually landing), but both now report a `DeleteOutcome { attempted, confirmed }` instead of swallowing the result — informative bookkeeping for a caller that does want to know (`Collection::delete`'s tombstone, a future GC sweep), never a business-logic failure signal.
 
 Deliberately small surface: no presign, multipart, byte-range, or ACLs — derived from an audit of every call the original codebase actually made, not a speculative superset.
 
@@ -68,6 +70,15 @@ let names: Vec<String> = USERS.list_names(backend).await?;
 
 `put_versioned` archives the previous value (under its own etag, at `<prefix>/.history/<name>/<etag>.json`) before overwriting — `list_versions`/`get_version` read it back. `list_all`/`find_all` fan out concurrently across every entry — full scan, only for admin views or small collections.
 
+`delete` is a soft-delete: it archives the current value the same way `put_versioned` does, writes a tombstone at `<prefix>/.deleted/<name>.json` recording that archive's etag, then best-effort-deletes the real object — the tombstone's `purge_state` stays `Pending` if that underlying delete never confirms, `Purged` once it does. `restore` reads the tombstone's `restore_etag`, writes that archived value back (winning over any orphaned object still occupying the key), and clears the tombstone:
+
+```rust
+USERS.delete(backend, &cipher, "alice").await;                     // soft-delete, archives + tombstones
+USERS.restore::<User>(backend, &cipher, "alice").await?;            // undo, if there's something to restore
+```
+
+`get`/`list_names`/`list_all` never consult the tombstone — they read the real object's state directly, so a delete whose underlying `Backend::delete` hasn't confirmed yet is still visible for that (self-healing, not immediately consistent) window rather than doubling every read's cost to close it.
+
 ### `#[derive(Entity)]` — the same primitives, without the boilerplate
 
 Every hand-written entity above ends up writing the same handful of things: a `Collection` const, a `SecondaryIndex` const per lookup field, a tiny pointer struct, and a claim/resolve/release trio. `#[derive(Entity)]` (from the `s3db-macros` crate, re-exported at the crate root) generates exactly that — no query planner, no ORM magic underneath, it still bottoms out in plain `Collection`/`SecondaryIndex` calls:
@@ -92,7 +103,7 @@ let by_mail = User::find_by_email(backend, &cipher, "alice@example.com").await?;
 user.release_email(backend).await;                          // best-effort unclaim
 ```
 
-`#[entity(key)]` marks the field the `Collection` is keyed by (exactly one, required). `#[entity(index)]` (`segment` defaults to `Raw`; `base64` for arbitrary bytes like a fingerprint or email) generates a `<FIELD>_INDEX` const, a private pointer type, and `find_by_<field>`/`claim_<field>`/`release_<field>` — a no-op success on `claim_`/`release_` when the field is `None` on an `Option<T>` index. `get`/`put`/`delete`/`list_keys` are generated once per entity, straight passthroughs to the underlying `Collection`.
+`#[entity(key)]` marks the field the `Collection` is keyed by (exactly one, required). `#[entity(index)]` (`segment` defaults to `Raw`; `base64` for arbitrary bytes like a fingerprint or email) generates a `<FIELD>_INDEX` const, a private pointer type, and `find_by_<field>`/`claim_<field>`/`release_<field>` — a no-op success on `claim_`/`release_` when the field is `None` on an `Option<T>` index. `get`/`put`/`delete`/`list_keys` are generated once per entity, straight passthroughs to the underlying `Collection` (`delete` takes `&cipher` now too, for the tombstone it writes).
 
 **`Singleton`** — same shape, one fixed key, no name:
 

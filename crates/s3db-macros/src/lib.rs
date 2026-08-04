@@ -214,9 +214,9 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 Self::COLLECTION.put(backend, cipher, &self.#key_field, self, expected_etag).await
             }
 
-            /// Best-effort delete by key.
-            pub async fn delete(backend: &dyn s3db::Backend, key: &str) {
-                Self::COLLECTION.delete(backend, key).await
+            /// Soft-delete by key -- see [`s3db::Collection::delete`].
+            pub async fn delete(backend: &dyn s3db::Backend, cipher: &s3db::Cipher, key: &str) {
+                Self::COLLECTION.delete(backend, cipher, key).await
             }
 
             /// Every key currently stored, sorted.
