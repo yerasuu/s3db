@@ -162,6 +162,11 @@ mod tests {
         // ran: write the WAL entry, do the real write, but never clear it.
         let op_id = begin(&backend, &cipher, "k", &sealed).await.unwrap();
         backend.put_cas("k", sealed, None).await.unwrap();
+        // Millisecond-resolution timestamps: make sure the WAL entry's own
+        // started_at_ms is strictly in the past relative to recover_stale's
+        // "now", rather than racing to land in the same millisecond (which
+        // a zero-width max_age would then treat as "still fresh").
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let resolved = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();
         assert_eq!(resolved, 1);
@@ -176,6 +181,7 @@ mod tests {
         let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
         // Simulates a crash before the real put_cas ever ran.
         begin(&backend, &cipher, "k", &sealed).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
 
         let resolved = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();
         assert_eq!(resolved, 1);
