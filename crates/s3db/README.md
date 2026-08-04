@@ -60,6 +60,29 @@ let cipher = s3db::bootstrap::get_or_create_cipher(backend.as_ref(), &passphrase
 
 On first use, `get_or_create_cipher` generates the salt and writes it — **unencrypted, on purpose** — to `.conf/encryption.json`, alongside a sealed verifier. On every later start it re-derives the key from `passphrase` and opens that verifier: a wrong passphrase fails right here, as one clear startup error, instead of turning into scattered decrypt failures deeper in the app.
 
+## Resilience stack (opt-in)
+
+`resilience::build_resilient_backend(inner, config, metrics)` wraps a raw driver in a fixed decorator order:
+
+```text
+MeteredBackend -> RetryBackend -> ThrottledBackend -> CachedBackend -> driver
+```
+
+`RetryBackend` sits *outside* `ThrottledBackend` on purpose: each attempt (including retries) acquires and releases its own concurrency permit around just that one call, so a retry's backoff sleep never holds a permit hostage — the reverse order lets a slow retry sequence starve the very budget everything else is competing for. The circuit breaker lives inside `ThrottledBackend` (per-call permit + breaker share the same layer) and opens after `CircuitBreakerConfig::failure_threshold` consecutive real errors (never a `Cas::Conflict`), failing fast without touching the inner backend until `open_duration` elapses and lets one trial call through.
+
+`CachedBackend` (raw bytes + etag, cross-request LRU) sits innermost, right above the driver — see [`cache::CacheConfig`]: `max_entries` is the primary O(1) budget, `max_bytes` an optional safety net checked only once entries are already at capacity. `request_cache::RequestCache` is *not* part of this stack — it belongs outside all of it, at the application layer, wrapping whatever `build_resilient_backend` returns, since its own invalidation needs to see a write's result after retry/throttle already ran.
+
+```rust
+let metrics: s3db::SharedMetrics = std::sync::Arc::new(s3db::NoopMetrics); // or your own MetricsRecorder
+let backend = s3db::resilience::build_resilient_backend(raw_backend, s3db::ResilienceConfig::default(), metrics);
+```
+
+The connection pool for the underlying HTTP client (each driver's own construction) isn't part of `ResilienceConfig` — it's sized once, at driver-construction time — but should match (not exceed) `max_concurrent_get + max_concurrent_put + max_concurrent_list`, with keep-alive and a generous idle timeout, so the concurrency this config grants doesn't end up bottlenecked on re-establishing connections.
+
+### Typed caching (opt-in, per-`Collection`)
+
+`cache::TypedCache<T>` is the alternative to `CachedBackend`'s raw-bytes cache: it caches the decrypted, deserialized `T` itself (wrapped in `Arc`, so a hit is a refcount bump, not a struct copy), trading away reusability across other types that might share the same S3 key (rare — `Collection`/`SecondaryIndex` use distinct key namespaces by design) for skipping AEAD-open + deserialize on every hit. Not wired into `Collection` itself — a caller reaching for it owns the cache instance and calls `get`/`insert`/`invalidate` around its own `Collection::get`/`put`/`delete` calls.
+
 ## Key rotation (opt-in)
 
 `bootstrap::get_or_create_cipher` and a bare `Cipher` are all that most callers need. `key_rotation` is additive on top, for a caller that wants to rotate its passphrase without losing access to everything already encrypted under the old one — `Collection`/`SecondaryIndex`/`txn::run`/`payload` are untouched, still `&Cipher`-only.

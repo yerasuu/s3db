@@ -22,13 +22,16 @@
 
 pub mod backend;
 pub mod bootstrap;
+pub mod cache;
 pub mod cipher;
 pub mod collection;
 pub mod config;
 pub mod index;
 pub mod key_rotation;
+pub mod metrics;
 pub mod payload;
 pub mod request_cache;
+pub mod resilience;
 pub mod txn;
 
 mod azure;
@@ -37,13 +40,16 @@ mod local;
 mod s3;
 
 pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
+pub use cache::{CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CompressionStrategy};
 pub use collection::{Collection, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
 pub use index::{Segment, SecondaryIndex};
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
+pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
 pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_json};
 pub use request_cache::RequestCache;
+pub use resilience::{CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend};
 
 /// ORM-style shortcut: `#[derive(Entity)]` generates the `Collection`/
 /// `SecondaryIndex` boilerplate a hand-written entity would otherwise repeat
