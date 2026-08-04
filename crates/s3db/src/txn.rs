@@ -39,6 +39,38 @@ impl TxnOp {
     }
 }
 
+/// One committed write, published through a [`ChangePublisher`] -- see
+/// [`run_with_publisher`] for exactly when (never before every op in the
+/// same transaction is confirmed committed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChangeEvent {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Where [`run_with_publisher`] sends each [`ChangeEvent`] -- a search
+/// index, a webhook dispatcher, a replica feed. Fire-and-forget from
+/// `run_with_publisher`'s own perspective: nothing about a transaction's
+/// own success/failure depends on whether a subscriber's `published` calls
+/// actually land anywhere, same "the caller who wanted delivery guarantees
+/// already got them from the CAS commit itself" reasoning as everything
+/// else best-effort in this crate.
+#[async_trait::async_trait]
+pub trait ChangePublisher: Send + Sync + std::fmt::Debug {
+    async fn published(&self, event: ChangeEvent);
+}
+
+/// The default for [`run`] -- discards every event, so a caller that
+/// doesn't care about change notifications never has to think about this
+/// at all.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopChangePublisher;
+
+#[async_trait::async_trait]
+impl ChangePublisher for NoopChangePublisher {
+    async fn published(&self, _event: ChangeEvent) {}
+}
+
 /// `Preparing`: ops may or may not all be applied yet -- [`recover_stale`]
 /// only ever touches records in this state. `Committed`: every op landed;
 /// the record is deleted right after reaching this state, so in practice
@@ -92,7 +124,22 @@ fn random_txn_id() -> Result<String> {
 }
 
 /// Applies `ops` atomically: every key ends up created, or none do.
-pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) -> Result<Cas> {
+pub async fn run(backend: &dyn Backend, cipher: &Cipher, ops: Vec<TxnOp>) -> Result<Cas> {
+    run_with_publisher(backend, cipher, ops, &NoopChangePublisher).await
+}
+
+/// Same as [`run`], but publishes a [`ChangeEvent`] per op through
+/// `publisher` -- **all of them together, once, after the record reaches
+/// `Committed`**, never one at a time as each op's own `put_cas` lands. A
+/// consumer (a search index, webhook, replica) that saw events as they
+/// applied could observe some of a transaction's writes before knowing
+/// whether the whole thing actually committed -- if the last op then
+/// genuinely conflicted and everything rolled back, that consumer would
+/// have already reacted to writes that no longer exist, with no
+/// compensating event telling it so. If the transaction aborts,
+/// `pending_events` is simply dropped: nothing was published, because
+/// nothing was committed.
+pub async fn run_with_publisher(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>, publisher: &dyn ChangePublisher) -> Result<Cas> {
     // Sorting first means any two transactions racing over an overlapping
     // key set always hit their first shared key in the same order -- one of
     // them deterministically loses there, so there's never a cycle where
@@ -118,6 +165,7 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
     // CAS the record from `Preparing` to `Committed`.
     let (_, record_etag) = get_json::<TxnRecord>(backend, &record_key, cipher).await?;
 
+    let mut pending_events = Vec::with_capacity(ops.len());
     for op in &ops {
         // MessagePack, not JSON -- matches `payload::put_json`'s wire format,
         // since a `Collection`/entity elsewhere in the app reads this exact
@@ -125,7 +173,10 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
         let plain = rmp_serde::to_vec_named(&op.value)?;
         let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
         match backend.put_cas(&op.key, sealed, None).await? {
-            Cas::Ok => continue,
+            Cas::Ok => {
+                pending_events.push(ChangeEvent { key: op.key.clone(), value: op.value.clone() });
+                continue;
+            }
             Cas::Conflict => {
                 let (existing_sealed, existing_etag) = backend.get(&op.key).await?;
                 let is_ours = if existing_etag.is_some() {
@@ -138,6 +189,9 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
                 if is_ours {
                     // Our own prior attempt at this exact transaction,
                     // re-running after a crash between this op and the next.
+                    // Its event was already published by that prior attempt
+                    // if the record ever reached Committed, or never should
+                    // be if it didn't -- either way, not appended again here.
                     continue;
                 }
                 // A genuinely different write got there first -- undo
@@ -152,6 +206,9 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
     match put_json(backend, &record_key, &committed, record_etag.as_deref(), cipher).await? {
         Cas::Ok => {
             delete_object(backend, &record_key).await;
+            for event in pending_events {
+                publisher.published(event).await; // fire-and-forget, already committed
+            }
             Ok(Cas::Ok)
         }
         // The record's etag moved out from under us since step 2's read --
@@ -160,7 +217,8 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>) ->
         // and is (or just did) roll it back. Doing so ourselves too is safe:
         // rollback only ever deletes a key if its content still matches
         // this transaction's own op, so a second pass over the same ops is
-        // a no-op wherever the sweep's pass already ran.
+        // a no-op wherever the sweep's pass already ran. `pending_events` is
+        // dropped, unpublished -- this transaction never reached Committed.
         Cas::Conflict => {
             rollback(backend, cipher, &committed).await?;
             Ok(Cas::Conflict)
@@ -240,6 +298,53 @@ mod tests {
     #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
     struct Widget {
         count: u32,
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingPublisher {
+        events: std::sync::Mutex<Vec<ChangeEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChangePublisher for RecordingPublisher {
+        async fn published(&self, event: ChangeEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_with_publisher_publishes_every_op_once_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let publisher = RecordingPublisher::default();
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+        ];
+
+        let cas = run_with_publisher(&backend, &cipher, ops, &publisher).await.unwrap();
+        assert_eq!(cas, Cas::Ok);
+
+        let events = publisher.events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e.key == "a.json"));
+        assert!(events.iter().any(|e| e.key == "b.json"));
+    }
+
+    #[tokio::test]
+    async fn run_with_publisher_publishes_nothing_on_a_genuine_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher).await.unwrap();
+        let publisher = RecordingPublisher::default();
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+        ];
+
+        let cas = run_with_publisher(&backend, &cipher, ops, &publisher).await.unwrap();
+        assert_eq!(cas, Cas::Conflict);
+        assert!(publisher.events.lock().unwrap().is_empty(), "an aborted transaction must publish nothing");
     }
 
     #[tokio::test]

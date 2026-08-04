@@ -207,6 +207,12 @@ match s3db::txn::run(backend, &cipher, ops).await? {
 
 A `Preparing` record at `.conf/txn/<txn_id>.json` survives a crash mid-transaction; `txn::recover_stale(backend, &cipher, max_age)` — run at server startup — sweeps records older than `max_age` still `Preparing`, aborts and rolls them back, and returns how many it cleaned up.
 
+`txn::run_with_publisher` (opt-in; `run` is a thin wrapper using a no-op publisher) publishes a `ChangeEvent` per op through a `ChangePublisher` — all of them together, once, after the record reaches `Committed`, never as each op's own `put_cas` lands. A subscriber (search index, webhook, replica) that saw events mid-apply could react to writes from a transaction that then genuinely conflicted and rolled everything back, with no compensating event telling it so; publishing only after commit rules that out. An aborted transaction publishes nothing.
+
+```rust
+s3db::txn::run_with_publisher(backend, &cipher, ops, &my_publisher).await?;
+```
+
 ## Point-in-time reads (opt-in)
 
 `snapshot::ReadSnapshot` gives a best-effort, time-bounded view over a `Collection`'s `.history/` archive — **not** real MVCC, no cross-entity atomicity, same honesty `backup::BackupConsistency::FuzzySnapshot` already commits to for a full-bucket backup, just at single-entity scale:
