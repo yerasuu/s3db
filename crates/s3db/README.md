@@ -207,6 +207,19 @@ match s3db::txn::run(backend, &cipher, ops).await? {
 
 A `Preparing` record at `.conf/txn/<txn_id>.json` survives a crash mid-transaction; `txn::recover_stale(backend, &cipher, max_age)` — run at server startup — sweeps records older than `max_age` still `Preparing`, aborts and rolls them back, and returns how many it cleaned up.
 
+## Write-ahead log (opt-in)
+
+`txn::run` already recovers a crashed multi-key transaction; `wal` covers the gap that leaves — a single `put_cas` outside a transaction whose response never arrives, so nobody can tell "never attempted" from "attempted, landed or not, we don't know" from the outside:
+
+```rust
+let sealed = cipher.seal(key, &plaintext, CompressionStrategy::None);
+let cas = s3db::wal::put_cas_with_wal(backend, &cipher, key, sealed, expected_etag).await?;
+// at startup, or periodically:
+s3db::wal::recover_stale(backend, &cipher, Duration::from_secs(60)).await?;
+```
+
+A WAL entry at `.conf/wal/<op_id>.json` records the write's intent (a hash of the exact sealed bytes) before attempting it, and is cleared once the outcome is definitively known (`Cas::Ok` or `Cas::Conflict` — both are answers). `recover_stale` resolves entries older than a threshold by comparing the object currently at that key against the recorded hash — diagnostic and cleanup only, never a delivery guarantee: it clears the WAL entry either way and never retries the write itself or touches the data key, since a stale retry the original caller never asked for could clobber something newer.
+
 ## RequestCache
 
 A decorator over `Backend` that caches `get()` results for the lifetime of one request or connection — never process-wide, since multiple server instances share one bucket and a stale cached permission record must not outlive its revocation. `put_cas`/`delete`/`delete_many` invalidate the touched keys regardless of outcome; `list_prefix`/`put_stream`/`get_stream` pass through uncached.

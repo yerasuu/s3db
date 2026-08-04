@@ -35,6 +35,7 @@ pub mod resilience;
 mod shard;
 pub mod sharded_index;
 pub mod txn;
+pub mod wal;
 
 mod azure;
 mod gcs;
