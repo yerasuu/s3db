@@ -1,0 +1,32 @@
+//! `s3db-crypto`: the pure encryption primitive behind `s3db`'s mandatory
+//! encryption-at-rest — derives a key from a passphrase and seals/opens
+//! bytes with AEAD, no storage backend, no `S3`/bucket concept at all. Split
+//! out from `s3db` itself into its own crate specifically so a caller that
+//! doesn't need object storage (gitquarry uses this directly to seal
+//! session/login cookies, unrelated to anything in a bucket) doesn't have
+//! to pull in `s3db`'s driver dependencies (`aws-sdk-s3`, Azure/GCS SDKs,
+//! ...) just to get `Cipher`. `s3db` itself re-exports this crate's types
+//! from its own `cipher` module unchanged, so nothing inside `s3db` had to
+//! change to use it from here instead.
+//!
+//! See `s3db::bootstrap` for deriving/creating a bucket's [`Cipher`] from a
+//! passphrase plus a durably-stored salt — that part does need `Backend`,
+//! so it stays in `s3db` proper, not here.
+//!
+//! Four independent concerns, one module each, so extending or swapping any
+//! one of them never touches the others -- this file itself is wiring only,
+//! no logic of its own:
+//! - [`kdf`] -- passphrase + salt -> key (Argon2id today).
+//! - [`compression`] -- optional pre-encryption compression (zstd today).
+//! - [`cipher`] -- the AEAD primitive and the small-object `seal`/`open`
+//!   format tying the two above together.
+//! - [`stream`] -- the separate, large-object streaming format.
+
+mod cipher;
+mod compression;
+mod kdf;
+mod stream;
+
+pub use cipher::Cipher;
+pub use compression::CompressionStrategy;
+pub use kdf::SALT_LEN;
