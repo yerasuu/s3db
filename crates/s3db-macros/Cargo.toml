@@ -10,9 +10,9 @@ license = "AGPL-3.0-or-later"
 proc-macro = true
 
 [dependencies]
-syn = { version = "2", features = ["full"] }
-quote = "1"
-proc-macro2 = "1"
+syn = { version = "3.0.3", features = ["full"] }
+quote = "1.0.47"
+proc-macro2 = "1.0.107"
 
 [lints.rust]
 unsafe_code = "forbid"
