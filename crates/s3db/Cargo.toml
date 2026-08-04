@@ -9,6 +9,7 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 async-trait = "0.1.91"
 futures = "0.3.33"
+s3db-macros = { path = "../s3db-macros" }
 tokio = { version = "1.53.1", features = ["fs", "io-util", "sync", "macros", "rt-multi-thread", "time"] }
 
 aws-sdk-s3 = "1.140.0"

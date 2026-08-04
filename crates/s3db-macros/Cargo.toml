@@ -1,0 +1,21 @@
+[package]
+name = "s3db-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Derive macro for s3db: annotate a struct with #[entity(...)] to generate its Collection/SecondaryIndex boilerplate"
+license = "AGPL-3.0-or-later"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

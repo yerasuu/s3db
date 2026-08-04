@@ -42,6 +42,12 @@ pub use index::{Segment, SecondaryIndex};
 pub use json::{delete_object, get_json, list_all_keys, put_json};
 pub use request_cache::RequestCache;
 
+/// ORM-style shortcut: `#[derive(Entity)]` generates the `Collection`/
+/// `SecondaryIndex` boilerplate a hand-written entity would otherwise repeat
+/// per struct. See `s3db_macros` for the attribute grammar
+/// (`#[entity(collection = "...")]`, `#[entity(key)]`, `#[entity(index)]`).
+pub use s3db_macros::Entity;
+
 pub use azure::AzureBackend;
 pub use gcs::GcsBackend;
 pub use local::LocalBackend;
