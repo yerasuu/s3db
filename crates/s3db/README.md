@@ -68,6 +68,32 @@ let names: Vec<String> = USERS.list_names(backend).await?;
 
 `put_versioned` archives the previous value (under its own etag, at `<prefix>/.history/<name>/<etag>.json`) before overwriting — `list_versions`/`get_version` read it back. `list_all`/`find_all` fan out concurrently across every entry — full scan, only for admin views or small collections.
 
+### `#[derive(Entity)]` — the same primitives, without the boilerplate
+
+Every hand-written entity above ends up writing the same handful of things: a `Collection` const, a `SecondaryIndex` const per lookup field, a tiny pointer struct, and a claim/resolve/release trio. `#[derive(Entity)]` (from the `s3db-macros` crate, re-exported at the crate root) generates exactly that — no query planner, no ORM magic underneath, it still bottoms out in plain `Collection`/`SecondaryIndex` calls:
+
+```rust
+#[derive(Serialize, Deserialize, Default, Entity)]
+#[entity(collection = ".conf/users")]
+struct User {
+    #[entity(key)]
+    username: String,
+    #[entity(index)]
+    email: Option<String>,
+    #[entity(index(segment = "base64"))]
+    fingerprint: Option<String>,
+    is_admin: bool,
+}
+
+let (user, etag) = User::get(backend, &cipher, "alice").await?;
+user.put(backend, &cipher, etag.as_deref()).await?;
+user.claim_email(backend, &cipher).await?;                 // CAS-claim email in its own index
+let by_mail = User::find_by_email(backend, &cipher, "alice@example.com").await?; // index -> pointer -> Collection::get
+user.release_email(backend).await;                          // best-effort unclaim
+```
+
+`#[entity(key)]` marks the field the `Collection` is keyed by (exactly one, required). `#[entity(index)]` (`segment` defaults to `Raw`; `base64` for arbitrary bytes like a fingerprint or email) generates a `<FIELD>_INDEX` const, a private pointer type, and `find_by_<field>`/`claim_<field>`/`release_<field>` — a no-op success on `claim_`/`release_` when the field is `None` on an `Option<T>` index. `get`/`put`/`delete`/`list_keys` are generated once per entity, straight passthroughs to the underlying `Collection`.
+
 **`Singleton`** — same shape, one fixed key, no name:
 
 ```rust
