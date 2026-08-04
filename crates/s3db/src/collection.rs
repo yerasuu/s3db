@@ -129,13 +129,31 @@ impl Collection {
     }
 
     pub fn key(&self, name: &str) -> String {
+        let mut buf = String::new();
+        self.write_key(&mut buf, name);
+        buf
+    }
+
+    /// Same key [`Self::key`] builds, written directly into a caller-owned
+    /// `buf` instead of allocating a fresh `String` -- `buf` is cleared
+    /// first, so reusing the same `buf` across many calls (a hot loop doing
+    /// several `get`/`put` calls against this one `Collection`) reuses its
+    /// existing heap allocation instead of allocating anew each time.
+    /// `#[derive(Entity)]`-generated types expose this as `T::write_key`.
+    pub fn write_key(&self, buf: &mut String, name: &str) {
+        buf.clear();
+        buf.push_str(&self.prefix);
+        buf.push('/');
         match self.entropy {
-            KeyEntropy::None => format!("{}/{name}{}", self.prefix, self.suffix),
+            KeyEntropy::None => {}
             KeyEntropy::HashPrefix { buckets } => {
+                use std::fmt::Write;
                 let bucket = crate::shard::shard_of_count(name, buckets);
-                format!("{}/{bucket:04x}/{name}{}", self.prefix, self.suffix)
+                write!(buf, "{bucket:04x}/").expect("writing to a String never fails");
             }
         }
+        buf.push_str(name);
+        buf.push_str(self.suffix);
     }
 
     /// Namespace for `name`'s archived versions — parallel to (not nested
@@ -598,6 +616,28 @@ mod tests {
         coll.put(&backend, &cipher, "alice", &Widget { count: 1 }, None).await.unwrap();
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(value, Some(Widget { count: 1 }));
+    }
+
+    #[test]
+    fn write_key_matches_key_and_reuses_the_same_buffer() {
+        let coll = Collection::new("widgets");
+        let mut buf = String::with_capacity(64);
+        let original_capacity = buf.capacity();
+
+        coll.write_key(&mut buf, "alice");
+        assert_eq!(buf, coll.key("alice"));
+
+        coll.write_key(&mut buf, "bob");
+        assert_eq!(buf, coll.key("bob"));
+        assert_eq!(buf.capacity(), original_capacity, "must reuse buf's existing allocation, not grow/reallocate for a same-sized name");
+    }
+
+    #[test]
+    fn write_key_matches_key_with_hash_prefix_entropy_too() {
+        let coll = Collection::new("widgets").with_hash_prefix(16);
+        let mut buf = String::new();
+        coll.write_key(&mut buf, "alice");
+        assert_eq!(buf, coll.key("alice"));
     }
 
     #[tokio::test]

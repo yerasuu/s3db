@@ -224,6 +224,13 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 Self::COLLECTION.list_names(backend).await
             }
 
+            /// Writes this entity's S3 key into `buf`, reusing its existing
+            /// allocation across repeated calls instead of allocating a
+            /// fresh `String` each time -- see [`s3db::Collection::write_key`].
+            pub fn write_key(buf: &mut String, key: &str) {
+                Self::COLLECTION.write_key(buf, key)
+            }
+
             #(#index_methods)*
         }
 

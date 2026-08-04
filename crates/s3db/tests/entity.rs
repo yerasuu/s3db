@@ -34,6 +34,13 @@ async fn put_then_get_roundtrips_by_key() {
     assert!(etag.is_some());
 }
 
+#[test]
+fn write_key_matches_the_collection_key() {
+    let mut buf = String::new();
+    Account::write_key(&mut buf, "alice");
+    assert_eq!(buf, Account::COLLECTION.key("alice"));
+}
+
 #[tokio::test]
 async fn get_reports_none_for_a_missing_key() {
     let dir = tempfile::tempdir().unwrap();
