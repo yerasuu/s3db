@@ -62,6 +62,33 @@ pub enum PurgeState {
 /// scoped per-call to some runtime value (e.g. "every permission grant
 /// under this one repo uid") — same CRUD/list shape either way, so both get
 /// to share it instead of the runtime-scoped ones reimplementing it by hand.
+/// Whether a [`Collection`]'s keys spread across a hash-prefixed set of
+/// sub-paths instead of sitting flat under one prefix. S3 (and compatibles)
+/// partitions internally by key prefix, and gives more aggregate throughput
+/// the more distinct partitions requests actually touch -- a flat
+/// `{prefix}/{name}.json` layout puts every entry under the same
+/// lexicographic range, capping throughput at whatever one partition gives
+/// regardless of how many server instances call it in parallel. Same
+/// principle [`crate::sharded_index::ShardedIndex`] already applies to
+/// secondary indexes, generalized to the collection itself -- where the
+/// real data lives, not just a pointer to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyEntropy {
+    /// `{prefix}/{name}{suffix}` -- today's behavior, unchanged.
+    #[default]
+    None,
+    /// `{prefix}/{bucket:04x}/{name}{suffix}`, `bucket = hash(name) mod
+    /// buckets` -- same hash [`crate::sharded_index::ShardedIndex`] uses,
+    /// spreading the same names across `buckets` distinct key ranges
+    /// without changing `get`/`put`'s public API (callers still pass
+    /// `name`, the bucket is computed internally). Opt-in per collection: a
+    /// collection already written flat needs an external rewrite pass to
+    /// switch (not provided by this crate today), so this only helps a
+    /// collection that adopts it from the start, or one deliberately
+    /// migrated.
+    HashPrefix { buckets: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub struct Collection {
     pub prefix: Cow<'static, str>,
@@ -71,23 +98,37 @@ pub struct Collection {
     /// deeper than its own name (e.g. a repo's config, nested under the
     /// repo's own storage prefix rather than sitting flat next to it).
     pub suffix: &'static str,
+    pub entropy: KeyEntropy,
 }
 
 impl Collection {
     pub const fn new(prefix: &'static str) -> Self {
-        Collection { prefix: Cow::Borrowed(prefix), suffix: ".json" }
+        Collection { prefix: Cow::Borrowed(prefix), suffix: ".json", entropy: KeyEntropy::None }
     }
 
     pub const fn new_with_suffix(prefix: &'static str, suffix: &'static str) -> Self {
-        Collection { prefix: Cow::Borrowed(prefix), suffix }
+        Collection { prefix: Cow::Borrowed(prefix), suffix, entropy: KeyEntropy::None }
     }
 
     pub fn new_owned(prefix: String) -> Self {
-        Collection { prefix: Cow::Owned(prefix), suffix: ".json" }
+        Collection { prefix: Cow::Owned(prefix), suffix: ".json", entropy: KeyEntropy::None }
+    }
+
+    /// Opt-in [`KeyEntropy::HashPrefix`] -- chainable at the same `const`
+    /// definition site as [`Self::new`]: `Collection::new("...").with_hash_prefix(256)`.
+    pub const fn with_hash_prefix(mut self, buckets: u32) -> Self {
+        self.entropy = KeyEntropy::HashPrefix { buckets };
+        self
     }
 
     pub fn key(&self, name: &str) -> String {
-        format!("{}/{name}{}", self.prefix, self.suffix)
+        match self.entropy {
+            KeyEntropy::None => format!("{}/{name}{}", self.prefix, self.suffix),
+            KeyEntropy::HashPrefix { buckets } => {
+                let bucket = crate::shard::shard_of_count(name, buckets);
+                format!("{}/{bucket:04x}/{name}{}", self.prefix, self.suffix)
+            }
+        }
     }
 
     /// Namespace for `name`'s archived versions — parallel to (not nested
@@ -307,7 +348,15 @@ impl Collection {
                 if rest.starts_with(".history/") || rest.starts_with(".deleted/") {
                     return None;
                 }
-                rest.strip_suffix(self.suffix).map(str::to_string)
+                match self.entropy {
+                    KeyEntropy::None => rest.strip_suffix(self.suffix).map(str::to_string),
+                    // `rest` is "{bucket:04x}/{name}{suffix}" -- skip the
+                    // bucket segment, it's not part of `name`.
+                    KeyEntropy::HashPrefix { .. } => {
+                        let (_bucket, name_and_suffix) = rest.split_once('/')?;
+                        name_and_suffix.strip_suffix(self.suffix).map(str::to_string)
+                    }
+                }
             })
             .collect();
         names.sort();
@@ -421,6 +470,35 @@ mod tests {
     #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
     struct Widget {
         count: u32,
+    }
+
+    #[tokio::test]
+    async fn hash_prefix_key_nests_under_a_bucket_and_still_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets").with_hash_prefix(16);
+
+        let key = coll.key("alice");
+        assert!(key.starts_with("widgets/"), "{key}");
+        assert!(key.ends_with("/alice.json"), "{key}");
+        assert_ne!(key, "widgets/alice.json", "must actually nest under a bucket, not fall back to flat");
+
+        coll.put(&backend, &cipher, "alice", &Widget { count: 1 }, None).await.unwrap();
+        let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "alice").await.unwrap();
+        assert_eq!(value, Some(Widget { count: 1 }));
+    }
+
+    #[tokio::test]
+    async fn hash_prefix_list_names_recovers_the_bare_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let coll = Collection::new("widgets").with_hash_prefix(4);
+        for (name, count) in [("alice", 1), ("bob", 2), ("carol", 3)] {
+            coll.put(&backend, &cipher, name, &Widget { count }, None).await.unwrap();
+        }
+        let mut names = coll.list_names(&backend).await.unwrap();
+        names.sort();
+        assert_eq!(names, vec!["alice", "bob", "carol"]);
     }
 
     #[tokio::test]

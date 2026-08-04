@@ -167,6 +167,29 @@ let (pointer, _etag) = PUBKEY_INDEX.resolve::<UsernamePointer>(backend, &cipher,
 
 `claim_self_healing` handles the "name squatted by something since-deleted" case: on conflict it re-fetches the existing pointer and calls a caller-supplied `is_genuine` check before deciding to refuse or reclaim.
 
+**`ShardedIndex`** — `SecondaryIndex`, but the key spreads across `2^prefix_bits` shards instead of one flat prefix, for an index hot enough to hit a single S3 partition's throughput ceiling:
+
+```rust
+let idx = ShardedIndex::new(".conf/index", "pubkey", Segment::Base64);
+idx.claim_once(backend, &cipher, &fingerprint, &pointer).await?;
+let (pointer, _etag) = idx.resolve::<UsernamePointer>(backend, &cipher, &fingerprint).await?;
+
+idx.begin_rebalance(backend, &cipher).await?;      // doubles prefix_bits, pins writers to the old layout
+idx.complete_rebalance(backend, &cipher).await?;    // copies every old entry to its new shard, clears the pin
+// or, from periodic maintenance:
+idx.maybe_rebalance(backend, &cipher, &metrics, /* threshold */ 8000).await?;
+```
+
+Rebalancing is gated by a single `ShardEpoch` record for the whole index (a documented simplification versus one epoch per old shard — see `sharded_index`'s module doc comment for the throughput trade-off that simplification costs during a rebalance, expected to be rare and brief). `resolve` checks both the new and (while a rebalance is in flight) old shard layout, so nothing becomes unresolvable mid-migration.
+
+`Collection` gets the same idea for the data itself, not just a pointer to it — `KeyEntropy::HashPrefix`, opt-in:
+
+```rust
+const USERS: Collection = Collection::new(".conf/users").with_hash_prefix(256);
+// .conf/users/<name>.json becomes .conf/users/<bucket:04x>/<name>.json;
+// get/put/list_names are unaffected, still keyed by `name`.
+```
+
 ## Multi-key transactions
 
 `txn::run` bundles several create-only writes into one all-or-nothing unit — no update/liveness protocol needed, because every op is a create and the target key is its own lock:

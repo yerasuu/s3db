@@ -7,7 +7,7 @@
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
 use crate::payload::{delete_object, get_json, put_json};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -24,12 +24,27 @@ pub enum Segment {
 }
 
 impl Segment {
-    fn encode(&self, raw: &str) -> String {
+    pub(crate) fn encode(&self, raw: &str) -> String {
         match self {
             Segment::Raw => raw.to_string(),
             Segment::Base64 => {
                 use base64::Engine;
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
+            }
+        }
+    }
+
+    /// Reverses [`Self::encode`] -- [`crate::sharded_index::ShardedIndex`]'s
+    /// rebalance needs the original `raw` back from a listed key's segment
+    /// to recompute which new shard it belongs in, since a shard listing
+    /// only ever has the encoded segment, never the `raw` that produced it.
+    pub(crate) fn decode(&self, encoded: &str) -> Result<String> {
+        match self {
+            Segment::Raw => Ok(encoded.to_string()),
+            Segment::Base64 => {
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).context("invalid base64 segment")?;
+                String::from_utf8(bytes).context("segment bytes aren't valid utf8")
             }
         }
     }
