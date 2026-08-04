@@ -62,8 +62,17 @@ pub struct AzureParams {
     /// every driver's config shares one field name for its physical
     /// storage target).
     pub bucket: String,
+    /// Storage account name — still needed to build the
+    /// `https://<account_name>.blob.core.windows.net/` service URL even
+    /// though auth itself no longer goes through this account (see below).
     pub account_name: String,
-    pub account_key: String,
+    /// Entra ID app registration's directory (tenant) id. The
+    /// `azure_storage_blob` crate line paired with `azure_core` 1.x dropped
+    /// account-key/HMAC auth entirely — only `azure_identity` credentials
+    /// are supported, so `account_key` is gone in favor of these three.
+    pub tenant_id: String,
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

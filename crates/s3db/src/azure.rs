@@ -1,29 +1,39 @@
 //! [`Backend`] over Azure Blob Storage. Unlike `s3`/`r2` (both real S3),
 //! this speaks a genuinely different wire protocol, hence its own crate
-//! (`azure_storage_blobs`) rather than another config variant over
+//! (`azure_storage_blob`) rather than another config variant over
 //! `S3Backend`. Azure's own conditional-write headers (`If-Match`/
 //! `If-None-Match`) map directly onto [`Backend::put_cas`], same as S3 —
 //! this driver doesn't need the local driver's flock emulation.
+//!
+//! Auth is Entra ID (`azure_identity::ClientSecretCredential`), not a
+//! storage account key: the `azure_storage_blob`/`azure_core` 1.x line this
+//! driver is built on dropped shared-key auth entirely in favor of
+//! `TokenCredential`. Building the credential needs a fallible URL parse
+//! and tenant/client validation, unlike every other driver's synchronous,
+//! infallible `new()` — so, like [`crate::gcs`]'s client pair, construction
+//! is deferred to first real use behind a `OnceCell`.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::AzureParams;
 use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use anyhow::bail;
-use azure_core::StatusCode;
-use azure_core::error::ErrorKind;
-use azure_core::prelude::IfMatchCondition;
-use azure_storage::StorageCredentials;
+use azure_core::Error as AzureError;
+use azure_core::credentials::Secret;
+use azure_core::http::{Etag, RequestContent, StatusCode, Url};
+use azure_identity::ClientSecretCredential;
+use azure_storage_blob::models::{BlobClientUploadOptions, BlobContainerClientListBlobsOptions};
 #[cfg(feature = "streaming")]
-use azure_storage_blobs::prelude::{BlobBlockType, BlockId, BlockList};
-use azure_storage_blobs::prelude::{BlobClient, ClientBuilder, ContainerClient};
-use futures::StreamExt;
-use futures::stream;
+use azure_storage_blob::models::BlockLookupList;
+use azure_storage_blob::{BlobContainerClient, BlobServiceClient};
+use futures::TryStreamExt;
+use futures::stream::{self, StreamExt};
 #[cfg(feature = "streaming")]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "streaming")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::OnceCell;
 
 /// How many keys [`AzureBackend::delete_many`] deletes at once — this API
 /// has no S3-style batch delete, so bounded concurrency is what stands in
@@ -37,62 +47,88 @@ const DELETE_CONCURRENCY: usize = 8;
 #[cfg(feature = "streaming")]
 const UPLOAD_BLOCK_LEN: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug)]
 pub struct AzureBackend {
-    container: ContainerClient,
+    account_name: String,
+    bucket: String,
+    tenant_id: String,
+    client_id: String,
+    client_secret: String,
+    container: OnceCell<BlobContainerClient>,
+}
+
+impl std::fmt::Debug for AzureBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureBackend")
+            .field("account_name", &self.account_name)
+            .field("bucket", &self.bucket)
+            .finish_non_exhaustive()
+    }
 }
 
 impl AzureBackend {
     pub fn new(cfg: &AzureParams) -> Self {
-        let credentials = StorageCredentials::access_key(cfg.account_name.clone(), cfg.account_key.clone());
-        let container = ClientBuilder::new(cfg.account_name.clone(), credentials).container_client(&cfg.bucket);
-        AzureBackend { container }
+        AzureBackend {
+            account_name: cfg.account_name.clone(),
+            bucket: cfg.bucket.clone(),
+            tenant_id: cfg.tenant_id.clone(),
+            client_id: cfg.client_id.clone(),
+            client_secret: cfg.client_secret.clone(),
+            container: OnceCell::new(),
+        }
     }
 
-    fn blob(&self, key: &str) -> BlobClient {
-        self.container.blob_client(key)
+    async fn container(&self) -> Result<&BlobContainerClient> {
+        self.container
+            .get_or_try_init(|| async {
+                let credential = ClientSecretCredential::new(
+                    &self.tenant_id,
+                    self.client_id.clone(),
+                    Secret::from(self.client_secret.clone()),
+                    None,
+                )
+                .context("building Entra ID credential")?;
+                let service_url = Url::parse(&format!("https://{}.blob.core.windows.net/", self.account_name))
+                    .with_context(|| format!("{}: invalid storage account name", self.account_name))?;
+                let service = BlobServiceClient::new(service_url, Some(credential), None)
+                    .context("building Azure Blob Storage client")?;
+                Ok(service.blob_container_client(&self.bucket))
+            })
+            .await
+    }
+
+    async fn blob(&self, key: &str) -> Result<azure_storage_blob::BlobClient> {
+        Ok(self.container().await?.blob_client(key))
     }
 }
 
-fn is_not_found(err: &azure_core::Error) -> bool {
-    matches!(err.kind(), ErrorKind::HttpResponse { status, .. } if *status == StatusCode::NotFound)
+fn is_not_found(err: &AzureError) -> bool {
+    err.http_status() == Some(StatusCode::NotFound)
 }
 
-fn is_precondition_failed(err: &azure_core::Error) -> bool {
-    matches!(err.kind(), ErrorKind::HttpResponse { status, .. } if *status == StatusCode::PreconditionFailed)
+fn is_precondition_failed(err: &AzureError) -> bool {
+    err.http_status() == Some(StatusCode::PreconditionFailed)
 }
 
 #[async_trait::async_trait]
 impl Backend for AzureBackend {
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
-        let mut stream = self.blob(key).get().into_stream();
-        let mut bytes = Vec::new();
-        let mut etag = None;
-        loop {
-            match stream.next().await {
-                Some(Ok(page)) => {
-                    etag = Some(page.blob.properties.etag.to_string());
-                    let chunk = page
-                        .data
-                        .collect()
-                        .await
-                        .with_context(|| format!("reading body of {key}"))?;
-                    bytes.extend_from_slice(&chunk);
-                }
-                Some(Err(e)) if is_not_found(&e) => return Ok((Vec::new(), None)),
-                Some(Err(e)) => return Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
-                None => break,
+        match self.blob(key).await?.download(None).await {
+            Ok(result) => {
+                let etag = result.properties.etag.as_ref().map(|e| e.to_string());
+                let bytes = result.body.collect().await.with_context(|| format!("reading body of {key}"))?;
+                Ok((bytes.to_vec(), etag))
             }
+            Err(e) if is_not_found(&e) => Ok((Vec::new(), None)),
+            Err(e) => Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
         }
-        Ok((bytes, etag))
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
-        let condition = match expected_etag {
-            Some(etag) => IfMatchCondition::Match(etag.to_string()),
-            None => IfMatchCondition::NotMatch("*".to_string()),
+        let options = match expected_etag {
+            Some(etag) => BlobClientUploadOptions { if_match: Some(Etag::from(etag)), ..Default::default() },
+            None => BlobClientUploadOptions { if_none_match: Some(Etag::from("*")), ..Default::default() },
         };
-        match self.blob(key).put_block_blob(body).if_match(condition).await {
+        match self.blob(key).await?.upload(RequestContent::from(body), Some(options)).await {
             Ok(_) => Ok(Cas::Ok),
             Err(e) if is_precondition_failed(&e) => Ok(Cas::Conflict),
             Err(e) => Err(e).with_context(|| format!("couldn't write {key} to Azure Blob Storage")),
@@ -100,7 +136,7 @@ impl Backend for AzureBackend {
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
-        match self.blob(key).delete().await {
+        match self.blob(key).await?.delete(None).await {
             Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
             Err(e) if is_not_found(&e) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
             Err(e) => {
@@ -115,11 +151,18 @@ impl Backend for AzureBackend {
         // REST call isn't exposed here) — bounded concurrency instead of
         // one request at a time. A single key's failure only counts against
         // `confirmed`, it never aborts the keys still in flight.
+        let container = match self.container().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: couldn't delete {} keys from Azure Blob Storage: {e:#}", keys.len());
+                return Ok(DeleteOutcome { attempted: keys.len(), confirmed: 0 });
+            }
+        };
         let confirmed = AtomicUsize::new(0);
         let confirmed_ref = &confirmed;
         stream::iter(keys)
             .for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
-                match self.blob(key).delete().await {
+                match container.blob_client(key).delete(None).await {
                     Ok(_) => {
                         confirmed_ref.fetch_add(1, Ordering::Relaxed);
                     }
@@ -134,11 +177,17 @@ impl Backend for AzureBackend {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let container = self.container().await?;
+        let options = BlobContainerClientListBlobsOptions { prefix: Some(prefix.to_string()), ..Default::default() };
+        let mut pages = container.list_blobs(Some(options))?.into_pages();
         let mut out = Vec::new();
-        let mut stream = self.container.list_blobs().prefix(prefix.to_string()).into_stream();
-        while let Some(page) = stream.next().await {
-            let page = page.with_context(|| format!("listing {prefix} in Azure Blob Storage"))?;
-            out.extend(page.blobs.blobs().map(|b| (b.name.clone(), b.properties.content_length)));
+        while let Some(page) = pages.try_next().await.with_context(|| format!("listing {prefix} in Azure Blob Storage"))? {
+            let page = page.into_model().with_context(|| format!("listing {prefix} in Azure Blob Storage"))?;
+            for item in page.blob_items {
+                let Some(name) = item.name else { continue };
+                let content_length = item.properties.as_ref().and_then(|p| p.content_length).unwrap_or(0);
+                out.push((name, content_length));
+            }
         }
         Ok(out)
     }
@@ -149,13 +198,14 @@ impl Backend for AzureBackend {
             .await
             .with_context(|| format!("checking size of {}", source.display()))?
             .len();
-        let blob = self.blob(key);
+        let block_blob = self.blob(key).await?.block_blob_client();
 
         // No blocks to commit for a genuinely empty object — Azure still
-        // needs the blob to exist, `put_block_blob` with an empty body is
-        // the same call the small-object `put` already makes.
+        // needs the blob to exist, `upload` with an empty body is the same
+        // call the small-object `put_cas` already makes.
         if total_len == 0 {
-            blob.put_block_blob(Vec::new())
+            block_blob
+                .upload(RequestContent::from(Vec::new()), None)
                 .await
                 .with_context(|| format!("uploading {key} to Azure Blob Storage"))?;
             return Ok(());
@@ -165,7 +215,7 @@ impl Backend for AzureBackend {
             .await
             .with_context(|| format!("opening {}", source.display()))?;
         let num_chunks = total_len.div_ceil(UPLOAD_BLOCK_LEN);
-        let mut blocks = Vec::with_capacity(num_chunks as usize);
+        let mut block_ids = Vec::with_capacity(num_chunks as usize);
         let mut remaining = total_len;
         for idx in 0..num_chunks {
             let this_len = remaining.min(UPLOAD_BLOCK_LEN) as usize;
@@ -178,13 +228,16 @@ impl Backend for AzureBackend {
             // Fixed-width block id (16 hex digits, well under the 64-byte
             // cap): every block id in one blob's list must be the same
             // length.
-            let block_id = BlockId::new(format!("{idx:016x}").into_bytes());
-            blob.put_block(block_id.clone(), buf)
+            let block_id = format!("{idx:016x}").into_bytes();
+            block_blob
+                .stage_block(&block_id, this_len as u64, RequestContent::from(buf), None)
                 .await
                 .with_context(|| format!("uploading block {idx} of {key} to Azure Blob Storage"))?;
-            blocks.push(BlobBlockType::new_uncommitted(block_id));
+            block_ids.push(block_id);
         }
-        blob.put_block_list(BlockList { blocks })
+        let block_list = BlockLookupList { committed: None, latest: Some(block_ids), uncommitted: None };
+        block_blob
+            .commit_block_list(block_list.try_into().context("encoding block list")?, None)
             .await
             .with_context(|| format!("committing blocks of {key} to Azure Blob Storage"))?;
         Ok(())
@@ -192,41 +245,30 @@ impl Backend for AzureBackend {
 
     #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
-        let mut stream = self.blob(key).get().into_stream();
+        let result = match self.blob(key).await?.download(None).await {
+            Ok(result) => result,
+            Err(e) if is_not_found(&e) => bail!("{key} doesn't exist in Azure Blob Storage"),
+            Err(e) => return Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
+        };
+        // `download()` streams the whole blob (not just one page like the
+        // old prelude API), so a single `collect()` already gets everything
+        // — checked against the declared length so a body that ends early
+        // fails loud instead of silently writing a short file to `dest`.
+        let expected_len = result.properties.content_length;
+        let bytes = result.body.collect().await.with_context(|| format!("reading body of {key}"))?;
+        if let Some(expected_len) = expected_len
+            && bytes.len() as u64 != expected_len
+        {
+            bail!(
+                "incomplete download of {key}: {} bytes arrived, Azure declared {expected_len} \
+                 (connection cut off midway)",
+                bytes.len()
+            );
+        }
         let mut file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("creating {}", dest.display()))?;
-        loop {
-            match stream.next().await {
-                Some(Ok(page)) => {
-                    // `content_length` here is the Content-Length header of
-                    // THIS ranged response (Azure paginates get_stream in
-                    // chunks internally), not the whole blob — checked
-                    // against what `.collect()` actually produced so a body
-                    // that ends early inside one page fails loud instead of
-                    // silently writing a short chunk to `dest`.
-                    let expected_len = page.blob.properties.content_length;
-                    let chunk = page
-                        .data
-                        .collect()
-                        .await
-                        .with_context(|| format!("reading body of {key}"))?;
-                    if chunk.len() as u64 != expected_len {
-                        bail!(
-                            "incomplete download of {key}: a chunk brought {} bytes, \
-                             Azure declared {expected_len} (connection cut off midway)",
-                            chunk.len()
-                        );
-                    }
-                    file.write_all(&chunk)
-                        .await
-                        .with_context(|| format!("writing {}", dest.display()))?;
-                }
-                Some(Err(e)) if is_not_found(&e) => bail!("{key} doesn't exist in Azure Blob Storage"),
-                Some(Err(e)) => return Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
-                None => break,
-            }
-        }
+        file.write_all(&bytes).await.with_context(|| format!("writing {}", dest.display()))?;
         // See the S3 driver's matching `flush()`: `tokio::fs::File` spawns
         // the last write without awaiting it, so without this it can still
         // be in flight when this returns.

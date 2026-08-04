@@ -35,7 +35,7 @@ Five drivers, selected via `BackendConfig` (a `#[serde(tag = "driver")]` enum) a
 |---|---|---|
 | `s3` | `S3Backend::new` | `S3Params { bucket, region, endpoint_url, access_key_id, secret_access_key, path_style }` |
 | `r2` | `S3Backend::new_r2` | `R2Params { bucket, account_id, access_key_id, secret_access_key }` |
-| `azure` | `AzureBackend::new` | `AzureParams { bucket, account_name, account_key }` |
+| `azure` | `AzureBackend::new` | `AzureParams { bucket, account_name, tenant_id, client_id, client_secret }` |
 | `gcs` | `GcsBackend::new` | `GcsParams { bucket, service_account_json_path }` |
 | `local` | `LocalBackend::new` | `LocalParams { bucket }` (a filesystem directory) |
 
