@@ -33,6 +33,18 @@ fn stream_chunk_count(total_len: u64) -> u64 {
     if total_len == 0 { 1 } else { total_len.div_ceil(STREAM_CHUNK_LEN as u64) }
 }
 
+/// `true` if `prefix` (as little as the sealed object's first 8 bytes —
+/// callers don't need to read more than that to decide) starts with
+/// [`STREAM_MAGIC`] — for a caller that has to handle objects sealed by
+/// either format without knowing ahead of time which one a given object
+/// used (`storage::remote::Remote::copy_all_to`, re-encrypting every
+/// object under a repo's prefix regardless of whether it's a git pack
+/// sealed by [`seal_stream`] or a small JSON object sealed by
+/// [`crate::Cipher::seal`]).
+pub(crate) fn is_stream_sealed(prefix: &[u8]) -> bool {
+    prefix.starts_with(STREAM_MAGIC.as_slice())
+}
+
 /// Streaming counterpart of [`crate::Cipher::seal`], for objects too big to
 /// want fully buffered (pack files) — bounds peak memory to roughly one
 /// chunk (see [`STREAM_CHUNK_LEN`]) regardless of `plaintext_path`'s size.

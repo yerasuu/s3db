@@ -119,6 +119,16 @@ impl Cipher {
     pub async fn open_stream(&self, aad: &str, sealed_path: &Path, plaintext_path: &Path) -> Result<()> {
         stream::open_stream(self, aad, sealed_path, plaintext_path).await
     }
+
+    /// `true` if `prefix` (as little as an object's first 8 bytes) was
+    /// sealed by [`Self::seal_stream`] rather than [`Self::seal`] -- lets a
+    /// caller handling objects of unknown provenance (any object under a
+    /// repo's S3 prefix, not just ones it wrote itself) pick the matching
+    /// `open`/`open_stream` without needing out-of-band knowledge of which
+    /// format a given key used. See [`stream::is_stream_sealed`].
+    pub fn is_stream_sealed(prefix: &[u8]) -> bool {
+        stream::is_stream_sealed(prefix)
+    }
 }
 
 #[cfg(test)]
