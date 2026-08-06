@@ -1,224 +1,169 @@
-# Roadmap: `s3db` hacia motor de tipo libre / multi-sitio (estilo Postgres)
+# Rediseño: `s3db` como motor LSM sobre object storage (S3-only, un binario)
 
 > **Diseño, todavía no implementado.** Este documento describe el plan tal
-> como quedó acordado, no código existente. Ver `git log` para confirmar si
-> alguna fase ya aterrizó antes de asumir que sigue pendiente.
+> como quedó acordado, no código existente. Reemplaza la versión anterior
+> de este archivo (documento-suelto + índices por tipo, fases 1-5) — esa
+> versión quedaba parchando el layout físico actual sin arreglar su techo
+> real. Ver `git log` para confirmar si alguna fase ya aterrizó antes de
+> asumir que sigue pendiente.
 >
-> Presupone lectura de `docs/s3db.md` (documento base + extensión de
-> escala). No repite lo que ya funciona ahí.
+> Restricción que se mantiene, sin negociar: **solo object storage
+> S3-compatible como primitivo, sin daemon de coordinación, un binario**
+> (mismo principio que el resto de gitquarry). Nada acá agrega un proceso
+> nuevo, un puerto nuevo, ni un protocolo de consenso.
 
-## Contexto
+## Diagnóstico raíz: por qué el diseño actual no llega a "full DB"
 
-Hoy `s3db` es un almacén tipado de documentos JSON sobre object storage:
-una `Collection<T>` guarda instancias de **un struct Rust fijo, conocido en
-compile-time** (`#[derive(Entity)]`), bajo un único prefijo de key, en un
-**único backend/bucket** por proceso. `SecondaryIndex`/`ShardedIndex`
-resuelven lookups exactos (`Segment::Raw`/`Base64`), no rangos ni queries
-compuestas. No hay lenguaje de queries, ni joins, ni motor de agregación.
+El documento anterior asumía que el problema era de *API* (falta rango,
+falta tipo libre, falta join) y proponía resolverlo capa por capa arriba
+del modelo actual. Pero el modelo actual tiene un problema de *layout
+físico* que ninguna API nueva arregla:
 
-El pedido es evolucionar esto en dos ejes, sin quedar "cerrado a datos en
-un único sitio o de un único tipo":
+- **1 registro = 1 objeto S3 = 1 request.** `Collection::put`/`get` hacen
+  un `put_cas`/`get` por entidad. Con miles de writes/seg eso choca
+  directo contra el techo de partición de S3 ya documentado en
+  `docs/s3db.md` (~3,500 PUT/s, ~5,500 GET/s por rango de prefijo).
+  `KeyEntropy::HashPrefix` reparte el hot-spot entre más particiones, pero
+  no cambia que siga siendo 1 request por fila — sube el techo, no cambia
+  la pendiente.
+- **`SecondaryIndex` es un puntero exact-match**, no una estructura
+  ordenada real. Un rango ("edad > 30") con `Segment::OrderedInt` (lo que
+  proponía el documento anterior) devolvería keys ordenadas, sí, pero
+  cada resultado sigue siendo un objeto individual — un scan de 10,000
+  filas sigue siendo 10,000 `GET`s, no una lectura contigua.
+- **CAS protege un objeto, nunca da una vista barata de "todo lo
+  reciente".** No hay estructura donde leer 10,000 filas cueste menos que
+  10,000 requests, porque nunca se agrupan físicamente.
 
-- **Eje A — tipo libre**: una colección no debería exigir un struct Rust
-  fijo por tipo de entidad, y debería soportar el rango de tipos de dato
-  que Postgres da (enteros, floats, timestamps, arrays, texto, bytes) con
-  índices que respeten cada tipo (rango, no solo igualdad).
-- **Eje B — multi-sitio**: los datos no deberían estar atados a un único
-  backend/bucket — distintas colecciones (o particiones de una colección)
-  en distintos sitios/proveedores.
+Ningún ajuste de *tipo* o de *índice* resuelve esto — es una limitación
+de cómo se agrupan los bytes en objetos, no de qué API se expone encima.
+La solución real es la que ya usan los sistemas que resuelven este mismo
+problema (motor de datos real sobre object storage puro, sin servidor de
+coordinación): **SlateDB, WarpStream (Kafka sobre S3), Turbopuffer, el
+storage layer de Neon, el formato de tabla Iceberg/Delta Lake** — todos
+convergen en el mismo patrón cuando el sustrato es "objeto inmutable +
+list + CAS". No es un diseño nuevo inventado acá, es el patrón que ya
+ganó en la industria para este problema exacto.
 
-## Estado actual (verificado en código)
+## Arquitectura: LSM-tree con manifest CAS-controlado
 
-- `Collection<T>`/`Singleton<T>` (`collection.rs`): key =
-  `{prefix}/{name}{suffix}` (o `{prefix}/{bucket:04x}/{name}{suffix}` con
-  `KeyEntropy::HashPrefix`). `T` es un tipo Rust concreto, resuelto en
-  compile-time vía `#[derive(Entity)]` (`s3db_macros`).
-- `SecondaryIndex`/`ShardedIndex` (`index.rs`, `sharded_index.rs`): puntero
-  `{root}/{kind}/{segment(raw)}.json → T`. `Segment::Raw`/`Base64` son las
-  únicas dos formas de encodear la key — ambas exact-match, ninguna
-  preserva orden numérico/temporal para rango.
-- `BackendConfig` (`config.rs`) es un enum de 5 variantes (`S3`/`R2`/
-  `Azure`/`Gcs`/`Local`); `build_backend` siempre construye **uno solo**
-  (`Arc<dyn Backend>`). No existe hoy el concepto de "varios backends
-  activos con routing por colección" — toda la app comparte un único
-  `Backend` decorado (cache/resilience/métricas).
-- No existe `_v`/schema-version en el código real — eso solo está
-  *diseñado* en `docs/s3db.md` (extensión de escala, `MaintenanceScanner`),
-  no implementado.
-- No hay query language ni joins: todo acceso es `Collection::get(name)`
-  exacto, `SecondaryIndex::resolve(raw)` exacto, o `scroll`/`list_all_keys`
-  (listar un prefijo entero, sin filtro server-side más allá del prefijo
-  mismo).
+**1. WAL local** (proceso, disco o memoria del propio binario). Cada
+write entra acá primero — ack rápido al caller sin tocar S3 por write
+individual. Reemplaza el `wal.rs` actual (que hoy es solo intención de
+escritura para diagnóstico) por su rol real: buffer de durabilidad local
+antes del flush.
 
-## Decisiones de diseño (fijadas para todo el roadmap)
+**2. Memtable** — `BTreeMap<Key, Row>` en memoria, acumula writes desde
+el último flush. Da orden real sin ningún request de red.
 
-- **No se persigue SQL real ni un optimizador de queries.** S3 no ejecuta
-  nada server-side; cualquier "join" es fan-out de `get`s del lado
-  cliente. Se declara así explícitamente en vez de prometer una paridad
-  con Postgres que el sustrato no puede dar.
-- **No se persigue replicación multi-writer entre sitios.** Eso requiere
-  consenso, que S3 no ofrece — mismo motivo por el que `docs/s3db.md`
-  rechaza explícitamente MVCC real. "Multi-sitio" acá significa *routing*
-  de colecciones a distintos backends/buckets (particionado), no un
-  clúster distribuido con quórum ni failover automático.
-- **Cada fase es aditiva y opt-in.** Colecciones existentes (`Entity`
-  derive, struct fijo, un solo backend) siguen funcionando sin cambios —
-  mismo espíritu que `KeyEntropy::HashPrefix` o `IndexMode::Inline` en el
-  doc de escala.
-
-## Fase 1 — Documento de tipo libre
-
-**Objetivo.** Una colección puede guardar entidades sin struct Rust fijado
-en compile-time — primer paso del eje A, antes de tocar rango o
-multi-sitio.
-
-**Diseño.**
+**3. Flush → SSTable inmutable en S3.** Al cruzar un umbral (tamaño o
+tiempo), la memtable completa se serializa como **un solo objeto S3**,
+formato columnar por bloques:
 
 ```rust
-pub enum FieldValue {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    Text(String),
-    Bytes(Vec<u8>),
-    Timestamp(DateTime<Utc>),
-    Array(Vec<FieldValue>),
-    Object(BTreeMap<String, FieldValue>),
-}
-
-pub type Document = BTreeMap<String, FieldValue>;
-```
-
-Superset tipado de `serde_json::Value`, con variantes elegidas porque
-admiten encoding lexicográfico ordenable (necesario en fase 2).
-`Collection<Document>` convive con `Collection<T: Entity>` ya
-existente — mismo esquema de key, `Document` es solo un `T` más para el
-genérico que `Collection` ya tiene.
-
-**Qué cambia.** Módulo nuevo `document.rs`. Nada en `collection.rs`/
-`index.rs` se toca.
-
-**Qué NO se hace todavía.** Sin validación de schema — eso queda como
-fase 1b opcional: un `SchemaRegistry` declarativo por colección
-(campos + tipo + requerido, versión explícita, chequeado en cada `put`),
-mismo patrón que `EncryptionConfig`/`ShardEpoch` (config explícita, nunca
-inferencia).
-
-## Fase 2 — Índices por rango y compuestos
-
-**Objetivo.** `SecondaryIndex` hoy solo hace exact-match. Queries tipo
-"edad > 30" o "eventos entre fecha A y B" necesitan que la key del índice
-preserve orden.
-
-**Diseño.** `Segment` gana variantes con encoding ordenable (mismo truco
-que RocksDB/FoundationDB: big-endian con bias de signo, para que
-comparación lexicográfica == comparación numérica):
-
-```rust
-pub enum Segment {
-    Raw,
-    Base64,
-    OrderedInt,       // i64 -> 8 bytes big-endian, bit de signo invertido
-    OrderedFloat,      // f64 -> IEEE-754 bit tricks, mismo principio
-    OrderedTimestamp,  // DateTime<Utc> -> OrderedInt de millis desde epoch
+struct SSTable {
+    blocks: Vec<Block>,        // filas ordenadas por key, agrupadas
+    block_index: Vec<(Key, Key, u64, u32)>, // (min, max, offset, len) por bloque
+    bloom: BloomFilter,        // descarta la tabla entera sin leer nada
 }
 ```
 
-`SecondaryIndex` gana `resolve_range(low, high) -> impl Stream<Item = T>`,
-que hace `list_prefix` acotado al rango de keys ya ordenadas — se apoya en
-que S3 `list_prefix` devuelve orden lexicográfico, sin agregar nada nuevo
-al `Backend` trait.
+Un flush de 10,000 filas = **1 PUT**, no 10,000. Esto es lo que rompe el
+techo de partición: el volumen de requests deja de escalar con el número
+de filas y pasa a escalar con el número de flushes.
 
-**Índices compuestos.** Concatenar `Segment`s encoded en orden fijo (mismo
-patrón que un índice b-tree compuesto `(a, b)` en Postgres):
-`kind = "age_name"`, `segment = encode(age) || "\0" || encode(name)`.
+**4. Manifest** (`{root}/MANIFEST.json`, CAS) — lista de SSTables
+vigentes con su rango `(min_key, max_key)` y nivel de compactación.
+Fuente única de verdad de qué existe; se actualiza con `put_cas` igual
+que hoy — single-writer por manifest, mismo principio ya aceptado (sin
+consenso multi-writer, ver sección final).
 
-**Qué NO se hace.** Sin índices parciales (`WHERE` en el índice mismo),
-sin GiST/GIN — no hay motor de expresiones que lo necesite todavía.
+**5. Compactor en background** — merge estándar LSM (leveled o tiered)
+de SSTables viejos en uno nuevo, purga tombstones expirados. Reemplaza
+`gc.rs`/`maintenance.rs` con una sola responsabilidad clara: mantener el
+número de SSTables acotado y la amplificación de lectura baja.
 
-## Fase 3 — Fan-out joins (declarativos, no reales)
+**6. Lectura.**
+- *Point lookup*: bloom filter por SSTable descarta las que no contienen
+  la key sin abrirlas; binary search en `block_index`; **un `GET` con
+  `Range` header** trae solo el bloque relevante, no el objeto entero.
+- *Range scan*: merge-iterator sobre los SSTables cuyo rango se solapa
+  con la query — ya están ordenados por construcción, es un scan
+  contiguo real, no N gets.
 
-**Objetivo.** Resolver relaciones (FK) sin que cada caller reescriba a
-mano el mismo patrón `get` → `get_many`.
+**Cambio de trait necesario.** `Backend` hoy declara explícitamente "no
+byte-range" (`backend.rs`, doc del trait). Este diseño necesita
+`get_range(key, offset, len) -> Result<Vec<u8>>` — los 5 drivers ya
+hablan HTTP y soportan `Range` nativo (S3/R2/GCS/Azure vía header
+estándar, `Local` vía `seek`), así que es una implementación mecánica por
+driver, no una capacidad nueva que haya que inventar.
 
-**Diseño.**
+## Tipos de dato — resueltos por el formato de bloque, no por un enum ad-hoc
 
-```rust
-pub struct Relation<T, U> {
-    fk: fn(&T) -> &str,
-    target: Collection, // o SecondaryIndex de U
-}
+Cada `Block` tiene columnas tipadas (mismo principio que Arrow/Parquet,
+versión mínima): `Int64`, `Float64`, `Text`, `Bytes`, `Timestamp`,
+`Bool`, `Array<T>`, y `Json` como escape hatch para schema no declarado.
+Min/max por bloque (ya en `block_index`) habilita poda real de I/O:
+`WHERE age > 30` salta bloques enteros sin leerlos, no solo evita
+deserializar filas que no matchean.
 
-impl<T, U: Entity> Relation<T, U> {
-    async fn join(&self, rows: Vec<T>, loader: &BatchLoader) -> Vec<(T, Option<U>)>;
-}
-```
+## Multi-sitio — routing a nivel de manifest, no de objeto individual
 
-`join` usa `BatchLoader::load_many` (ya existe) por debajo — batching
-real, no N+1, pero sigue siendo fan-out del lado cliente, nunca ejecución
-server-side.
-
-**Qué NO se hace.** Sin joins multi-hop optimizados automáticamente, sin
-agregaciones (`COUNT`/`SUM`/`GROUP BY`) — requerirían escanear datasets
-completos, ya identificado como caro en `docs/s3db.md`
-(`MaintenanceScanner`). Si aparece necesidad real de agregación, la
-respuesta es un contador mantenido incrementalmente en cada write, no un
-motor de agregación genérico.
-
-## Fase 4 — Routing multi-backend (colección → bucket/sitio)
-
-**Objetivo.** Eje B: una colección puede vivir en un backend distinto al
-resto, sin que la app arme un único `Arc<dyn Backend>` global.
-
-**Diseño.**
+Cada tabla es un manifest + su propio conjunto de SSTables, en un backend
+elegido explícitamente:
 
 ```rust
-pub struct BackendRegistry {
-    backends: HashMap<String, Arc<dyn Backend>>, // "primary" siempre presente
+pub struct TableLocation {
+    backend_id: &'static str,   // clave en un BackendRegistry, default "primary"
+    root: String,               // prefijo/bucket lógico de esa tabla
 }
 ```
 
-`Collection`/`SecondaryIndex` ganan un campo opcional
-`backend_id: &'static str` (default `"primary"` = comportamiento actual
-sin cambios). En config, `BackendConfig` pasa de un único valor a un mapa
-`nombre -> BackendConfig` en `gitquarry.toml`, con validación de que
-`"primary"` siempre exista.
+Más natural que en el diseño anterior porque el manifest ya es la unidad
+que responde "quién es dueño de qué" — routear ahí es routear en el
+mismo lugar donde ya vive la fuente de verdad, no una capa nueva
+paralela.
 
-**Qué NO se hace.** Sin replicación activa entre backends (escribir 2x y
-reconciliar conflictos es un mecanismo de consenso, rechazado por el mismo
-motivo que el rechazo de MVCC real en `docs/s3db.md`). Un backend por
-colección es *particionado*, no *replicación*: si un sitio cae, esa
-colección específica cae con él, sin failover automático. Failover real
-queda fuera de este roadmap.
+## Qué se mantiene fuera de alcance (declarado, no prometido de más)
 
-## Fase 5 (opcional — evaluar después de 1-4) — Query builder mínimo
+- **Sin transacciones multi-tabla ACID cross-manifest.** Cada manifest
+  su propio CAS, sin 2PC entre manifests distintos.
+- **Sin multi-writer concurrente por tabla.** Single-writer por manifest
+  — mismo motivo que siempre: replicación/consenso real necesita
+  coordinación que S3 no da, y agregar un daemon de consenso viola la
+  restricción de este documento (un binario, sin proceso extra).
+- **El cómputo de queries (joins, agregación) sigue del lado del
+  proceso que lee**, no un motor distribuido. La diferencia con el
+  documento anterior es que ahora el I/O de base es real (scan contiguo,
+  poda por min/max, bloom filter) — el cuello de botella deja de ser "un
+  request por fila" y pasa a ser cómputo local, que es barato y sí escala
+  con más CPU/RAM del proceso.
 
-Azúcar sintáctica sobre las fases 1-3, no un motor nuevo:
+## Migración: no reemplaza `Collection<T: Entity>` para todo
 
-```rust
-query::<Document>("events")
-    .filter("age", Cmp::Gt(30))
-    .limit(50)
-```
+Las colecciones actuales (usuarios, grupos, peers, configs — miles de
+entidades, no millones, acceso por key exacta) siguen con el modelo
+documento-suelto: no tienen el problema que este rediseño resuelve, y
+migrarlas sería reescritura sin beneficio (contra "no speculative
+abstractions"). El motor LSM es un **modo de storage nuevo, opt-in por
+tabla** — se usa para lo que sí necesita volumen + rango + tipo (logs de
+auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
+`Collection`/`SecondaryIndex` actuales no se tocan.
 
-Arma internamente el `resolve_range` correcto de fase 2. Se implementa
-solo si, tras las fases 1-4, hay uso real que lo justifique — no se
-compromete de antemano (consistente con "no speculative abstractions" del
-proyecto).
+## Fases de implementación
 
-## Tabla resumen
+| Fase | Qué construye | Reemplaza |
+|---|---|---|
+| 1 | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
+| 2 | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
+| 3 | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
+| 4 | Formato de bloque columnar tipado + schema declarado | — |
+| 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
+| 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
+| 7 (opcional) | Query builder mínimo sobre 1-5 | — |
 
-| Fase | Eje | Módulo nuevo | Rompe algo existente |
-|---|---|---|---|
-| 1 | Tipo libre | `document.rs` | No, aditivo |
-| 2 | Rango / compuestos | `index.rs`: `Segment::Ordered*` | No, aditivo |
-| 3 | Joins fan-out | `relation.rs` | No, aditivo |
-| 4 | Multi-backend | `backend_registry.rs`, `config.rs` | Config: `BackendConfig` pasa a mapa (breaking en config, no en API) |
-| 5 | Query builder | `query.rs` (opcional) | No, aditivo |
-
-## Orden recomendado
-
-Fase 1 antes de fase 2 (rango necesita `FieldValue` ordenable). Fase 4 es
-independiente — se puede hacer en paralelo a 1-3. Fase 3 depende de fase
-1. Fase 5 al final, opcional, condicionada a uso real.
+**Orden real:** 1 → 2 son bloque mínimo funcional (sin esto no hay motor).
+3 puede esperar (SSTables sin compactar funcionan, solo degradan lectura
+con el tiempo). 4 y 5 son el valor central del pedido original (tipo +
+rango) y dependen de 1-2. 6 es independiente, se puede hacer en paralelo
+a 3-5. 7 al final, condicionado a uso real.
