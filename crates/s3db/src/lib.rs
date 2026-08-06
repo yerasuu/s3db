@@ -57,15 +57,17 @@ pub use cipher::{Cipher, CompressionStrategy};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
-pub use index::{IndexKey, Segment, SecondaryIndex};
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
+pub use index::{IndexKey, SecondaryIndex, Segment};
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
 pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_json};
 pub use request_cache::RequestCache;
-pub use resilience::{CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend};
+pub use resilience::{
+    CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend,
+};
 pub use sharded_index::{ShardEpoch, ShardedIndex};
 pub use snapshot::{ReadSnapshot, SnapshotLease};
 

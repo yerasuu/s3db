@@ -37,7 +37,9 @@ impl Default for MemoryBudget {
         // 64 concurrent max-sized objects' worth -- a reasonable default
         // for a single request handler, not a hard ceiling on what a
         // caller can configure.
-        MemoryBudget { max_buffer_bytes: 64 * MAX_OBJECT_BYTES }
+        MemoryBudget {
+            max_buffer_bytes: 64 * MAX_OBJECT_BYTES,
+        }
     }
 }
 
@@ -58,7 +60,12 @@ impl BatchLoader {
     /// reserved for what's actually exceptional: a real backend/
     /// deserialization failure after this crate's own resilience layer (if
     /// any) already exhausted its retries.
-    pub async fn load_many<T>(&self, backend: &Arc<dyn Backend>, cipher: &Arc<Cipher>, keys: impl IntoIterator<Item = String>) -> HashMap<String, Result<Option<T>>>
+    pub async fn load_many<T>(
+        &self,
+        backend: &Arc<dyn Backend>,
+        cipher: &Arc<Cipher>,
+        keys: impl IntoIterator<Item = String>,
+    ) -> HashMap<String, Result<Option<T>>>
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
@@ -70,7 +77,9 @@ impl BatchLoader {
             let semaphore = Arc::clone(&semaphore);
             set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.expect("semaphore is never closed");
-                let result = get_json::<T>(backend.as_ref(), &key, &cipher).await.map(|(value, etag)| etag.is_some().then_some(value));
+                let result = get_json::<T>(backend.as_ref(), &key, &cipher)
+                    .await
+                    .map(|(value, etag)| etag.is_some().then_some(value));
                 (key, result)
             });
         }
@@ -101,20 +110,31 @@ mod tests {
     #[tokio::test]
     async fn load_many_reports_found_and_missing_keys_distinctly() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams { bucket: dir.path().to_string_lossy().to_string() }));
+        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
+            bucket: dir.path().to_string_lossy().to_string(),
+        }));
         let cipher = Arc::new(Cipher::derive("test passphrase", &[53u8; crate::cipher::SALT_LEN]).unwrap());
-        crate::payload::put_json(backend.as_ref(), "a.json", &Widget { count: 1 }, None, &cipher).await.unwrap();
+        crate::payload::put_json(backend.as_ref(), "a.json", &Widget { count: 1 }, None, &cipher)
+            .await
+            .unwrap();
 
         let loader = BatchLoader::new(MemoryBudget::default());
-        let results = loader.load_many::<Widget>(&backend, &cipher, ["a.json".to_string(), "missing.json".to_string()]).await;
+        let results = loader
+            .load_many::<Widget>(&backend, &cipher, ["a.json".to_string(), "missing.json".to_string()])
+            .await;
 
-        assert_eq!(results.get("a.json").unwrap().as_ref().unwrap(), &Some(Widget { count: 1 }));
+        assert_eq!(
+            results.get("a.json").unwrap().as_ref().unwrap(),
+            &Some(Widget { count: 1 })
+        );
         assert_eq!(results.get("missing.json").unwrap().as_ref().unwrap(), &None);
     }
 
     #[test]
     fn memory_budget_derives_concurrency_from_object_size_cap() {
-        let budget = MemoryBudget { max_buffer_bytes: MAX_OBJECT_BYTES * 10 };
+        let budget = MemoryBudget {
+            max_buffer_bytes: MAX_OBJECT_BYTES * 10,
+        };
         assert_eq!(budget.max_concurrency(), 10);
         // Never zero, even for a tiny budget -- one in flight at a time
         // beats refusing to load anything at all.

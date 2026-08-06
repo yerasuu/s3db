@@ -30,7 +30,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SNAPSHOT_PREFIX: &str = ".conf/snapshots";
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 fn random_snapshot_id() -> Result<String> {
@@ -72,7 +75,11 @@ impl ReadSnapshot {
     pub async fn open(backend: &dyn Backend, cipher: &Cipher, max_duration: Duration) -> Result<Self> {
         let snapshot_id = random_snapshot_id()?;
         let as_of_ms = now_ms();
-        let lease = SnapshotLease { snapshot_id: snapshot_id.clone(), timestamp_ms: as_of_ms, max_duration_ms: max_duration.as_millis() as u64 };
+        let lease = SnapshotLease {
+            snapshot_id: snapshot_id.clone(),
+            timestamp_ms: as_of_ms,
+            max_duration_ms: max_duration.as_millis() as u64,
+        };
         put_json(backend, &lease_key(&snapshot_id), &lease, None, cipher).await?;
         Ok(ReadSnapshot { snapshot_id, as_of_ms })
     }
@@ -112,7 +119,13 @@ impl ReadSnapshot {
     /// companion timestamp, from a lost race on
     /// `Collection::archive_history_timestamp`, is simply skipped, not
     /// treated as an ordering pivot).
-    pub async fn get<T: Serialize + DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, collection: &Collection, name: &str) -> Result<Option<T>> {
+    pub async fn get<T: Serialize + DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        collection: &Collection,
+        name: &str,
+    ) -> Result<Option<T>> {
         let versions = collection.list_versions(backend, name).await?;
         let mut earliest_after: Option<(u64, String)> = None;
         for version in versions {
@@ -166,7 +179,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[19u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -181,9 +196,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
 
-        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60)).await.unwrap();
+        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60))
+            .await
+            .unwrap();
         let value: Option<Widget> = snap.get(&backend, &cipher, &coll, "a").await.unwrap();
         assert_eq!(value, Some(Widget { count: 1 }));
     }
@@ -193,7 +212,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60)).await.unwrap();
+        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60))
+            .await
+            .unwrap();
         let value: Option<Widget> = snap.get(&backend, &cipher, &coll, "ghost").await.unwrap();
         assert_eq!(value, None);
     }
@@ -203,10 +224,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         let (_, etag1) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
 
-        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60)).await.unwrap();
+        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60))
+            .await
+            .unwrap();
         // Millisecond-resolution timestamps: guarantee the next write's
         // archive timestamp is strictly after the snapshot's own moment,
         // rather than racing to land in the same millisecond.
@@ -214,7 +239,9 @@ mod tests {
 
         // Written *after* the snapshot was opened -- must not be visible
         // through it.
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, etag1.as_deref()).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, etag1.as_deref())
+            .await
+            .unwrap();
 
         let value: Option<Widget> = snap.get(&backend, &cipher, &coll, "a").await.unwrap();
         assert_eq!(value, Some(Widget { count: 1 }));
@@ -228,12 +255,18 @@ mod tests {
     async fn close_removes_the_lease_record() {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
-        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60)).await.unwrap();
-        let (_, etag) = get_json::<SnapshotLease>(&backend, &lease_key(snap.snapshot_id()), &cipher).await.unwrap();
+        let snap = ReadSnapshot::open(&backend, &cipher, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let (_, etag) = get_json::<SnapshotLease>(&backend, &lease_key(snap.snapshot_id()), &cipher)
+            .await
+            .unwrap();
         assert!(etag.is_some());
 
         snap.close(&backend).await;
-        let (_, etag) = get_json::<SnapshotLease>(&backend, &lease_key(snap.snapshot_id()), &cipher).await.unwrap();
+        let (_, etag) = get_json::<SnapshotLease>(&backend, &lease_key(snap.snapshot_id()), &cipher)
+            .await
+            .unwrap();
         assert!(etag.is_none());
     }
 }

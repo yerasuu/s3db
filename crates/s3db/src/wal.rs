@@ -24,7 +24,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const WAL_PREFIX: &str = ".conf/wal";
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 fn random_op_id() -> Result<String> {
@@ -68,7 +71,12 @@ struct WalEntry {
 /// particular failure instead of proceeding to the real write anyway.
 async fn begin(backend: &dyn Backend, cipher: &Cipher, key: &str, sealed: &[u8]) -> Result<String> {
     let op_id = random_op_id()?;
-    let entry = WalEntry { op_id: op_id.clone(), key: key.to_string(), intent_hash: hash_bytes(sealed), started_at_ms: now_ms() };
+    let entry = WalEntry {
+        op_id: op_id.clone(),
+        key: key.to_string(),
+        intent_hash: hash_bytes(sealed),
+        started_at_ms: now_ms(),
+    };
     put_json(backend, &wal_key(&op_id), &entry, None, cipher).await?;
     Ok(op_id)
 }
@@ -85,7 +93,13 @@ async fn complete(backend: &dyn Backend, op_id: &str) {
 /// returns `Err` (the ambiguous case this whole module exists for), the WAL
 /// entry is deliberately left behind for [`recover_stale`] to resolve later
 /// -- this function does not retry.
-pub async fn put_cas_with_wal(backend: &dyn Backend, cipher: &Cipher, key: &str, sealed: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+pub async fn put_cas_with_wal(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    key: &str,
+    sealed: Vec<u8>,
+    expected_etag: Option<&str>,
+) -> Result<Cas> {
     let op_id = begin(backend, cipher, key, &sealed).await?;
     let result = backend.put_cas(key, sealed, expected_etag).await;
     if result.is_ok() {
@@ -126,7 +140,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[17u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -138,7 +154,12 @@ mod tests {
         let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
         let cas = put_cas_with_wal(&backend, &cipher, "k", sealed, None).await.unwrap();
         assert_eq!(cas, Cas::Ok);
-        assert!(list_all_keys(&backend, &format!("{WAL_PREFIX}/")).await.unwrap().is_empty());
+        assert!(
+            list_all_keys(&backend, &format!("{WAL_PREFIX}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -150,7 +171,12 @@ mod tests {
         let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
         let cas = put_cas_with_wal(&backend, &cipher, "k", sealed, None).await.unwrap();
         assert_eq!(cas, Cas::Conflict);
-        assert!(list_all_keys(&backend, &format!("{WAL_PREFIX}/")).await.unwrap().is_empty());
+        assert!(
+            list_all_keys(&backend, &format!("{WAL_PREFIX}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -170,7 +196,12 @@ mod tests {
 
         let resolved = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();
         assert_eq!(resolved, 1);
-        assert!(list_all_keys(&backend, &format!("{WAL_PREFIX}/")).await.unwrap().is_empty());
+        assert!(
+            list_all_keys(&backend, &format!("{WAL_PREFIX}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let _ = op_id;
     }
 
@@ -196,8 +227,13 @@ mod tests {
         let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
         begin(&backend, &cipher, "k", &sealed).await.unwrap();
 
-        let resolved = recover_stale(&backend, &cipher, Duration::from_secs(3600)).await.unwrap();
+        let resolved = recover_stale(&backend, &cipher, Duration::from_secs(3600))
+            .await
+            .unwrap();
         assert_eq!(resolved, 0);
-        assert_eq!(list_all_keys(&backend, &format!("{WAL_PREFIX}/")).await.unwrap().len(), 1);
+        assert_eq!(
+            list_all_keys(&backend, &format!("{WAL_PREFIX}/")).await.unwrap().len(),
+            1
+        );
     }
 }

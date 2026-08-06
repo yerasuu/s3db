@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +128,14 @@ pub async fn backup_collection(
         entity_count,
         tombstone_count,
     };
-    put_json(dest_backend, &manifest_key(backup_id, &collection.prefix), &manifest, None, dest_cipher).await?;
+    put_json(
+        dest_backend,
+        &manifest_key(backup_id, &collection.prefix),
+        &manifest,
+        None,
+        dest_cipher,
+    )
+    .await?;
     Ok(manifest)
 }
 
@@ -144,7 +154,12 @@ pub async fn restore_collection(
     collection: &Collection,
     backup_id: &str,
 ) -> Result<BackupManifest> {
-    let (manifest, etag) = get_json::<BackupManifest>(backup_backend, &manifest_key(backup_id, &collection.prefix), backup_cipher).await?;
+    let (manifest, etag) = get_json::<BackupManifest>(
+        backup_backend,
+        &manifest_key(backup_id, &collection.prefix),
+        backup_cipher,
+    )
+    .await?;
     etag.with_context(|| format!("no backup {backup_id} found for collection {}", collection.prefix))?;
     let prefix = backup_prefix(backup_id, &collection.prefix);
     // A `Collection` over the backup's own nested prefix -- the backup
@@ -152,7 +167,11 @@ pub async fn restore_collection(
     // live collection, just under `.conf/backups/<id>/` instead of at the
     // live collection's own prefix, so this is what actually has to be
     // scanned, not `collection` itself.
-    let backup_view = Collection { suffix: collection.suffix, entropy: collection.entropy, ..Collection::new_owned(prefix.clone()) };
+    let backup_view = Collection {
+        suffix: collection.suffix,
+        entropy: collection.entropy,
+        ..Collection::new_owned(prefix.clone())
+    };
 
     for name in backup_view.list_names(backup_backend).await? {
         let key = backup_view.key(&name);
@@ -166,20 +185,34 @@ pub async fn restore_collection(
         // Overwrites whatever's currently at `dest_key` -- restore is a
         // deliberate, caller-initiated overwrite, not a CAS-protected merge.
         let (_, current_etag) = dest_backend.get(&dest_key).await?;
-        dest_backend.put_cas(&dest_key, resealed, current_etag.as_deref()).await?;
+        dest_backend
+            .put_cas(&dest_key, resealed, current_etag.as_deref())
+            .await?;
     }
 
     if manifest.includes_tombstones {
         let tombstones_prefix = format!("{prefix}/.deleted/");
         for key in crate::payload::list_all_keys(backup_backend, &tombstones_prefix).await? {
-            let Some(name) = key.strip_prefix(&tombstones_prefix).and_then(|s| s.strip_suffix(".json")) else { continue };
+            let Some(name) = key
+                .strip_prefix(&tombstones_prefix)
+                .and_then(|s| s.strip_suffix(".json"))
+            else {
+                continue;
+            };
             let (tombstone, backup_etag) = get_json::<Tombstone>(backup_backend, &key, backup_cipher).await?;
             if backup_etag.is_none() {
                 continue;
             }
             let dest_tombstone_key = format!("{}/.deleted/{name}.json", collection.prefix);
             let (_, current_etag) = dest_backend.get(&dest_tombstone_key).await?;
-            put_json(dest_backend, &dest_tombstone_key, &tombstone, current_etag.as_deref(), dest_cipher).await?;
+            put_json(
+                dest_backend,
+                &dest_tombstone_key,
+                &tombstone,
+                current_etag.as_deref(),
+                dest_cipher,
+            )
+            .await?;
         }
     }
 
@@ -193,7 +226,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path, salt: u8) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[salt; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -209,10 +244,14 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path(), 31);
         let coll = Collection::new("widgets");
         for (name, count) in [("a", 1), ("b", 2), ("c", 3)] {
-            coll.put(&backend, &cipher, name, &Widget { count }, None).await.unwrap();
+            coll.put(&backend, &cipher, name, &Widget { count }, None)
+                .await
+                .unwrap();
         }
 
-        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true).await.unwrap();
+        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+            .await
+            .unwrap();
         assert_eq!(manifest.entity_count, 3);
         assert_eq!(manifest.consistency, BackupConsistency::FuzzySnapshot);
 
@@ -222,7 +261,9 @@ mod tests {
         }
         assert!(coll.list_names(&backend).await.unwrap().is_empty());
 
-        restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1").await.unwrap();
+        restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+            .await
+            .unwrap();
         let mut restored = coll.list_names(&backend).await.unwrap();
         restored.sort();
         assert_eq!(restored, vec!["a", "b", "c"]);
@@ -235,18 +276,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path(), 37);
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
         assert_eq!(coll.list_tombstones(&backend, &cipher).await.unwrap().len(), 1);
 
-        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true).await.unwrap();
+        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+            .await
+            .unwrap();
         assert!(manifest.includes_tombstones);
         assert_eq!(manifest.tombstone_count, 1);
 
         coll.forget_tombstone(&backend, &cipher, "a").await.unwrap();
         assert!(coll.list_tombstones(&backend, &cipher).await.unwrap().is_empty());
 
-        restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1").await.unwrap();
+        restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+            .await
+            .unwrap();
         assert_eq!(coll.list_tombstones(&backend, &cipher).await.unwrap().len(), 1);
     }
 
@@ -255,10 +302,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path(), 41);
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
 
-        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", false).await.unwrap();
+        let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", false)
+            .await
+            .unwrap();
         assert!(!manifest.includes_tombstones);
         assert_eq!(manifest.tombstone_count, 0);
     }
@@ -270,14 +321,29 @@ mod tests {
         let dest_dir = tempfile::tempdir().unwrap();
         let (dest_backend, dest_cipher) = test_backend_and_cipher(dest_dir.path(), 47);
         let coll = Collection::new("widgets");
-        coll.put(&backend, &src_cipher, "a", &Widget { count: 9 }, None).await.unwrap();
+        coll.put(&backend, &src_cipher, "a", &Widget { count: 9 }, None)
+            .await
+            .unwrap();
 
-        backup_collection(&backend, &src_cipher, &dest_backend, &dest_cipher, &coll, "backup1", true).await.unwrap();
+        backup_collection(
+            &backend,
+            &src_cipher,
+            &dest_backend,
+            &dest_cipher,
+            &coll,
+            "backup1",
+            true,
+        )
+        .await
+        .unwrap();
 
         // The destination backend's own manifest is only readable under
         // dest_cipher -- proves this was a real re-encryption, not a raw
         // ciphertext copy.
-        let (manifest, etag) = get_json::<BackupManifest>(&dest_backend, &manifest_key("backup1", "widgets"), &dest_cipher).await.unwrap();
+        let (manifest, etag) =
+            get_json::<BackupManifest>(&dest_backend, &manifest_key("backup1", "widgets"), &dest_cipher)
+                .await
+                .unwrap();
         assert!(etag.is_some());
         assert_eq!(manifest.entity_count, 1);
     }

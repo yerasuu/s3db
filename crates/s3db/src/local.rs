@@ -17,9 +17,9 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
-use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use fs4::tokio::AsyncFileExt;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
@@ -39,7 +39,9 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     pub fn new(cfg: &LocalParams) -> Self {
-        LocalBackend { root: PathBuf::from(&cfg.bucket) }
+        LocalBackend {
+            root: PathBuf::from(&cfg.bucket),
+        }
     }
 
     fn data_path(&self, key: &str) -> PathBuf {
@@ -62,11 +64,11 @@ impl LocalBackend {
 /// Reads the decimal counter in `path`, or `None` if it doesn't exist yet.
 async fn read_rev(path: &Path) -> Result<Option<u64>> {
     match fs::read_to_string(path).await {
-        Ok(s) => Ok(Some(
-            s.trim()
-                .parse()
-                .with_context(|| format!("{}: invalid version counter", path.display()))?,
-        )),
+        Ok(s) => {
+            Ok(Some(s.trim().parse().with_context(|| {
+                format!("{}: invalid version counter", path.display())
+            })?))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -77,7 +79,9 @@ async fn read_rev(path: &Path) -> Result<Option<u64>> {
 /// download-to-disk path already uses.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
-    fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
     let tmp = tempfile::Builder::new()
         .prefix(".gitquarry-tmp-")
         .tempfile_in(dir)
@@ -92,7 +96,9 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let file = File::open(&tmp_path)
         .await
         .with_context(|| format!("reopening {}", tmp_path.display()))?;
-    file.sync_all().await.with_context(|| format!("syncing {}", tmp_path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("syncing {}", tmp_path.display()))?;
     drop(file);
     tmp_path
         .persist(path)
@@ -106,7 +112,9 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(feature = "streaming")]
 async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
-    fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
     let tmp = tempfile::Builder::new()
         .prefix(".gitquarry-tmp-")
         .tempfile_in(dir)
@@ -123,7 +131,9 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
             .await
             .with_context(|| format!("copying to {}", tmp_path.display()))?;
         // fsync before the rename, same reasoning as `write_atomic`.
-        dst.sync_all().await.with_context(|| format!("syncing {}", tmp_path.display()))?;
+        dst.sync_all()
+            .await
+            .with_context(|| format!("syncing {}", tmp_path.display()))?;
     }
     tmp_path
         .persist(path)
@@ -143,7 +153,9 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
 /// short.
 async fn lock_key(lock_path: &Path) -> Result<File> {
     if let Some(dir) = lock_path.parent() {
-        fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("creating {}", dir.display()))?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -152,7 +164,8 @@ async fn lock_key(lock_path: &Path) -> Result<File> {
         .open(lock_path)
         .await
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    file.lock().with_context(|| format!("taking exclusive lock on {}", lock_path.display()))?;
+    file.lock()
+        .with_context(|| format!("taking exclusive lock on {}", lock_path.display()))?;
     Ok(file)
 }
 
@@ -189,19 +202,26 @@ impl Backend for LocalBackend {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: couldn't delete {key}: {e:#}");
-                return Ok(DeleteOutcome { attempted: 1, confirmed: 0 });
+                return Ok(DeleteOutcome {
+                    attempted: 1,
+                    confirmed: 0,
+                });
             }
         };
         let _ = fs::remove_file(self.data_path(key)).await;
         let _ = fs::remove_file(self.rev_path(key)).await;
         drop(lock_file);
-        Ok(DeleteOutcome { attempted: 1, confirmed: 1 })
+        Ok(DeleteOutcome {
+            attempted: 1,
+            confirmed: 1,
+        })
     }
 
     async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
         let mut outcome = DeleteOutcome::default();
         for chunk in keys.chunks(DELETE_CONCURRENCY) {
-            let results: Vec<DeleteOutcome> = futures::future::try_join_all(chunk.iter().map(|key| self.delete(key))).await?;
+            let results: Vec<DeleteOutcome> =
+                futures::future::try_join_all(chunk.iter().map(|key| self.delete(key))).await?;
             outcome = DeleteOutcome::combine([outcome].into_iter().chain(results));
         }
         Ok(outcome)
@@ -249,7 +269,10 @@ impl Backend for LocalBackend {
 }
 
 fn relative_key(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// Recursive directory walk collecting `(key, size)` for every real object
@@ -261,7 +284,9 @@ fn walk_dir<'a>(
     out: &'a mut Vec<(String, u64)>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = fs::read_dir(dir).await.with_context(|| format!("listing {}", dir.display()))?;
+        let mut entries = fs::read_dir(dir)
+            .await
+            .with_context(|| format!("listing {}", dir.display()))?;
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -292,7 +317,9 @@ mod tests {
     use super::*;
 
     fn backend(root: &Path) -> LocalBackend {
-        LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() })
+        LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        })
     }
 
     #[tokio::test]
@@ -323,10 +350,7 @@ mod tests {
             b.put_cas("k", b"v2".to_vec(), Some("stale")).await.unwrap(),
             Cas::Conflict
         );
-        assert_eq!(
-            b.put_cas("k", b"v2".to_vec(), etag.as_deref()).await.unwrap(),
-            Cas::Ok
-        );
+        assert_eq!(b.put_cas("k", b"v2".to_vec(), etag.as_deref()).await.unwrap(), Cas::Ok);
         let (bytes, _) = b.get("k").await.unwrap();
         assert_eq!(bytes, b"v2");
     }
@@ -347,8 +371,12 @@ mod tests {
     async fn list_prefix_finds_nested_keys_and_skips_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
-        b.put_cas("repos/team/proj/refs.json", b"a".to_vec(), None).await.unwrap();
-        b.put_cas("repos/team/proj/objects/pack/x.pack", b"bb".to_vec(), None).await.unwrap();
+        b.put_cas("repos/team/proj/refs.json", b"a".to_vec(), None)
+            .await
+            .unwrap();
+        b.put_cas("repos/team/proj/objects/pack/x.pack", b"bb".to_vec(), None)
+            .await
+            .unwrap();
         b.put_cas("repos/other/refs.json", b"c".to_vec(), None).await.unwrap();
 
         let mut found = b.list_prefix("repos/team/proj/").await.unwrap();

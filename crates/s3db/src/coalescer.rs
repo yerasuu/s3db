@@ -27,7 +27,10 @@ pub struct WriteCoalescer {
 
 impl std::fmt::Debug for WriteCoalescer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteCoalescer").field("inner", &self.inner).field("flush_interval", &self.flush_interval).finish()
+        f.debug_struct("WriteCoalescer")
+            .field("inner", &self.inner)
+            .field("flush_interval", &self.flush_interval)
+            .finish()
     }
 }
 
@@ -37,7 +40,11 @@ impl WriteCoalescer {
     /// requires `Arc<Self>` already in hand rather than the caller
     /// remembering to wrap it correctly later.
     pub fn new(inner: Arc<dyn Backend>, flush_interval: Duration) -> Arc<Self> {
-        Arc::new(WriteCoalescer { inner, flush_interval, pending: Mutex::new(HashMap::new()) })
+        Arc::new(WriteCoalescer {
+            inner,
+            flush_interval,
+            pending: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Records `value` as the latest pending write for `key`, replacing
@@ -89,7 +96,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn backend(root: &std::path::Path) -> Arc<dyn Backend> {
-        Arc::new(LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() }))
+        Arc::new(LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        }))
     }
 
     #[tokio::test]
@@ -120,11 +129,18 @@ mod tests {
         // Something else writes `k` directly (not through the coalescer)
         // before the flush runs -- the etag captured at debounce-start time
         // (there wasn't one, key didn't exist) is now stale.
-        coalescer.inner.put_cas("k", b"other writer".to_vec(), None).await.unwrap();
+        coalescer
+            .inner
+            .put_cas("k", b"other writer".to_vec(), None)
+            .await
+            .unwrap();
 
         coalescer.flush("k").await.unwrap();
         let (bytes, _) = coalescer.inner.get("k").await.unwrap();
-        assert_eq!(bytes, b"coalesced", "coalesced write must win via CAS-with-reread, not silently drop");
+        assert_eq!(
+            bytes, b"coalesced",
+            "coalesced write must win via CAS-with-reread, not silently drop"
+        );
     }
 
     #[tokio::test]
@@ -137,6 +153,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(60)).await;
         let (bytes, _) = coalescer.inner.get("k").await.unwrap();
-        assert_eq!(bytes, b"v3", "the auto-scheduled flush must have applied only the latest value");
+        assert_eq!(
+            bytes, b"v3",
+            "the auto-scheduled flush must have applied only the latest value"
+        );
     }
 }

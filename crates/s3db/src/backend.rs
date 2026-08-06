@@ -31,10 +31,12 @@ impl DeleteOutcome {
     /// `delete_many` fans out to individual deletes and needs to fold the
     /// results back into a single [`DeleteOutcome`].
     pub(crate) fn combine(results: impl IntoIterator<Item = DeleteOutcome>) -> Self {
-        results.into_iter().fold(DeleteOutcome::default(), |acc, o| DeleteOutcome {
-            attempted: acc.attempted + o.attempted,
-            confirmed: acc.confirmed + o.confirmed,
-        })
+        results
+            .into_iter()
+            .fold(DeleteOutcome::default(), |acc, o| DeleteOutcome {
+                attempted: acc.attempted + o.attempted,
+                confirmed: acc.confirmed + o.confirmed,
+            })
     }
 }
 

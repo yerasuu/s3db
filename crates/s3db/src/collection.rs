@@ -18,7 +18,10 @@ use tokio::task::JoinSet;
 /// stored for humans/audits to read later, same reasoning as
 /// `crate::txn::now_ms`.
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 /// Soft-delete marker for one [`Collection`] entry, at
@@ -110,15 +113,27 @@ pub struct Collection {
 
 impl Collection {
     pub const fn new(prefix: &'static str) -> Self {
-        Collection { prefix: Cow::Borrowed(prefix), suffix: ".json", entropy: KeyEntropy::None }
+        Collection {
+            prefix: Cow::Borrowed(prefix),
+            suffix: ".json",
+            entropy: KeyEntropy::None,
+        }
     }
 
     pub const fn new_with_suffix(prefix: &'static str, suffix: &'static str) -> Self {
-        Collection { prefix: Cow::Borrowed(prefix), suffix, entropy: KeyEntropy::None }
+        Collection {
+            prefix: Cow::Borrowed(prefix),
+            suffix,
+            entropy: KeyEntropy::None,
+        }
     }
 
     pub fn new_owned(prefix: String) -> Self {
-        Collection { prefix: Cow::Owned(prefix), suffix: ".json", entropy: KeyEntropy::None }
+        Collection {
+            prefix: Cow::Owned(prefix),
+            suffix: ".json",
+            entropy: KeyEntropy::None,
+        }
     }
 
     /// Opt-in [`KeyEntropy::HashPrefix`] -- chainable at the same `const`
@@ -234,7 +249,14 @@ impl Collection {
                 // already wrote this exact archive entry — fine. Only a
                 // genuine `Err` (backend/serialization failure) needs to
                 // propagate.
-                put_json(backend, &format!("{}/{etag}.json", self.history_prefix(name)), &current_value, None, cipher).await?;
+                put_json(
+                    backend,
+                    &format!("{}/{etag}.json", self.history_prefix(name)),
+                    &current_value,
+                    None,
+                    cipher,
+                )
+                .await?;
                 self.archive_history_timestamp(backend, cipher, name, etag).await;
             }
         }
@@ -257,7 +279,9 @@ impl Collection {
     /// [`crate::snapshot::ReadSnapshot`] already treats as "can't place
     /// this version in time, skip it").
     async fn archive_history_timestamp(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, etag: &str) {
-        let record = HistoryTimestamp { archived_at_ms: now_ms() };
+        let record = HistoryTimestamp {
+            archived_at_ms: now_ms(),
+        };
         let _ = put_json(backend, &self.history_timestamp_key(name, etag), &record, None, cipher).await;
     }
 
@@ -266,8 +290,15 @@ impl Collection {
     /// [`Self::archive_history_timestamp`]) or the version itself doesn't
     /// exist. [`crate::snapshot::ReadSnapshot`] uses this to find the
     /// version that was live as of a given moment.
-    pub async fn version_timestamp(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, etag: &str) -> Result<Option<u64>> {
-        let (record, found) = get_json::<HistoryTimestamp>(backend, &self.history_timestamp_key(name, etag), cipher).await?;
+    pub async fn version_timestamp(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+        etag: &str,
+    ) -> Result<Option<u64>> {
+        let (record, found) =
+            get_json::<HistoryTimestamp>(backend, &self.history_timestamp_key(name, etag), cipher).await?;
         Ok(found.map(|_| record.archived_at_ms))
     }
 
@@ -288,23 +319,41 @@ impl Collection {
                 (Vec::new(), None)
             }
         };
-        let restore_etag = self.archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref()).await;
+        let restore_etag = self
+            .archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref())
+            .await;
 
         let tombstone_key = self.tombstone_key(name);
-        let (_, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await.unwrap_or_default();
-        let pending = Tombstone { deleted_at_ms: now_ms(), purge_state: PurgeState::Pending, restore_etag };
-        if put_json(backend, &tombstone_key, &pending, tomb_etag.as_deref(), cipher).await.is_err() {
+        let (_, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher)
+            .await
+            .unwrap_or_default();
+        let pending = Tombstone {
+            deleted_at_ms: now_ms(),
+            purge_state: PurgeState::Pending,
+            restore_etag,
+        };
+        if put_json(backend, &tombstone_key, &pending, tomb_etag.as_deref(), cipher)
+            .await
+            .is_err()
+        {
             return; // couldn't even record intent -- nothing to retry from, bail
         }
 
-        let confirmed = backend.delete(&key).await.map(|o| o.confirmed == o.attempted).unwrap_or(false);
+        let confirmed = backend
+            .delete(&key)
+            .await
+            .map(|o| o.confirmed == o.attempted)
+            .unwrap_or(false);
         if confirmed {
             // Re-read for a fresh etag rather than reusing the one from the
             // `put_json` above (which only returns `Cas`, never the etag it
             // just wrote) -- same technique `txn::run` uses for its own
             // record.
             if let Ok((_, fresh_etag)) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await {
-                let purged = Tombstone { purge_state: PurgeState::Purged, ..pending };
+                let purged = Tombstone {
+                    purge_state: PurgeState::Purged,
+                    ..pending
+                };
                 let _ = put_json(backend, &tombstone_key, &purged, fresh_etag.as_deref(), cipher).await;
             }
         }
@@ -321,7 +370,15 @@ impl Collection {
     /// failed -- either way, best-effort, same tolerance as everywhere else
     /// in this method: a failure to archive just means a later `restore` on
     /// this particular delete won't have anything to bring back.
-    async fn archive_for_delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, key: &str, sealed: &[u8], etag: Option<&str>) -> Option<String> {
+    async fn archive_for_delete(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+        key: &str,
+        sealed: &[u8],
+        etag: Option<&str>,
+    ) -> Option<String> {
         let etag = etag?;
         let plaintext = match cipher.open(key, sealed) {
             Ok(p) => p,
@@ -355,10 +412,17 @@ impl Collection {
     /// worst case is "restored but still hidden" (recoverable by retrying
     /// just the tombstone delete); the reverse order could lose the object
     /// being restored.
-    pub async fn restore<T: Serialize + DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
+    pub async fn restore<T: Serialize + DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+    ) -> Result<()> {
         let tombstone_key = self.tombstone_key(name);
         let (tombstone, _) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
-        let etag = tombstone.restore_etag.context("nothing to restore: no archived version for this name")?;
+        let etag = tombstone
+            .restore_etag
+            .context("nothing to restore: no archived version for this name")?;
         let value: T = self
             .get_version(backend, cipher, name, &etag)
             .await?
@@ -375,7 +439,13 @@ impl Collection {
     /// win, not bounce off a CAS conflict against bytes that were already
     /// supposed to be gone. Also makes a repeated [`Self::restore`] call
     /// idempotent instead of failing the second time on "already exists".
-    async fn write_object_for_restore<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, value: &T) -> Result<()> {
+    async fn write_object_for_restore<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+        value: &T,
+    ) -> Result<()> {
         let key = self.key(name);
         let (_, mut expected_etag) = backend.get(&key).await?;
         for _ in 0..3 {
@@ -399,7 +469,9 @@ impl Collection {
         let scan_prefix = format!("{}/.deleted/", self.prefix);
         let mut out = Vec::new();
         for key in list_all_keys(backend, &scan_prefix).await? {
-            let Some(name) = key.strip_prefix(&scan_prefix).and_then(|s| s.strip_suffix(".json")) else { continue };
+            let Some(name) = key.strip_prefix(&scan_prefix).and_then(|s| s.strip_suffix(".json")) else {
+                continue;
+            };
             let (tombstone, etag) = get_json::<Tombstone>(backend, &key, cipher).await?;
             if etag.is_some() {
                 out.push((name.to_string(), tombstone));
@@ -423,9 +495,16 @@ impl Collection {
         if tombstone.purge_state == PurgeState::Purged {
             return Ok(true);
         }
-        let confirmed = backend.delete(&self.key(name)).await.map(|o| o.confirmed == o.attempted).unwrap_or(false);
+        let confirmed = backend
+            .delete(&self.key(name))
+            .await
+            .map(|o| o.confirmed == o.attempted)
+            .unwrap_or(false);
         if confirmed {
-            let purged = Tombstone { purge_state: PurgeState::Purged, ..tombstone };
+            let purged = Tombstone {
+                purge_state: PurgeState::Purged,
+                ..tombstone
+            };
             put_json(backend, &tombstone_key, &purged, tomb_etag.as_deref(), cipher).await?;
         }
         Ok(confirmed)
@@ -517,7 +596,8 @@ impl Collection {
         name: &str,
         etag: &str,
     ) -> Result<Option<T>> {
-        let (value, found_etag) = get_json::<T>(backend, &format!("{}/{etag}.json", self.history_prefix(name)), cipher).await?;
+        let (value, found_etag) =
+            get_json::<T>(backend, &format!("{}/{etag}.json", self.history_prefix(name)), cipher).await?;
         Ok(found_etag.is_some().then_some(value))
     }
 
@@ -553,11 +633,21 @@ impl Collection {
     /// collections. A field that needs fast lookup by value belongs behind
     /// a [`crate::SecondaryIndex`] instead, maintained on write, not
     /// scanned on read.
-    pub async fn find_all<T>(&self, backend: &Arc<dyn Backend>, cipher: &Arc<Cipher>, predicate: impl Fn(&T) -> bool) -> Result<Vec<T>>
+    pub async fn find_all<T>(
+        &self,
+        backend: &Arc<dyn Backend>,
+        cipher: &Arc<Cipher>,
+        predicate: impl Fn(&T) -> bool,
+    ) -> Result<Vec<T>>
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
-        Ok(self.list_all::<T>(backend, cipher).await?.into_iter().filter(predicate).collect())
+        Ok(self
+            .list_all::<T>(backend, cipher)
+            .await?
+            .into_iter()
+            .filter(predicate)
+            .collect())
     }
 }
 
@@ -577,11 +667,21 @@ impl Singleton {
     /// `get_json`'s own convention: `T::default()`, not an `Option`, when
     /// nothing has been written yet — for a singleton, "doesn't exist" and
     /// "still at its defaults" are the same thing.
-    pub async fn get<T: DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher) -> Result<(T, Option<String>)> {
+    pub async fn get<T: DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+    ) -> Result<(T, Option<String>)> {
         get_json(backend, self.key, cipher).await
     }
 
-    pub async fn put<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, value: &T, expected_etag: Option<&str>) -> Result<Cas> {
+    pub async fn put<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        value: &T,
+        expected_etag: Option<&str>,
+    ) -> Result<Cas> {
         put_json(backend, self.key, value, expected_etag, cipher).await
     }
 }
@@ -592,7 +692,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&crate::config::LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&crate::config::LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[5u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -611,9 +713,14 @@ mod tests {
         let key = coll.key("alice");
         assert!(key.starts_with("widgets/"), "{key}");
         assert!(key.ends_with("/alice.json"), "{key}");
-        assert_ne!(key, "widgets/alice.json", "must actually nest under a bucket, not fall back to flat");
+        assert_ne!(
+            key, "widgets/alice.json",
+            "must actually nest under a bucket, not fall back to flat"
+        );
 
-        coll.put(&backend, &cipher, "alice", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "alice", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(value, Some(Widget { count: 1 }));
     }
@@ -629,7 +736,11 @@ mod tests {
 
         coll.write_key(&mut buf, "bob");
         assert_eq!(buf, coll.key("bob"));
-        assert_eq!(buf.capacity(), original_capacity, "must reuse buf's existing allocation, not grow/reallocate for a same-sized name");
+        assert_eq!(
+            buf.capacity(),
+            original_capacity,
+            "must reuse buf's existing allocation, not grow/reallocate for a same-sized name"
+        );
     }
 
     #[test]
@@ -646,7 +757,9 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets").with_hash_prefix(4);
         for (name, count) in [("alice", 1), ("bob", 2), ("carol", 3)] {
-            coll.put(&backend, &cipher, name, &Widget { count }, None).await.unwrap();
+            coll.put(&backend, &cipher, name, &Widget { count }, None)
+                .await
+                .unwrap();
         }
         let mut names = coll.list_names(&backend).await.unwrap();
         names.sort();
@@ -668,7 +781,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        let cas = coll.put(&backend, &cipher, "a", &Widget { count: 3 }, None).await.unwrap();
+        let cas = coll
+            .put(&backend, &cipher, "a", &Widget { count: 3 }, None)
+            .await
+            .unwrap();
         assert_eq!(cas, Cas::Ok);
         let (value, etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         assert_eq!(value, Some(Widget { count: 3 }));
@@ -680,8 +796,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
-        let cas = coll.put(&backend, &cipher, "a", &Widget { count: 2 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
+        let cas = coll
+            .put(&backend, &cipher, "a", &Widget { count: 2 }, None)
+            .await
+            .unwrap();
         assert_eq!(cas, Cas::Conflict);
     }
 
@@ -690,7 +811,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         assert_eq!(value, None);
@@ -701,10 +824,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
 
-        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher).await.unwrap();
+        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher)
+            .await
+            .unwrap();
         assert_eq!(tombstone.purge_state, PurgeState::Purged);
         assert!(tombstone.restore_etag.is_some());
     }
@@ -716,7 +843,9 @@ mod tests {
         let coll = Collection::new("widgets");
         coll.delete(&backend, &cipher, "ghost").await;
 
-        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("ghost"), &cipher).await.unwrap();
+        let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("ghost"), &cipher)
+            .await
+            .unwrap();
         assert_eq!(tombstone.restore_etag, None);
         assert!(coll.restore::<Widget>(&backend, &cipher, "ghost").await.is_err());
     }
@@ -726,14 +855,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
 
         coll.restore::<Widget>(&backend, &cipher, "a").await.unwrap();
 
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         assert_eq!(value, Some(Widget { count: 1 }));
-        let (_, tomb_etag) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher).await.unwrap();
+        let (_, tomb_etag) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher)
+            .await
+            .unwrap();
         assert!(tomb_etag.is_none(), "tombstone must be gone after a successful restore");
     }
 
@@ -742,12 +875,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, "a").await;
         // Something re-occupies the now-empty key before the restore runs
         // -- `write_object_for_restore`'s CAS-with-reread must still win,
         // not bounce off a stale-etag conflict against it.
-        coll.put(&backend, &cipher, "a", &Widget { count: 99 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "a", &Widget { count: 99 }, None)
+            .await
+            .unwrap();
 
         coll.restore::<Widget>(&backend, &cipher, "a").await.unwrap();
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
@@ -762,7 +899,9 @@ mod tests {
         let cipher = Arc::new(cipher);
         let coll = Collection::new("widgets");
         for (name, count) in [("a", 1), ("b", 2), ("c", 3)] {
-            coll.put(backend.as_ref(), cipher.as_ref(), name, &Widget { count }, None).await.unwrap();
+            coll.put(backend.as_ref(), cipher.as_ref(), name, &Widget { count }, None)
+                .await
+                .unwrap();
         }
         let mut names = coll.list_names(backend.as_ref()).await.unwrap();
         names.sort();
@@ -779,7 +918,9 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new_with_suffix("repos", "/.conf/config.json");
         assert_eq!(coll.key("acme/web"), "repos/acme/web/.conf/config.json");
-        coll.put(&backend, &cipher, "acme/web", &Widget { count: 9 }, None).await.unwrap();
+        coll.put(&backend, &cipher, "acme/web", &Widget { count: 9 }, None)
+            .await
+            .unwrap();
         let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "acme/web").await.unwrap();
         assert_eq!(value, Some(Widget { count: 9 }));
         assert_eq!(coll.list_names(&backend).await.unwrap(), vec!["acme/web"]);
@@ -790,7 +931,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        let (value, etag) = coll.get_or_default::<Widget>(&backend, &cipher, "missing").await.unwrap();
+        let (value, etag) = coll
+            .get_or_default::<Widget>(&backend, &cipher, "missing")
+            .await
+            .unwrap();
         assert_eq!(value, Widget::default());
         assert_eq!(etag, None);
     }
@@ -803,9 +947,14 @@ mod tests {
         let cipher = Arc::new(cipher);
         let coll = Collection::new("widgets");
         for (name, count) in [("a", 1), ("b", 2), ("c", 3)] {
-            coll.put(backend.as_ref(), cipher.as_ref(), name, &Widget { count }, None).await.unwrap();
+            coll.put(backend.as_ref(), cipher.as_ref(), name, &Widget { count }, None)
+                .await
+                .unwrap();
         }
-        let mut big: Vec<Widget> = coll.find_all(&backend, &cipher, |w: &Widget| w.count > 1).await.unwrap();
+        let mut big: Vec<Widget> = coll
+            .find_all(&backend, &cipher, |w: &Widget| w.count > 1)
+            .await
+            .unwrap();
         big.sort_by_key(|w| w.count);
         assert_eq!(big, vec![Widget { count: 2 }, Widget { count: 3 }]);
     }
@@ -819,7 +968,10 @@ mod tests {
         assert_eq!(value, Widget::default());
         assert_eq!(etag, None);
 
-        settings.put(&backend, &cipher, &Widget { count: 7 }, None).await.unwrap();
+        settings
+            .put(&backend, &cipher, &Widget { count: 7 }, None)
+            .await
+            .unwrap();
         let (value, etag) = settings.get::<Widget>(&backend, &cipher).await.unwrap();
         assert_eq!(value, Widget { count: 7 });
         assert!(etag.is_some());
@@ -830,7 +982,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         assert_eq!(coll.list_versions(&backend, "a").await.unwrap(), Vec::<String>::new());
     }
 
@@ -839,15 +993,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         let (_value, etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         let etag = etag.unwrap();
 
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some(&etag)).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some(&etag))
+            .await
+            .unwrap();
 
         let versions = coll.list_versions(&backend, "a").await.unwrap();
         assert_eq!(versions.len(), 1);
-        let archived: Widget = coll.get_version(&backend, &cipher, "a", &versions[0]).await.unwrap().unwrap();
+        let archived: Widget = coll
+            .get_version(&backend, &cipher, "a", &versions[0])
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(archived, Widget { count: 1 });
 
         let (current, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
@@ -860,15 +1022,21 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
 
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         let (_value, etag1) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         let etag1 = etag1.unwrap();
 
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some(&etag1)).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some(&etag1))
+            .await
+            .unwrap();
         let (_value, etag2) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         let etag2 = etag2.unwrap();
 
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 3 }, Some(&etag2)).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 3 }, Some(&etag2))
+            .await
+            .unwrap();
 
         let versions = coll.list_versions(&backend, "a").await.unwrap();
         assert_eq!(versions.len(), 2);
@@ -879,7 +1047,9 @@ mod tests {
 
         let (_value, current_etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         let current_etag = current_etag.unwrap();
-        coll.put_versioned(&backend, &cipher, "a", &oldest, Some(&current_etag)).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &oldest, Some(&current_etag))
+            .await
+            .unwrap();
 
         let (restored, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
         assert_eq!(restored, Some(Widget { count: 1 }));
@@ -890,9 +1060,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let coll = Collection::new("widgets");
-        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
 
-        let cas = coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some("stale-etag")).await.unwrap();
+        let cas = coll
+            .put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, Some("stale-etag"))
+            .await
+            .unwrap();
         assert_eq!(cas, Cas::Conflict);
         assert_eq!(coll.list_versions(&backend, "a").await.unwrap(), Vec::<String>::new());
     }

@@ -35,7 +35,10 @@ pub struct TxnOp {
 
 impl TxnOp {
     pub fn create<T: Serialize>(key: String, value: &T) -> Result<Self> {
-        Ok(TxnOp { key, value: serde_json::to_value(value)? })
+        Ok(TxnOp {
+            key,
+            value: serde_json::to_value(value)?,
+        })
     }
 }
 
@@ -139,7 +142,12 @@ pub async fn run(backend: &dyn Backend, cipher: &Cipher, ops: Vec<TxnOp>) -> Res
 /// compensating event telling it so. If the transaction aborts,
 /// `pending_events` is simply dropped: nothing was published, because
 /// nothing was committed.
-pub async fn run_with_publisher(backend: &dyn Backend, cipher: &Cipher, mut ops: Vec<TxnOp>, publisher: &dyn ChangePublisher) -> Result<Cas> {
+pub async fn run_with_publisher(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    mut ops: Vec<TxnOp>,
+    publisher: &dyn ChangePublisher,
+) -> Result<Cas> {
     // Sorting first means any two transactions racing over an overlapping
     // key set always hit their first shared key in the same order -- one of
     // them deterministically loses there, so there's never a cycle where
@@ -174,7 +182,10 @@ pub async fn run_with_publisher(backend: &dyn Backend, cipher: &Cipher, mut ops:
         let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
         match backend.put_cas(&op.key, sealed, None).await? {
             Cas::Ok => {
-                pending_events.push(ChangeEvent { key: op.key.clone(), value: op.value.clone() });
+                pending_events.push(ChangeEvent {
+                    key: op.key.clone(),
+                    value: op.value.clone(),
+                });
                 continue;
             }
             Cas::Conflict => {
@@ -202,7 +213,10 @@ pub async fn run_with_publisher(backend: &dyn Backend, cipher: &Cipher, mut ops:
         }
     }
 
-    let committed = TxnRecord { status: TxnStatus::Committed, ..record };
+    let committed = TxnRecord {
+        status: TxnStatus::Committed,
+        ..record
+    };
     match put_json(backend, &record_key, &committed, record_etag.as_deref(), cipher).await? {
         Cas::Ok => {
             delete_object(backend, &record_key).await;
@@ -267,7 +281,10 @@ pub async fn recover_stale(backend: &dyn Backend, cipher: &Cipher, max_age: Dura
         if now.saturating_sub(record.started_at_ms) <= cutoff_ms {
             continue;
         }
-        let aborting = TxnRecord { status: TxnStatus::Aborting, ..record };
+        let aborting = TxnRecord {
+            status: TxnStatus::Aborting,
+            ..record
+        };
         match put_json(backend, &key, &aborting, Some(&etag), cipher).await? {
             Cas::Ok => {
                 // Ownership has now cleanly transferred to this sweep: the
@@ -290,7 +307,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&crate::config::LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&crate::config::LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[11u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -335,7 +354,9 @@ mod tests {
     async fn run_with_publisher_publishes_nothing_on_a_genuine_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
-        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher).await.unwrap();
+        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher)
+            .await
+            .unwrap();
         let publisher = RecordingPublisher::default();
         let ops = vec![
             TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
@@ -344,7 +365,10 @@ mod tests {
 
         let cas = run_with_publisher(&backend, &cipher, ops, &publisher).await.unwrap();
         assert_eq!(cas, Cas::Conflict);
-        assert!(publisher.events.lock().unwrap().is_empty(), "an aborted transaction must publish nothing");
+        assert!(
+            publisher.events.lock().unwrap().is_empty(),
+            "an aborted transaction must publish nothing"
+        );
     }
 
     #[tokio::test]
@@ -373,7 +397,9 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         // Pre-created with content different from what the transaction below
         // will try to write -- a genuine collision, not our own retry.
-        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher).await.unwrap();
+        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher)
+            .await
+            .unwrap();
 
         let ops = vec![
             TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
@@ -407,7 +433,11 @@ mod tests {
         // Simulates a crash after a previous `run` applied only this one op
         // directly, bypassing `run`'s own txn record entirely -- the exact
         // content `run` would have produced, so this must read as "ours".
-        let sealed = cipher.seal(&ops[0].key, &rmp_serde::to_vec_named(&ops[0].value).unwrap(), CompressionStrategy::None);
+        let sealed = cipher.seal(
+            &ops[0].key,
+            &rmp_serde::to_vec_named(&ops[0].value).unwrap(),
+            CompressionStrategy::None,
+        );
         assert_eq!(backend.put_cas(&ops[0].key, sealed, None).await.unwrap(), Cas::Ok);
 
         let cas = run(&backend, &cipher, ops).await.unwrap();
@@ -431,9 +461,15 @@ mod tests {
             started_at_ms: 0, // arbitrarily old
             ops: vec![op.clone()],
         };
-        put_json(&backend, &txn_key(&record.txn_id), &record, None, &cipher).await.unwrap();
+        put_json(&backend, &txn_key(&record.txn_id), &record, None, &cipher)
+            .await
+            .unwrap();
         // Simulates the real partial-apply a crashed `run` would leave behind.
-        let sealed = cipher.seal(&op.key, &rmp_serde::to_vec_named(&op.value).unwrap(), CompressionStrategy::None);
+        let sealed = cipher.seal(
+            &op.key,
+            &rmp_serde::to_vec_named(&op.value).unwrap(),
+            CompressionStrategy::None,
+        );
         assert_eq!(backend.put_cas(&op.key, sealed, None).await.unwrap(), Cas::Ok);
 
         let recovered = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();
@@ -466,7 +502,10 @@ mod tests {
         let (_, only_a_etag) = get_json::<Widget>(&backend, "only_a.json", &cipher).await.unwrap();
         assert!(only_a_etag.is_some());
         let (_, only_b_etag) = get_json::<Widget>(&backend, "only_b.json", &cipher).await.unwrap();
-        assert!(only_b_etag.is_none(), "the loser's non-conflicting op must have been rolled back too");
+        assert!(
+            only_b_etag.is_none(),
+            "the loser's non-conflicting op must have been rolled back too"
+        );
         assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
     }
 }

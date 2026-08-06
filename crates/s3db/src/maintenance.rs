@@ -40,7 +40,12 @@ impl MaintenanceScanner {
     /// [`gc::sweep`] itself has; a caller that wants partial-failure
     /// tolerance across collections can call [`gc::sweep`] directly per
     /// collection instead.
-    pub async fn run(&self, backend: &dyn Backend, cipher: &Cipher, collections: &[&Collection]) -> Result<Vec<GcReport>> {
+    pub async fn run(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        collections: &[&Collection],
+    ) -> Result<Vec<GcReport>> {
         let mut reports = Vec::with_capacity(collections.len());
         for collection in collections {
             reports.push(gc::sweep(backend, cipher, collection, &self.gc_config).await?);
@@ -57,7 +62,9 @@ mod tests {
     use std::time::Duration;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[29u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -73,12 +80,21 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let widgets = Collection::new("widgets");
         let gadgets = Collection::new("gadgets");
-        widgets.put(&backend, &cipher, "a", &Widget { count: 1 }, None).await.unwrap();
+        widgets
+            .put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         widgets.delete(&backend, &cipher, "a").await;
-        gadgets.put(&backend, &cipher, "b", &Widget { count: 2 }, None).await.unwrap();
+        gadgets
+            .put(&backend, &cipher, "b", &Widget { count: 2 }, None)
+            .await
+            .unwrap();
         gadgets.delete(&backend, &cipher, "b").await;
 
-        let scanner = MaintenanceScanner::new(GcConfig { tombstone_purge_age: Duration::ZERO, ..GcConfig::default() });
+        let scanner = MaintenanceScanner::new(GcConfig {
+            tombstone_purge_age: Duration::ZERO,
+            ..GcConfig::default()
+        });
         let reports = scanner.run(&backend, &cipher, &[&widgets, &gadgets]).await.unwrap();
 
         assert_eq!(reports.len(), 2);

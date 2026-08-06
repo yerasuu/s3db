@@ -32,7 +32,10 @@ pub struct RequestCache {
 
 impl RequestCache {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
-        RequestCache { inner, reads: Mutex::new(HashMap::new()) }
+        RequestCache {
+            inner,
+            reads: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -104,7 +107,10 @@ mod tests {
 
     impl CountingBackend {
         fn new(inner: LocalBackend) -> Self {
-            CountingBackend { inner, gets: AtomicUsize::new(0) }
+            CountingBackend {
+                inner,
+                gets: AtomicUsize::new(0),
+            }
         }
 
         fn get_count(&self) -> usize {
@@ -147,7 +153,9 @@ mod tests {
     }
 
     fn local_backend(root: &Path) -> LocalBackend {
-        LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() })
+        LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        })
     }
 
     #[tokio::test]

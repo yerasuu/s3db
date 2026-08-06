@@ -8,9 +8,9 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::{R2Params, S3Params};
-use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, retry::RetryConfig};
 use aws_sdk_s3::primitives::ByteStream;
@@ -61,7 +61,14 @@ impl S3Backend {
     /// so there's nothing for a config field to toggle.
     pub fn new_r2(cfg: &R2Params) -> Self {
         let endpoint = format!("https://{}.r2.cloudflarestorage.com", cfg.account_id);
-        Self::from_parts(&cfg.bucket, &cfg.access_key_id, &cfg.secret_access_key, "auto", Some(&endpoint), true)
+        Self::from_parts(
+            &cfg.bucket,
+            &cfg.access_key_id,
+            &cfg.secret_access_key,
+            "auto",
+            Some(&endpoint),
+            true,
+        )
     }
 
     fn from_parts(
@@ -93,7 +100,10 @@ impl S3Backend {
             builder = builder.endpoint_url(endpoint);
         }
 
-        S3Backend { client: Client::from_conf(builder.build()), bucket: bucket.to_string() }
+        S3Backend {
+            client: Client::from_conf(builder.build()),
+            bucket: bucket.to_string(),
+        }
     }
 }
 
@@ -137,11 +147,20 @@ impl Backend for S3Backend {
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         match self.client.delete_object().bucket(&self.bucket).key(key).send().await {
-            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
-            Err(err) if is_not_found(&err) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Ok(_) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
+            Err(err) if is_not_found(&err) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
             Err(err) => {
                 eprintln!("gitquarry: warning: couldn't delete {key} from S3: {err}");
-                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+                Ok(DeleteOutcome {
+                    attempted: 1,
+                    confirmed: 0,
+                })
             }
         }
     }
@@ -312,9 +331,7 @@ pub fn is_not_found<E: std::error::Error + 'static>(err: &SdkError<E, HttpRespon
 /// CAS precondition failure. AWS returns 412; several S3-compatible
 /// implementations return 409 for `If-None-Match: *`, so we accept both or
 /// the CAS would look like a hard error instead of a retry.
-pub fn is_precondition_failed<E: std::error::Error + 'static>(
-    err: &SdkError<E, HttpResponse>,
-) -> bool {
+pub fn is_precondition_failed<E: std::error::Error + 'static>(err: &SdkError<E, HttpResponse>) -> bool {
     matches!(raw_status(err), Some(412 | 409))
 }
 

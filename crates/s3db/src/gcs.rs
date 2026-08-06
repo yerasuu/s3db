@@ -18,9 +18,9 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::GcsParams;
-use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use google_cloud_auth::credentials::service_account;
 use google_cloud_gax::paginator::ItemPaginator;
@@ -137,16 +137,34 @@ impl Backend for GcsBackend {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e:#}");
-                return Ok(DeleteOutcome { attempted: 1, confirmed: 0 });
+                return Ok(DeleteOutcome {
+                    attempted: 1,
+                    confirmed: 0,
+                });
             }
         };
         let (_, control) = clients;
-        match control.delete_object().set_bucket(self.bucket_resource()).set_object(key).send().await {
-            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
-            Err(e) if status_code(&e) == Some(404) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+        match control
+            .delete_object()
+            .set_bucket(self.bucket_resource())
+            .set_object(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
+            Err(e) if status_code(&e) == Some(404) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
             Err(e) => {
                 eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}");
-                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+                Ok(DeleteOutcome {
+                    attempted: 1,
+                    confirmed: 0,
+                })
             }
         }
     }
@@ -160,7 +178,13 @@ impl Backend for GcsBackend {
         let confirmed_ref = &confirmed;
         stream::iter(keys)
             .for_each_concurrent(Some(DELETE_CONCURRENCY), |key| async move {
-                match control.delete_object().set_bucket(self.bucket_resource()).set_object(key.as_str()).send().await {
+                match control
+                    .delete_object()
+                    .set_bucket(self.bucket_resource())
+                    .set_object(key.as_str())
+                    .send()
+                    .await
+                {
                     Ok(_) => {
                         confirmed_ref.fetch_add(1, Ordering::Relaxed);
                     }
@@ -171,7 +195,10 @@ impl Backend for GcsBackend {
                 }
             })
             .await;
-        Ok(DeleteOutcome { attempted: keys.len(), confirmed: confirmed.load(Ordering::Relaxed) })
+        Ok(DeleteOutcome {
+            attempted: keys.len(),
+            confirmed: confirmed.load(Ordering::Relaxed),
+        })
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {

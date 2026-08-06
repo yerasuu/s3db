@@ -29,13 +29,18 @@ pub struct HealthProbe {
 
 impl std::fmt::Debug for HealthProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HealthProbe").field("last_ready", &self.last_ready.load(Ordering::Relaxed)).finish()
+        f.debug_struct("HealthProbe")
+            .field("last_ready", &self.last_ready.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
 impl HealthProbe {
     pub fn new(probe_backend: Arc<dyn Backend>) -> Self {
-        HealthProbe { probe_backend, last_ready: AtomicBool::new(false) }
+        HealthProbe {
+            probe_backend,
+            last_ready: AtomicBool::new(false),
+        }
     }
 
     /// Does a real `get` against the backend right now. `true` if it
@@ -66,7 +71,9 @@ mod tests {
     #[tokio::test]
     async fn ready_is_true_for_a_reachable_backend_even_without_the_key_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams { bucket: dir.path().to_string_lossy().to_string() }));
+        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
+            bucket: dir.path().to_string_lossy().to_string(),
+        }));
         let probe = HealthProbe::new(backend);
         assert!(probe.ready().await);
         assert!(probe.last_ready());
@@ -80,7 +87,12 @@ mod tests {
         async fn get(&self, _key: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
             anyhow::bail!("simulated unreachable backend")
         }
-        async fn put_cas(&self, _key: &str, _body: Vec<u8>, _expected_etag: Option<&str>) -> anyhow::Result<crate::backend::Cas> {
+        async fn put_cas(
+            &self,
+            _key: &str,
+            _body: Vec<u8>,
+            _expected_etag: Option<&str>,
+        ) -> anyhow::Result<crate::backend::Cas> {
             unreachable!()
         }
         async fn delete(&self, _key: &str) -> anyhow::Result<crate::backend::DeleteOutcome> {
@@ -112,7 +124,9 @@ mod tests {
     #[tokio::test]
     async fn last_ready_is_false_before_the_first_probe() {
         let dir = tempfile::tempdir().unwrap();
-        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams { bucket: dir.path().to_string_lossy().to_string() }));
+        let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
+            bucket: dir.path().to_string_lossy().to_string(),
+        }));
         let probe = HealthProbe::new(backend);
         assert!(!probe.last_ready());
     }

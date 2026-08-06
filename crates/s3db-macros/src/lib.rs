@@ -70,10 +70,16 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let container = parse_container_args(&input)?;
 
     let Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new_spanned(&input, "#[derive(Entity)] only supports structs"));
+        return Err(syn::Error::new_spanned(
+            &input,
+            "#[derive(Entity)] only supports structs",
+        ));
     };
     let Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new_spanned(&input, "#[derive(Entity)] requires named fields"));
+        return Err(syn::Error::new_spanned(
+            &input,
+            "#[derive(Entity)] requires named fields",
+        ));
     };
 
     let mut key_field: Option<syn::Ident> = None;
@@ -140,17 +146,34 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         if has_key {
             if key_field.is_some() {
-                return Err(syn::Error::new_spanned(&field.ident, "only one field may be #[entity(key)]"));
+                return Err(syn::Error::new_spanned(
+                    &field.ident,
+                    "only one field may be #[entity(key)]",
+                ));
             }
             key_field = Some(ident.clone());
         }
-        if let Some(IndexArgs { segment, root, kind, pointer_field }) = index_args {
+        if let Some(IndexArgs {
+            segment,
+            root,
+            kind,
+            pointer_field,
+        }) = index_args
+        {
             let is_optional = is_option_type(&field.ty);
-            index_fields.push(IndexField { ident, is_optional, segment, root, kind, pointer_field });
+            index_fields.push(IndexField {
+                ident,
+                is_optional,
+                segment,
+                root,
+                kind,
+                pointer_field,
+            });
         }
     }
 
-    let key_field = key_field.ok_or_else(|| syn::Error::new_spanned(&input, "#[derive(Entity)] requires one field marked #[entity(key)]"))?;
+    let key_field = key_field
+        .ok_or_else(|| syn::Error::new_spanned(&input, "#[derive(Entity)] requires one field marked #[entity(key)]"))?;
 
     let collection_prefix = &container.collection;
     let suffix_tokens = match &container.suffix {
@@ -170,7 +193,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         // collection would get silently swept up by `list_keys`/`list_all`
         // as if it were a real stored entity. `.index` is a sibling prefix,
         // structurally outside that scan, not a subpath of it.
-        let root = index.root.clone().unwrap_or_else(|| format!("{collection_prefix}.index"));
+        let root = index
+            .root
+            .clone()
+            .unwrap_or_else(|| format!("{collection_prefix}.index"));
         let kind = index.kind.clone().unwrap_or_else(|| field_ident.to_string());
         let pointer_field = format_ident!("{}", index.pointer_field.clone().unwrap_or_else(|| "key".to_string()));
         let segment_tokens = match index.segment {
@@ -327,13 +353,16 @@ fn is_option_type(ty: &syn::Type) -> bool {
 }
 
 fn to_camel(field_name: &str) -> String {
-    field_name.split('_').map(|part| {
-        let mut chars = part.chars();
-        match chars.next() {
-            Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-            None => String::new(),
-        }
-    }).collect()
+    field_name
+        .split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 fn parse_container_args(input: &DeriveInput) -> syn::Result<ContainerArgs> {
@@ -344,7 +373,10 @@ fn parse_container_args(input: &DeriveInput) -> syn::Result<ContainerArgs> {
             continue;
         }
         if !matches!(&attr.meta, Meta::List(_)) {
-            return Err(syn::Error::new_spanned(attr, "expected #[entity(collection = \"...\")]"));
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected #[entity(collection = \"...\")]",
+            ));
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("collection") {
@@ -362,6 +394,7 @@ fn parse_container_args(input: &DeriveInput) -> syn::Result<ContainerArgs> {
             Err(meta.error("unsupported #[entity(...)] key, expected \"collection\" or \"suffix\""))
         })?;
     }
-    let collection = collection.ok_or_else(|| syn::Error::new_spanned(input, "#[derive(Entity)] requires #[entity(collection = \"...\")]"))?;
+    let collection = collection
+        .ok_or_else(|| syn::Error::new_spanned(input, "#[derive(Entity)] requires #[entity(collection = \"...\")]"))?;
     Ok(ContainerArgs { collection, suffix })
 }

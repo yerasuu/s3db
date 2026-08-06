@@ -29,7 +29,11 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        CacheConfig { max_entries: 10_000, max_bytes: None, ttl: Duration::from_secs(30) }
+        CacheConfig {
+            max_entries: 10_000,
+            max_bytes: None,
+            ttl: Duration::from_secs(30),
+        }
     }
 }
 
@@ -61,14 +65,22 @@ pub struct CachedBackend {
 
 impl std::fmt::Debug for CachedBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedBackend").field("inner", &self.inner).field("config", &self.config).finish()
+        f.debug_struct("CachedBackend")
+            .field("inner", &self.inner)
+            .field("config", &self.config)
+            .finish()
     }
 }
 
 impl CachedBackend {
     pub fn new(inner: Arc<dyn Backend>, config: CacheConfig) -> Self {
         let capacity = std::num::NonZeroUsize::new(config.max_entries.max(1)).expect("max(1) is never zero");
-        CachedBackend { inner, config, entries: Mutex::new(lru::LruCache::new(capacity)), total_bytes: Mutex::new(0) }
+        CachedBackend {
+            inner,
+            config,
+            entries: Mutex::new(lru::LruCache::new(capacity)),
+            total_bytes: Mutex::new(0),
+        }
     }
 
     fn get_fresh(&self, key: &str) -> Option<(Vec<u8>, Option<String>)> {
@@ -86,7 +98,14 @@ impl CachedBackend {
         let new_len = bytes.len();
         let mut entries = self.entries.lock().unwrap();
         let mut total = self.total_bytes.lock().unwrap();
-        if let Some((_, evicted)) = entries.push(key.to_string(), Entry { bytes, etag, inserted_at: Instant::now() }) {
+        if let Some((_, evicted)) = entries.push(
+            key.to_string(),
+            Entry {
+                bytes,
+                etag,
+                inserted_at: Instant::now(),
+            },
+        ) {
             *total = total.saturating_sub(evicted.bytes.len());
         }
         *total += new_len;
@@ -193,7 +212,10 @@ impl<T> std::fmt::Debug for TypedCache<T> {
 impl<T> TypedCache<T> {
     pub fn new(config: CacheConfig) -> Self {
         let capacity = std::num::NonZeroUsize::new(config.max_entries.max(1)).expect("max(1) is never zero");
-        TypedCache { config, entries: Mutex::new(lru::LruCache::new(capacity)) }
+        TypedCache {
+            config,
+            entries: Mutex::new(lru::LruCache::new(capacity)),
+        }
     }
 
     /// A fresh cache hit for `name`, or `None` on a miss/expired entry --
@@ -211,7 +233,14 @@ impl<T> TypedCache<T> {
     }
 
     pub fn insert(&self, name: &str, value: Arc<T>, etag: Option<String>) {
-        self.entries.lock().unwrap().put(name.to_string(), TypedEntry { value, etag, inserted_at: Instant::now() });
+        self.entries.lock().unwrap().put(
+            name.to_string(),
+            TypedEntry {
+                value,
+                etag,
+                inserted_at: Instant::now(),
+            },
+        );
     }
 
     /// Same invalidation moment as `CachedBackend`'s: any write or delete
@@ -264,13 +293,18 @@ mod tests {
     }
 
     fn local(root: &std::path::Path) -> LocalBackend {
-        LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() })
+        LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        })
     }
 
     #[tokio::test]
     async fn a_second_get_is_served_from_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let counting = Arc::new(CountingBackend { inner: local(dir.path()), gets: AtomicUsize::new(0) });
+        let counting = Arc::new(CountingBackend {
+            inner: local(dir.path()),
+            gets: AtomicUsize::new(0),
+        });
         counting.put_cas("k", b"v1".to_vec(), None).await.unwrap();
         let cached = CachedBackend::new(counting.clone(), CacheConfig::default());
 
@@ -282,7 +316,10 @@ mod tests {
     #[tokio::test]
     async fn put_cas_invalidates_the_cached_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let counting = Arc::new(CountingBackend { inner: local(dir.path()), gets: AtomicUsize::new(0) });
+        let counting = Arc::new(CountingBackend {
+            inner: local(dir.path()),
+            gets: AtomicUsize::new(0),
+        });
         counting.put_cas("k", b"v1".to_vec(), None).await.unwrap();
         let cached = CachedBackend::new(counting.clone(), CacheConfig::default());
         let (_, etag) = cached.get("k").await.unwrap();
@@ -296,24 +333,48 @@ mod tests {
     #[tokio::test]
     async fn entries_over_ttl_are_treated_as_a_miss() {
         let dir = tempfile::tempdir().unwrap();
-        let counting = Arc::new(CountingBackend { inner: local(dir.path()), gets: AtomicUsize::new(0) });
+        let counting = Arc::new(CountingBackend {
+            inner: local(dir.path()),
+            gets: AtomicUsize::new(0),
+        });
         counting.put_cas("k", b"v1".to_vec(), None).await.unwrap();
-        let cached = CachedBackend::new(counting.clone(), CacheConfig { max_entries: 10, max_bytes: None, ttl: Duration::from_millis(0) });
+        let cached = CachedBackend::new(
+            counting.clone(),
+            CacheConfig {
+                max_entries: 10,
+                max_bytes: None,
+                ttl: Duration::from_millis(0),
+            },
+        );
 
         cached.get("k").await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         cached.get("k").await.unwrap();
-        assert_eq!(counting.gets.load(Ordering::SeqCst), 2, "expired entry must not be served from cache");
+        assert_eq!(
+            counting.gets.load(Ordering::SeqCst),
+            2,
+            "expired entry must not be served from cache"
+        );
     }
 
     #[tokio::test]
     async fn max_entries_evicts_the_least_recently_used() {
         let dir = tempfile::tempdir().unwrap();
-        let counting = Arc::new(CountingBackend { inner: local(dir.path()), gets: AtomicUsize::new(0) });
+        let counting = Arc::new(CountingBackend {
+            inner: local(dir.path()),
+            gets: AtomicUsize::new(0),
+        });
         for (k, v) in [("a", "1"), ("b", "2")] {
             counting.put_cas(k, v.as_bytes().to_vec(), None).await.unwrap();
         }
-        let cached = CachedBackend::new(counting.clone(), CacheConfig { max_entries: 1, max_bytes: None, ttl: Duration::from_secs(60) });
+        let cached = CachedBackend::new(
+            counting.clone(),
+            CacheConfig {
+                max_entries: 1,
+                max_bytes: None,
+                ttl: Duration::from_secs(60),
+            },
+        );
 
         cached.get("a").await.unwrap(); // cache: {a}
         cached.get("b").await.unwrap(); // cache: {b}, a evicted (capacity 1)
@@ -328,7 +389,10 @@ mod tests {
         cache.insert("k", Arc::clone(&value), Some("etag1".to_string()));
 
         let (hit, etag) = cache.get("k").unwrap();
-        assert!(Arc::ptr_eq(&hit, &value), "a hit must be the same allocation, not a fresh copy");
+        assert!(
+            Arc::ptr_eq(&hit, &value),
+            "a hit must be the same allocation, not a fresh copy"
+        );
         assert_eq!(etag.as_deref(), Some("etag1"));
     }
 

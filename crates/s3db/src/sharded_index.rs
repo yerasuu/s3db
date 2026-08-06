@@ -88,7 +88,11 @@ impl ShardedIndex {
 
     fn key_for(&self, raw: &str, prefix_bits: u8) -> String {
         let shard = shard_of(raw, prefix_bits);
-        format!("{}{}.json", self.shard_prefix(shard, prefix_bits), self.segment.encode(raw))
+        format!(
+            "{}{}.json",
+            self.shard_prefix(shard, prefix_bits),
+            self.segment.encode(raw)
+        )
     }
 
     /// Reads the current epoch, short-TTL-cached (not per-request) so a
@@ -110,7 +114,13 @@ impl ShardedIndex {
     /// [`crate::index::SecondaryIndex::claim_once`]. Always writes to the
     /// shard layout in effect for writers right now (`prev_prefix_bits`
     /// while a rebalance is in flight, `prefix_bits` otherwise).
-    pub async fn claim_once<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str, value: &T) -> Result<bool> {
+    pub async fn claim_once<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+        value: &T,
+    ) -> Result<bool> {
         let epoch = self.current_epoch(backend, cipher).await?;
         let key = self.key_for(raw, epoch.write_bits());
         match put_json(backend, &key, value, None, cipher).await? {
@@ -122,7 +132,12 @@ impl ShardedIndex {
     /// Resolves `raw`, checking the new shard layout first, then (only
     /// while a rebalance is in flight) the old one -- an entry not yet
     /// copied over by [`Self::complete_rebalance`] must still resolve.
-    pub async fn resolve<T: DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str) -> Result<(Option<T>, Option<String>)> {
+    pub async fn resolve<T: DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+    ) -> Result<(Option<T>, Option<String>)> {
         let epoch = self.current_epoch(backend, cipher).await?;
         let (value, etag) = get_json::<T>(backend, &self.key_for(raw, epoch.prefix_bits), cipher).await?;
         if etag.is_some() {
@@ -136,7 +151,9 @@ impl ShardedIndex {
     }
 
     pub async fn release(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str) {
-        let Ok(epoch) = self.current_epoch(backend, cipher).await else { return };
+        let Ok(epoch) = self.current_epoch(backend, cipher).await else {
+            return;
+        };
         delete_object(backend, &self.key_for(raw, epoch.write_bits())).await;
         if let Some(prev_bits) = epoch.prev_prefix_bits {
             delete_object(backend, &self.key_for(raw, prev_bits)).await;
@@ -173,7 +190,9 @@ impl ShardedIndex {
     /// content).
     pub async fn complete_rebalance(&self, backend: &dyn Backend, cipher: &Cipher) -> Result<()> {
         let (epoch, etag) = get_json::<ShardEpoch>(backend, &self.epoch_key(), cipher).await?;
-        let Some(prev_bits) = epoch.prev_prefix_bits else { return Ok(()) };
+        let Some(prev_bits) = epoch.prev_prefix_bits else {
+            return Ok(());
+        };
         let old_shard_count = 1u32 << prev_bits.min(31);
 
         for old_shard in 0..old_shard_count {
@@ -201,7 +220,10 @@ impl ShardedIndex {
             }
         }
 
-        let done = ShardEpoch { prev_prefix_bits: None, ..epoch };
+        let done = ShardEpoch {
+            prev_prefix_bits: None,
+            ..epoch
+        };
         match put_json(backend, &self.epoch_key(), &done, etag.as_deref(), cipher).await? {
             crate::backend::Cas::Ok => {
                 *self.epoch_cache.lock().unwrap() = None;
@@ -223,14 +245,22 @@ impl ShardedIndex {
     /// direct count this method just did, not a round-trip through the
     /// metrics system. This is an O(total entries) operation -- call it
     /// from periodic maintenance, never a request path.
-    pub async fn occupancy(&self, backend: &dyn Backend, cipher: &Cipher, metrics: &dyn MetricsRecorder) -> Result<Vec<usize>> {
+    pub async fn occupancy(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        metrics: &dyn MetricsRecorder,
+    ) -> Result<Vec<usize>> {
         let epoch = self.current_epoch(backend, cipher).await?;
         let shard_count = 1u32 << epoch.prefix_bits.min(31);
         let mut counts = Vec::with_capacity(shard_count as usize);
         for shard in 0..shard_count {
             let prefix = self.shard_prefix(shard, epoch.prefix_bits);
             let count = list_all_keys(backend, &prefix).await?.len();
-            metrics.gauge(&format!("s3db_shard_occupancy{{kind=\"{}\",shard=\"{shard}\"}}", self.kind), count as f64);
+            metrics.gauge(
+                &format!("s3db_shard_occupancy{{kind=\"{}\",shard=\"{shard}\"}}", self.kind),
+                count as f64,
+            );
             counts.push(count);
         }
         Ok(counts)
@@ -243,7 +273,13 @@ impl ShardedIndex {
     /// cost note), and pick `threshold` well above the expected average
     /// (2x is the doc's own suggestion) so noise in an approximate count
     /// doesn't trigger a rebalance nobody needed.
-    pub async fn maybe_rebalance(&self, backend: &dyn Backend, cipher: &Cipher, metrics: &dyn MetricsRecorder, threshold: usize) -> Result<bool> {
+    pub async fn maybe_rebalance(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        metrics: &dyn MetricsRecorder,
+        threshold: usize,
+    ) -> Result<bool> {
         let epoch = self.current_epoch(backend, cipher).await?;
         if epoch.prev_prefix_bits.is_some() {
             return Ok(false); // already migrating, don't stack another
@@ -265,7 +301,9 @@ mod tests {
     use crate::metrics::NoopMetrics;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[13u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -280,7 +318,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = ShardedIndex::new(".conf/index", "pubkey", Segment::Base64);
-        assert!(idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() }).await.unwrap());
+        assert!(
+            idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
+                .await
+                .unwrap()
+        );
         let (resolved, _etag) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(resolved, Some(Pointer { owner: "alice".into() }));
     }
@@ -293,7 +335,11 @@ mod tests {
 
         let names: Vec<String> = (0..50).map(|i| format!("user-{i}")).collect();
         for name in &names {
-            assert!(idx.claim_once(&backend, &cipher, name, &Pointer { owner: name.clone() }).await.unwrap());
+            assert!(
+                idx.claim_once(&backend, &cipher, name, &Pointer { owner: name.clone() })
+                    .await
+                    .unwrap()
+            );
         }
 
         idx.begin_rebalance(&backend, &cipher).await.unwrap();
@@ -301,22 +347,44 @@ mod tests {
         // still resolve.
         for name in &names {
             let (resolved, _) = idx.resolve::<Pointer>(&backend, &cipher, name).await.unwrap();
-            assert_eq!(resolved, Some(Pointer { owner: name.clone() }), "{name} must resolve mid-rebalance");
+            assert_eq!(
+                resolved,
+                Some(Pointer { owner: name.clone() }),
+                "{name} must resolve mid-rebalance"
+            );
         }
         // And a claim on a brand-new name during the rebalance must still
         // land on the OLD layout (writers pinned until complete_rebalance).
-        assert!(idx.claim_once(&backend, &cipher, "new-during-rebalance", &Pointer { owner: "x".into() }).await.unwrap());
+        assert!(
+            idx.claim_once(
+                &backend,
+                &cipher,
+                "new-during-rebalance",
+                &Pointer { owner: "x".into() }
+            )
+            .await
+            .unwrap()
+        );
 
         idx.complete_rebalance(&backend, &cipher).await.unwrap();
         for name in &names {
             let (resolved, _) = idx.resolve::<Pointer>(&backend, &cipher, name).await.unwrap();
-            assert_eq!(resolved, Some(Pointer { owner: name.clone() }), "{name} must resolve after rebalance completes");
+            assert_eq!(
+                resolved,
+                Some(Pointer { owner: name.clone() }),
+                "{name} must resolve after rebalance completes"
+            );
         }
-        let (resolved, _) = idx.resolve::<Pointer>(&backend, &cipher, "new-during-rebalance").await.unwrap();
+        let (resolved, _) = idx
+            .resolve::<Pointer>(&backend, &cipher, "new-during-rebalance")
+            .await
+            .unwrap();
         assert_eq!(resolved, Some(Pointer { owner: "x".into() }));
 
         // No rebalance left in flight.
-        let (epoch, _) = get_json::<ShardEpoch>(&backend, &idx.epoch_key(), &cipher).await.unwrap();
+        let (epoch, _) = get_json::<ShardEpoch>(&backend, &idx.epoch_key(), &cipher)
+            .await
+            .unwrap();
         assert!(epoch.prev_prefix_bits.is_none());
     }
 
@@ -334,7 +402,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = ShardedIndex::new(".conf/index", "namespace", Segment::Raw);
-        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() }).await.unwrap();
+        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
+            .await
+            .unwrap();
         idx.release(&backend, &cipher, "alice").await;
         let (resolved, _) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(resolved, None);
@@ -346,11 +416,15 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = ShardedIndex::new(".conf/index", "namespace", Segment::Raw);
         for i in 0..20 {
-            idx.claim_once(&backend, &cipher, &format!("user-{i}"), &Pointer { owner: "x".into() }).await.unwrap();
+            idx.claim_once(&backend, &cipher, &format!("user-{i}"), &Pointer { owner: "x".into() })
+                .await
+                .unwrap();
         }
         let triggered = idx.maybe_rebalance(&backend, &cipher, &NoopMetrics, 10).await.unwrap();
         assert!(triggered);
-        let (epoch, _) = get_json::<ShardEpoch>(&backend, &idx.epoch_key(), &cipher).await.unwrap();
+        let (epoch, _) = get_json::<ShardEpoch>(&backend, &idx.epoch_key(), &cipher)
+            .await
+            .unwrap();
         assert!(epoch.prev_prefix_bits.is_some());
     }
 
@@ -359,8 +433,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = ShardedIndex::new(".conf/index", "namespace", Segment::Raw);
-        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "x".into() }).await.unwrap();
-        let triggered = idx.maybe_rebalance(&backend, &cipher, &NoopMetrics, 1000).await.unwrap();
+        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "x".into() })
+            .await
+            .unwrap();
+        let triggered = idx
+            .maybe_rebalance(&backend, &cipher, &NoopMetrics, 1000)
+            .await
+            .unwrap();
         assert!(!triggered);
     }
 }

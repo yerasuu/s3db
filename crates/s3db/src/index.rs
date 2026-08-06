@@ -89,7 +89,9 @@ impl Segment {
             Segment::Raw => Ok(encoded.to_string()),
             Segment::Base64 => {
                 use base64::Engine;
-                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded).context("invalid base64 segment")?;
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .context("invalid base64 segment")?;
                 String::from_utf8(bytes).context("segment bytes aren't valid utf8")
             }
         }
@@ -117,7 +119,14 @@ impl SecondaryIndex {
     /// caller that already has an etag in hand (e.g. reclaiming after its
     /// own liveness check) and wants the real [`Cas`] outcome rather than a
     /// collapsed bool.
-    pub async fn put_raw<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str, value: &T, expected_etag: Option<&str>) -> Result<Cas> {
+    pub async fn put_raw<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+        value: &T,
+        expected_etag: Option<&str>,
+    ) -> Result<Cas> {
         put_json(backend, &self.key(raw), value, expected_etag, cipher).await
     }
 
@@ -134,7 +143,13 @@ impl SecondaryIndex {
     /// Single-attempt CAS claim, no retry, no self-heal — correct when the
     /// key space can't meaningfully collide (a random uid) or the first
     /// claimant should simply win (a namespace reservation).
-    pub async fn claim_once<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str, value: &T) -> Result<bool> {
+    pub async fn claim_once<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+        value: &T,
+    ) -> Result<bool> {
         match put_json(backend, &self.key(raw), value, None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => Ok(false),
@@ -202,7 +217,13 @@ impl SecondaryIndex {
     }
 
     /// [`Self::claim_once`], for an [`IndexKey`] `raw`.
-    pub async fn claim_once_typed<T: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &(impl IndexKey + ?Sized), value: &T) -> Result<bool> {
+    pub async fn claim_once_typed<T: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &(impl IndexKey + ?Sized),
+        value: &T,
+    ) -> Result<bool> {
         match put_json(backend, &self.key_typed(raw), value, None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => Ok(false),
@@ -210,7 +231,12 @@ impl SecondaryIndex {
     }
 
     /// [`Self::resolve`], for an [`IndexKey`] `raw`.
-    pub async fn resolve_typed<T: DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &(impl IndexKey + ?Sized)) -> Result<(Option<T>, Option<String>)> {
+    pub async fn resolve_typed<T: DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &(impl IndexKey + ?Sized),
+    ) -> Result<(Option<T>, Option<String>)> {
         let (value, etag) = get_json::<T>(backend, &self.key_typed(raw), cipher).await?;
         Ok((etag.is_some().then_some(value), etag))
     }
@@ -228,7 +254,14 @@ impl SecondaryIndex {
     /// `claim_inline` call to keep this copy from going stale -- there's no
     /// automatic propagation) for fewer reads -- worth it only where lookup
     /// volume dominates over update volume.
-    pub async fn claim_inline<P: Serialize, V: Serialize>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str, pointer: &P, value: &V) -> Result<bool> {
+    pub async fn claim_inline<P: Serialize, V: Serialize>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+        pointer: &P,
+        value: &V,
+    ) -> Result<bool> {
         match put_json(backend, &self.key(raw), &(pointer, value), None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => Ok(false),
@@ -238,7 +271,12 @@ impl SecondaryIndex {
     /// Reads the denormalized value straight from the pointer entry a
     /// prior [`Self::claim_inline`] wrote -- one `get`, no second fetch
     /// against the entity's own `Collection`.
-    pub async fn resolve_inline<P: DeserializeOwned + Default, V: DeserializeOwned + Default>(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str) -> Result<Option<V>> {
+    pub async fn resolve_inline<P: DeserializeOwned + Default, V: DeserializeOwned + Default>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        raw: &str,
+    ) -> Result<Option<V>> {
         let (entry, etag) = get_json::<(P, V)>(backend, &self.key(raw), cipher).await?;
         Ok(etag.map(|_| entry.1))
     }
@@ -250,7 +288,9 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-        let backend = LocalBackend::new(&crate::config::LocalParams { bucket: root.to_string_lossy().to_string() });
+        let backend = LocalBackend::new(&crate::config::LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        });
         let cipher = Cipher::derive("test passphrase", &[8u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
     }
@@ -268,7 +308,10 @@ mod tests {
         let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
         use base64::Engine;
         let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"SHA256:abc/def+ghi");
-        assert_eq!(idx.key("SHA256:abc/def+ghi"), format!(".conf/index/pubkey/{expected}.json"));
+        assert_eq!(
+            idx.key("SHA256:abc/def+ghi"),
+            format!(".conf/index/pubkey/{expected}.json")
+        );
     }
 
     #[tokio::test]
@@ -277,7 +320,11 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "byid", Segment::Raw);
         let id: u64 = 42;
-        assert!(idx.claim_once_typed(&backend, &cipher, &id, &Pointer { owner: "alice".into() }).await.unwrap());
+        assert!(
+            idx.claim_once_typed(&backend, &cipher, &id, &Pointer { owner: "alice".into() })
+                .await
+                .unwrap()
+        );
         let (resolved, _etag) = idx.resolve_typed::<Pointer>(&backend, &cipher, &id).await.unwrap();
         assert_eq!(resolved, Some(Pointer { owner: "alice".into() }));
     }
@@ -299,7 +346,9 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "byid", Segment::Raw);
         let id: u64 = 7;
-        idx.claim_once_typed(&backend, &cipher, &id, &Pointer { owner: "alice".into() }).await.unwrap();
+        idx.claim_once_typed(&backend, &cipher, &id, &Pointer { owner: "alice".into() })
+            .await
+            .unwrap();
         idx.release_typed(&backend, &id).await;
         let (resolved, _) = idx.resolve_typed::<Pointer>(&backend, &cipher, &id).await.unwrap();
         assert_eq!(resolved, None);
@@ -311,11 +360,20 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "email", Segment::Base64);
         assert!(
-            idx.claim_inline(&backend, &cipher, "alice@example.com", &Pointer { owner: "alice".into() }, &Widget { count: 9 })
-                .await
-                .unwrap()
+            idx.claim_inline(
+                &backend,
+                &cipher,
+                "alice@example.com",
+                &Pointer { owner: "alice".into() },
+                &Widget { count: 9 }
+            )
+            .await
+            .unwrap()
         );
-        let value: Option<Widget> = idx.resolve_inline::<Pointer, Widget>(&backend, &cipher, "alice@example.com").await.unwrap();
+        let value: Option<Widget> = idx
+            .resolve_inline::<Pointer, Widget>(&backend, &cipher, "alice@example.com")
+            .await
+            .unwrap();
         assert_eq!(value, Some(Widget { count: 9 }));
     }
 
@@ -324,7 +382,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "email", Segment::Base64);
-        let value: Option<Widget> = idx.resolve_inline::<Pointer, Widget>(&backend, &cipher, "nobody@example.com").await.unwrap();
+        let value: Option<Widget> = idx
+            .resolve_inline::<Pointer, Widget>(&backend, &cipher, "nobody@example.com")
+            .await
+            .unwrap();
         assert_eq!(value, None);
     }
 
@@ -344,8 +405,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "namespace", Segment::Raw);
-        assert!(idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() }).await.unwrap());
-        assert!(!idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "bob".into() }).await.unwrap());
+        assert!(
+            idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
+                .await
+                .unwrap()
+        );
+        assert!(
+            !idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "bob".into() })
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -354,7 +423,13 @@ mod tests {
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
         let ok = idx
-            .claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "alice".into() }, |_existing: Pointer| async { Ok(false) })
+            .claim_self_healing(
+                &backend,
+                &cipher,
+                "fp1",
+                &Pointer { owner: "alice".into() },
+                |_existing: Pointer| async { Ok(false) },
+            )
             .await
             .unwrap();
         assert!(ok);
@@ -365,14 +440,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
-        idx.claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "alice".into() }, |_: Pointer| async { Ok(true) })
-            .await
-            .unwrap();
+        idx.claim_self_healing(
+            &backend,
+            &cipher,
+            "fp1",
+            &Pointer { owner: "alice".into() },
+            |_: Pointer| async { Ok(true) },
+        )
+        .await
+        .unwrap();
         let ok = idx
-            .claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "alice".into() }, |_: Pointer| async { Ok(true) })
+            .claim_self_healing(
+                &backend,
+                &cipher,
+                "fp1",
+                &Pointer { owner: "alice".into() },
+                |_: Pointer| async { Ok(true) },
+            )
             .await
             .unwrap();
-        assert!(ok, "reclaiming with the identical value must be idempotent, not a conflict");
+        assert!(
+            ok,
+            "reclaiming with the identical value must be idempotent, not a conflict"
+        );
     }
 
     #[tokio::test]
@@ -380,13 +470,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
-        idx.claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "alice".into() }, |_: Pointer| async { Ok(true) })
-            .await
-            .unwrap();
+        idx.claim_self_healing(
+            &backend,
+            &cipher,
+            "fp1",
+            &Pointer { owner: "alice".into() },
+            |_: Pointer| async { Ok(true) },
+        )
+        .await
+        .unwrap();
         let ok = idx
-            .claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "bob".into() }, |existing: Pointer| async move {
-                Ok(existing.owner == "alice")
-            })
+            .claim_self_healing(
+                &backend,
+                &cipher,
+                "fp1",
+                &Pointer { owner: "bob".into() },
+                |existing: Pointer| async move { Ok(existing.owner == "alice") },
+            )
             .await
             .unwrap();
         assert!(!ok, "a claim genuinely still held by someone else must be refused");
@@ -397,12 +497,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
-        idx.claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "alice".into() }, |_: Pointer| async { Ok(true) })
-            .await
-            .unwrap();
+        idx.claim_self_healing(
+            &backend,
+            &cipher,
+            "fp1",
+            &Pointer { owner: "alice".into() },
+            |_: Pointer| async { Ok(true) },
+        )
+        .await
+        .unwrap();
         // `alice` no longer genuinely holds it (simulated via is_genuine=false).
         let ok = idx
-            .claim_self_healing(&backend, &cipher, "fp1", &Pointer { owner: "bob".into() }, |_: Pointer| async { Ok(false) })
+            .claim_self_healing(
+                &backend,
+                &cipher,
+                "fp1",
+                &Pointer { owner: "bob".into() },
+                |_: Pointer| async { Ok(false) },
+            )
             .await
             .unwrap();
         assert!(ok, "a stale claim must be reclaimable");
@@ -415,7 +527,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (backend, cipher) = test_backend_and_cipher(dir.path());
         let idx = SecondaryIndex::new(".conf/index", "namespace", Segment::Raw);
-        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() }).await.unwrap();
+        idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
+            .await
+            .unwrap();
         idx.release(&backend, "alice").await;
         let (resolved, _etag) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(resolved, None);

@@ -42,7 +42,10 @@ const VERIFIER_AAD: &str = ".conf/encryption.json#verifier";
 const MAX_BOOTSTRAP_RETRIES: u32 = 5;
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("system clock before unix epoch").as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
 }
 
 fn random_key_id() -> Result<String> {
@@ -104,14 +107,21 @@ impl std::fmt::Debug for KeyRing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeyRing")
             .field("active_key_id", &self.active_key_id)
-            .field("retired_key_ids", &self.retired.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>())
+            .field(
+                "retired_key_ids",
+                &self.retired.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
 
 impl KeyRing {
     fn single(key_id: String, cipher: Cipher) -> Self {
-        KeyRing { active_key_id: key_id, active_cipher: cipher, retired: Vec::new() }
+        KeyRing {
+            active_key_id: key_id,
+            active_cipher: cipher,
+            retired: Vec::new(),
+        }
     }
 
     pub fn active_key_id(&self) -> &str {
@@ -154,12 +164,19 @@ impl KeyRing {
 }
 
 fn derive_and_verify(passphrase: &str, material: &KeyMaterial) -> Result<Cipher> {
-    let salt_bytes = BASE64.decode(&material.salt).context(".conf/encryption.json: invalid salt (not base64)")?;
-    let salt: [u8; SALT_LEN] = salt_bytes
-        .try_into()
-        .map_err(|bytes: Vec<u8>| anyhow::anyhow!(".conf/encryption.json: salt has invalid length ({} bytes, expected {SALT_LEN})", bytes.len()))?;
+    let salt_bytes = BASE64
+        .decode(&material.salt)
+        .context(".conf/encryption.json: invalid salt (not base64)")?;
+    let salt: [u8; SALT_LEN] = salt_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            ".conf/encryption.json: salt has invalid length ({} bytes, expected {SALT_LEN})",
+            bytes.len()
+        )
+    })?;
     let cipher = Cipher::derive(passphrase, &salt)?;
-    let verifier = BASE64.decode(&material.verifier).context(".conf/encryption.json: invalid verifier (not base64)")?;
+    let verifier = BASE64
+        .decode(&material.verifier)
+        .context(".conf/encryption.json: invalid verifier (not base64)")?;
     cipher.open(VERIFIER_AAD, &verifier).with_context(|| {
         format!(
             "the passphrase supplied for key {} doesn't match the one used to encrypt it \
@@ -190,13 +207,20 @@ fn new_key_material(passphrase: &str) -> Result<(KeyMaterial, Cipher)> {
 /// entry here fails bootstrap with a clear error naming it, rather than
 /// silently building a `KeyRing` that can't actually open that key's old
 /// objects.
-pub async fn get_or_create_keyring(backend: &dyn Backend, passphrase: &str, retired_passphrases: &HashMap<String, String>) -> Result<KeyRing> {
+pub async fn get_or_create_keyring(
+    backend: &dyn Backend,
+    passphrase: &str,
+    retired_passphrases: &HashMap<String, String>,
+) -> Result<KeyRing> {
     for _ in 0..MAX_BOOTSTRAP_RETRIES {
         let (config, etag) = get_json_plain::<EncryptionConfig>(backend, ENCRYPTION_CONFIG_KEY).await?;
 
         if etag.is_none() {
             let (material, cipher) = new_key_material(passphrase)?;
-            let config = EncryptionConfig { active_key_id: material.key_id.clone(), keys: vec![material.clone()] };
+            let config = EncryptionConfig {
+                active_key_id: material.key_id.clone(),
+                keys: vec![material.clone()],
+            };
             match put_json_plain(backend, ENCRYPTION_CONFIG_KEY, &config, None).await? {
                 Cas::Ok => return Ok(KeyRing::single(material.key_id, cipher)),
                 // Another instance bootstrapped the bucket first: discard
@@ -211,16 +235,27 @@ pub async fn get_or_create_keyring(backend: &dyn Backend, passphrase: &str, reti
             if material.key_id == config.active_key_id {
                 active_cipher = Some(derive_and_verify(passphrase, material)?);
             } else {
-                let retired_passphrase = retired_passphrases
-                    .get(&material.key_id)
-                    .with_context(|| format!("bucket has retired key {} with no matching passphrase supplied", material.key_id))?;
-                retired.push((material.key_id.clone(), derive_and_verify(retired_passphrase, material)?));
+                let retired_passphrase = retired_passphrases.get(&material.key_id).with_context(|| {
+                    format!(
+                        "bucket has retired key {} with no matching passphrase supplied",
+                        material.key_id
+                    )
+                })?;
+                retired.push((
+                    material.key_id.clone(),
+                    derive_and_verify(retired_passphrase, material)?,
+                ));
             }
         }
-        let active_cipher = active_cipher.context(".conf/encryption.json: active_key_id doesn't match any key in `keys`")?;
+        let active_cipher =
+            active_cipher.context(".conf/encryption.json: active_key_id doesn't match any key in `keys`")?;
         // Most-recently-retired first, matching `KeyRing::open`'s try order.
         retired.reverse();
-        return Ok(KeyRing { active_key_id: config.active_key_id.clone(), active_cipher, retired });
+        return Ok(KeyRing {
+            active_key_id: config.active_key_id.clone(),
+            active_cipher,
+            retired,
+        });
     }
     bail!("couldn't initialize bucket encryption after several attempts (high contention)")
 }
@@ -293,14 +328,18 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn backend(root: &std::path::Path) -> LocalBackend {
-        LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() })
+        LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        })
     }
 
     #[tokio::test]
     async fn fresh_bucket_bootstraps_a_single_active_key() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
-        let ring = get_or_create_keyring(&b, "correct horse", &HashMap::new()).await.unwrap();
+        let ring = get_or_create_keyring(&b, "correct horse", &HashMap::new())
+            .await
+            .unwrap();
         let sealed = ring.active().seal("k", b"hello", CompressionStrategy::None);
         assert_eq!(ring.open("k", &sealed).unwrap(), b"hello");
     }
@@ -309,8 +348,12 @@ mod tests {
     async fn wrong_active_passphrase_fails_clearly() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
-        get_or_create_keyring(&b, "correct horse", &HashMap::new()).await.unwrap();
-        let err = get_or_create_keyring(&b, "wrong horse", &HashMap::new()).await.unwrap_err();
+        get_or_create_keyring(&b, "correct horse", &HashMap::new())
+            .await
+            .unwrap();
+        let err = get_or_create_keyring(&b, "wrong horse", &HashMap::new())
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains("doesn't match"));
     }
 
@@ -318,7 +361,9 @@ mod tests {
     async fn rotate_keeps_old_objects_readable_via_dual_read() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
-        let mut ring = get_or_create_keyring(&b, "first passphrase", &HashMap::new()).await.unwrap();
+        let mut ring = get_or_create_keyring(&b, "first passphrase", &HashMap::new())
+            .await
+            .unwrap();
         let old_key_id = ring.active_key_id().to_string();
         let sealed_under_old = ring.active().seal("k", b"old value", CompressionStrategy::None);
 
@@ -336,13 +381,17 @@ mod tests {
     async fn restart_after_rotate_needs_the_retired_passphrase_too() {
         let dir = tempfile::tempdir().unwrap();
         let b = backend(dir.path());
-        let mut ring = get_or_create_keyring(&b, "first passphrase", &HashMap::new()).await.unwrap();
+        let mut ring = get_or_create_keyring(&b, "first passphrase", &HashMap::new())
+            .await
+            .unwrap();
         let old_key_id = ring.active_key_id().to_string();
         rotate(&b, &mut ring, "second passphrase").await.unwrap();
 
         // Simulates a process restart: only the current passphrase is
         // supplied, the retired one is "forgotten" by the caller.
-        let err = get_or_create_keyring(&b, "second passphrase", &HashMap::new()).await.unwrap_err();
+        let err = get_or_create_keyring(&b, "second passphrase", &HashMap::new())
+            .await
+            .unwrap_err();
         assert!(format!("{err:#}").contains(&old_key_id));
 
         // Supplying it makes bootstrap succeed again.
@@ -361,7 +410,10 @@ mod tests {
         assert!(ring.open("k", &sealed_under_old).is_ok());
 
         ring.forget_retired(&old_key_id);
-        assert!(ring.open("k", &sealed_under_old).is_err(), "forgotten key must no longer be tried");
+        assert!(
+            ring.open("k", &sealed_under_old).is_err(),
+            "forgotten key must no longer be tried"
+        );
     }
 
     #[tokio::test]
@@ -374,7 +426,9 @@ mod tests {
 
         forget_key(&b, &old_key_id).await.unwrap();
 
-        let (config, _) = get_json_plain::<EncryptionConfig>(&b, ENCRYPTION_CONFIG_KEY).await.unwrap();
+        let (config, _) = get_json_plain::<EncryptionConfig>(&b, ENCRYPTION_CONFIG_KEY)
+            .await
+            .unwrap();
         assert!(config.keys.iter().all(|k| k.key_id != old_key_id));
     }
 

@@ -8,8 +8,8 @@
 use crate::Cipher;
 use crate::cipher::NONCE_LEN;
 use anyhow::{Context, Result, bail};
-use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::XNonce;
+use chacha20poly1305::aead::{Aead, Payload};
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -30,7 +30,11 @@ const STREAM_CHUNK_LEN: usize = 4 * 1024 * 1024;
 /// (empty) chunk, never zero — `open_stream` always expects at least one
 /// chunk frame.
 fn stream_chunk_count(total_len: u64) -> u64 {
-    if total_len == 0 { 1 } else { total_len.div_ceil(STREAM_CHUNK_LEN as u64) }
+    if total_len == 0 {
+        1
+    } else {
+        total_len.div_ceil(STREAM_CHUNK_LEN as u64)
+    }
 }
 
 /// `true` if `prefix` (as little as the sealed object's first 8 bytes —
@@ -90,7 +94,13 @@ pub(crate) async fn seal_stream(cipher: &Cipher, aad: &str, plaintext_path: &Pat
         let chunk_aad = format!("{aad}\0stream\0{total_len}\0{idx}");
         let ciphertext = cipher
             .aead()
-            .encrypt(&nonce, Payload { msg: &plain, aad: chunk_aad.as_bytes() })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &plain,
+                    aad: chunk_aad.as_bytes(),
+                },
+            )
             // Same reasoning as `seal`: only fails on a plaintext bigger
             // than the cipher's theoretical limit, never on content/key,
             // and a chunk is always far under that limit.
@@ -197,7 +207,13 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
         let chunk_aad = format!("{aad}\0stream\0{total_len}\0{idx}");
         let plain = cipher
             .aead()
-            .decrypt(&nonce, Payload { msg: &ciphertext, aad: chunk_aad.as_bytes() })
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &ciphertext,
+                    aad: chunk_aad.as_bytes(),
+                },
+            )
             .map_err(|_| {
                 anyhow::anyhow!(
                     "couldn't decrypt (wrong passphrase, out-of-order chunk, or the \
@@ -218,7 +234,10 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
         }
         remaining -= expected_len as u64;
 
-        output.write_all(&plain).await.with_context(|| format!("writing {}", plaintext_path.display()))?;
+        output
+            .write_all(&plain)
+            .await
+            .with_context(|| format!("writing {}", plaintext_path.display()))?;
     }
 
     // No trailing bytes allowed after the declared final chunk — catches an
@@ -247,7 +266,10 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
         .with_context(|| format!("verifying size of {}", plaintext_path.display()))?
         .len();
     if actual_len != total_len {
-        bail!("incomplete write: {} ended up at {actual_len} bytes, expected {total_len}", plaintext_path.display());
+        bail!(
+            "incomplete write: {} ended up at {actual_len} bytes, expected {total_len}",
+            plaintext_path.display()
+        );
     }
     Ok(())
 }
@@ -325,7 +347,10 @@ mod tests {
                 // Reached only on a claimed success from both — this is the
                 // one path that must be trustworthy.
                 let opened = tokio::fs::read(&opened_path).await.unwrap();
-                assert_eq!(opened, plain, "task {n} len {len}: claimed success but content is wrong");
+                assert_eq!(
+                    opened, plain,
+                    "task {n} len {len}: claimed success but content is wrong"
+                );
             }));
         }
         for h in handles {
@@ -339,7 +364,13 @@ mod tests {
     #[tokio::test]
     async fn stream_roundtrips_various_sizes() {
         let c = test_cipher();
-        for &len in &[0usize, 1, STREAM_CHUNK_LEN, STREAM_CHUNK_LEN + 1, STREAM_CHUNK_LEN * 2 + 100] {
+        for &len in &[
+            0usize,
+            1,
+            STREAM_CHUNK_LEN,
+            STREAM_CHUNK_LEN + 1,
+            STREAM_CHUNK_LEN * 2 + 100,
+        ] {
             let plain: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let dir = tempfile::tempdir().unwrap();
             let plain_path = dir.path().join("plain");
@@ -457,6 +488,11 @@ mod tests {
         assert!(c.open_stream("repo-b/pack", &sealed_path, &opened_path).await.is_err());
 
         let other = Cipher::derive("another passphrase", &[7u8; SALT_LEN]).unwrap();
-        assert!(other.open_stream("repo-a/pack", &sealed_path, &opened_path).await.is_err());
+        assert!(
+            other
+                .open_stream("repo-a/pack", &sealed_path, &opened_path)
+                .await
+                .is_err()
+        );
     }
 }

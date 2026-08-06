@@ -30,7 +30,9 @@ struct Widget {
 }
 
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-    let backend = LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() });
+    let backend = LocalBackend::new(&LocalParams {
+        bucket: root.to_string_lossy().to_string(),
+    });
     let cipher = Cipher::derive("test passphrase", &[3u8; s3db::cipher::SALT_LEN]).unwrap();
     (backend, cipher)
 }
@@ -39,7 +41,12 @@ fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
 async fn put_then_get_roundtrips_by_key() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: None, fingerprint: None, is_admin: true };
+    let account = Account {
+        username: "alice".into(),
+        email: None,
+        fingerprint: None,
+        is_admin: true,
+    };
 
     assert_eq!(account.put(&backend, &cipher, None).await.unwrap(), s3db::Cas::Ok);
     let (fetched, etag) = Account::get(&backend, &cipher, "alice").await.unwrap();
@@ -67,11 +74,18 @@ async fn get_reports_none_for_a_missing_key() {
 async fn indexed_field_claims_and_resolves_back_to_the_owning_entity() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: Some("alice@example.com".into()), fingerprint: None, is_admin: false };
+    let account = Account {
+        username: "alice".into(),
+        email: Some("alice@example.com".into()),
+        fingerprint: None,
+        is_admin: false,
+    };
     account.put(&backend, &cipher, None).await.unwrap();
 
     assert!(account.claim_email(&backend, &cipher).await.unwrap());
-    let found = Account::find_by_email(&backend, &cipher, "alice@example.com").await.unwrap();
+    let found = Account::find_by_email(&backend, &cipher, "alice@example.com")
+        .await
+        .unwrap();
     assert_eq!(found, Some(account));
 }
 
@@ -79,8 +93,18 @@ async fn indexed_field_claims_and_resolves_back_to_the_owning_entity() {
 async fn claiming_an_already_taken_index_value_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let alice = Account { username: "alice".into(), email: Some("shared@example.com".into()), fingerprint: None, is_admin: false };
-    let bob = Account { username: "bob".into(), email: Some("shared@example.com".into()), fingerprint: None, is_admin: false };
+    let alice = Account {
+        username: "alice".into(),
+        email: Some("shared@example.com".into()),
+        fingerprint: None,
+        is_admin: false,
+    };
+    let bob = Account {
+        username: "bob".into(),
+        email: Some("shared@example.com".into()),
+        fingerprint: None,
+        is_admin: false,
+    };
     alice.put(&backend, &cipher, None).await.unwrap();
     bob.put(&backend, &cipher, None).await.unwrap();
 
@@ -92,7 +116,12 @@ async fn claiming_an_already_taken_index_value_is_refused() {
 async fn claiming_a_none_optional_index_is_a_no_op_success() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: None, fingerprint: None, is_admin: false };
+    let account = Account {
+        username: "alice".into(),
+        email: None,
+        fingerprint: None,
+        is_admin: false,
+    };
     assert!(account.claim_email(&backend, &cipher).await.unwrap());
     assert_eq!(Account::find_by_email(&backend, &cipher, "").await.unwrap(), None);
 }
@@ -101,11 +130,17 @@ async fn claiming_a_none_optional_index_is_a_no_op_success() {
 async fn base64_segment_index_round_trips_a_slash_containing_value() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account =
-        Account { username: "alice".into(), email: None, fingerprint: Some("SHA256:abc/def+ghi".into()), is_admin: false };
+    let account = Account {
+        username: "alice".into(),
+        email: None,
+        fingerprint: Some("SHA256:abc/def+ghi".into()),
+        is_admin: false,
+    };
     account.put(&backend, &cipher, None).await.unwrap();
     assert!(account.claim_fingerprint(&backend, &cipher).await.unwrap());
-    let found = Account::find_by_fingerprint(&backend, &cipher, "SHA256:abc/def+ghi").await.unwrap();
+    let found = Account::find_by_fingerprint(&backend, &cipher, "SHA256:abc/def+ghi")
+        .await
+        .unwrap();
     assert_eq!(found, Some(account));
 }
 
@@ -113,20 +148,49 @@ async fn base64_segment_index_round_trips_a_slash_containing_value() {
 async fn release_then_find_by_reports_missing() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: Some("alice@example.com".into()), fingerprint: None, is_admin: false };
+    let account = Account {
+        username: "alice".into(),
+        email: Some("alice@example.com".into()),
+        fingerprint: None,
+        is_admin: false,
+    };
     account.put(&backend, &cipher, None).await.unwrap();
     account.claim_email(&backend, &cipher).await.unwrap();
     account.release_email(&backend).await;
-    assert_eq!(Account::find_by_email(&backend, &cipher, "alice@example.com").await.unwrap(), None);
+    assert_eq!(
+        Account::find_by_email(&backend, &cipher, "alice@example.com")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
 async fn list_keys_returns_every_stored_username_sorted() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    Account { username: "bob".into(), email: None, fingerprint: None, is_admin: false }.put(&backend, &cipher, None).await.unwrap();
-    Account { username: "alice".into(), email: None, fingerprint: None, is_admin: false }.put(&backend, &cipher, None).await.unwrap();
-    assert_eq!(Account::list_keys(&backend).await.unwrap(), vec!["alice".to_string(), "bob".to_string()]);
+    Account {
+        username: "bob".into(),
+        email: None,
+        fingerprint: None,
+        is_admin: false,
+    }
+    .put(&backend, &cipher, None)
+    .await
+    .unwrap();
+    Account {
+        username: "alice".into(),
+        email: None,
+        fingerprint: None,
+        is_admin: false,
+    }
+    .put(&backend, &cipher, None)
+    .await
+    .unwrap();
+    assert_eq!(
+        Account::list_keys(&backend).await.unwrap(),
+        vec!["alice".to_string(), "bob".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -137,7 +201,12 @@ async fn default_index_root_never_leaks_into_list_keys_or_list_all() {
     // land on a sibling prefix, never inside `Account::COLLECTION`'s own.
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: Some("alice@example.com".into()), fingerprint: None, is_admin: false };
+    let account = Account {
+        username: "alice".into(),
+        email: Some("alice@example.com".into()),
+        fingerprint: None,
+        is_admin: false,
+    };
     account.put(&backend, &cipher, None).await.unwrap();
     account.claim_email(&backend, &cipher).await.unwrap();
 
@@ -160,7 +229,10 @@ fn index_root_kind_and_pointer_field_overrides_match_a_hand_written_index() {
 async fn claim_op_builds_a_txn_creating_the_override_shaped_pointer() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let widget = Widget { id: "w1".into(), owner: Some("alice".into()) };
+    let widget = Widget {
+        id: "w1".into(),
+        owner: Some("alice".into()),
+    };
 
     let ops = vec![widget.create_op().unwrap(), widget.owner_claim_op().unwrap().unwrap()];
     assert_eq!(s3db::txn::run(&backend, &cipher, ops).await.unwrap(), s3db::Cas::Ok);
@@ -175,7 +247,10 @@ async fn claim_op_builds_a_txn_creating_the_override_shaped_pointer() {
 async fn claim_op_is_none_for_an_unset_optional_index() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let widget = Widget { id: "w2".into(), owner: None };
+    let widget = Widget {
+        id: "w2".into(),
+        owner: None,
+    };
     assert!(widget.owner_claim_op().unwrap().is_none());
     widget.put(&backend, &cipher, None).await.unwrap();
     assert_eq!(Widget::find_by_owner(&backend, &cipher, "").await.unwrap(), None);
@@ -185,8 +260,18 @@ async fn claim_op_is_none_for_an_unset_optional_index() {
 async fn create_op_matches_a_plain_put_for_the_same_entity() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let account = Account { username: "alice".into(), email: None, fingerprint: None, is_admin: true };
-    assert_eq!(s3db::txn::run(&backend, &cipher, vec![account.create_op().unwrap()]).await.unwrap(), s3db::Cas::Ok);
+    let account = Account {
+        username: "alice".into(),
+        email: None,
+        fingerprint: None,
+        is_admin: true,
+    };
+    assert_eq!(
+        s3db::txn::run(&backend, &cipher, vec![account.create_op().unwrap()])
+            .await
+            .unwrap(),
+        s3db::Cas::Ok
+    );
     let (fetched, _) = Account::get(&backend, &cipher, "alice").await.unwrap();
     assert_eq!(fetched, Some(account));
 }

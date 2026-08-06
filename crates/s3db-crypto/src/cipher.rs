@@ -76,7 +76,13 @@ impl Cipher {
         let combined_aad = header_bound_aad(aad, header);
         let mut ciphertext = self
             .0
-            .encrypt(&nonce, Payload { msg: &payload, aad: &combined_aad })
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &payload,
+                    aad: &combined_aad,
+                },
+            )
             // The only way this fails in this API is a plaintext bigger than
             // the cipher's theoretical limit (hundreds of GiB); never due to
             // the key or the content itself.
@@ -102,8 +108,16 @@ impl Cipher {
         let combined_aad = header_bound_aad(aad, header);
         let payload = self
             .0
-            .decrypt(&nonce, Payload { msg: ciphertext, aad: &combined_aad })
-            .map_err(|_| anyhow::anyhow!("couldn't decrypt (wrong passphrase, or data was modified/moved from a different key)"))?;
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: &combined_aad,
+                },
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("couldn't decrypt (wrong passphrase, or data was modified/moved from a different key)")
+            })?;
         compression::decompress(header, payload)
     }
 
@@ -194,7 +208,10 @@ mod tests {
         let c = test_cipher();
         let plaintext = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
         let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
-        assert!(sealed.len() < plaintext.len(), "highly repetitive data should compress smaller");
+        assert!(
+            sealed.len() < plaintext.len(),
+            "highly repetitive data should compress smaller"
+        );
         assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
     }
 
@@ -205,7 +222,10 @@ mod tests {
         let mut sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
         assert_eq!(sealed[NONCE_LEN], compression::ZSTD);
         sealed[NONCE_LEN] = compression::NONE; // flip the header without re-encrypting
-        assert!(c.open("k", &sealed).is_err(), "header is bound into the AAD, tampering must fail auth");
+        assert!(
+            c.open("k", &sealed).is_err(),
+            "header is bound into the AAD, tampering must fail auth"
+        );
     }
 
     #[test]

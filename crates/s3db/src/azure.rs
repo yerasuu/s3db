@@ -15,16 +15,16 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::AzureParams;
-use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use azure_core::Error as AzureError;
 use azure_core::credentials::Secret;
 use azure_core::http::{Etag, RequestContent, StatusCode, Url};
 use azure_identity::ClientSecretCredential;
-use azure_storage_blob::models::{BlobClientUploadOptions, BlobContainerClientListBlobsOptions};
 #[cfg(feature = "streaming")]
 use azure_storage_blob::models::BlockLookupList;
+use azure_storage_blob::models::{BlobClientUploadOptions, BlobContainerClientListBlobsOptions};
 use azure_storage_blob::{BlobContainerClient, BlobServiceClient};
 use futures::TryStreamExt;
 use futures::stream::{self, StreamExt};
@@ -115,7 +115,11 @@ impl Backend for AzureBackend {
         match self.blob(key).await?.download(None).await {
             Ok(result) => {
                 let etag = result.properties.etag.as_ref().map(|e| e.to_string());
-                let bytes = result.body.collect().await.with_context(|| format!("reading body of {key}"))?;
+                let bytes = result
+                    .body
+                    .collect()
+                    .await
+                    .with_context(|| format!("reading body of {key}"))?;
                 Ok((bytes.to_vec(), etag))
             }
             Err(e) if is_not_found(&e) => Ok((Vec::new(), None)),
@@ -125,10 +129,21 @@ impl Backend for AzureBackend {
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         let options = match expected_etag {
-            Some(etag) => BlobClientUploadOptions { if_match: Some(Etag::from(etag)), ..Default::default() },
-            None => BlobClientUploadOptions { if_none_match: Some(Etag::from("*")), ..Default::default() },
+            Some(etag) => BlobClientUploadOptions {
+                if_match: Some(Etag::from(etag)),
+                ..Default::default()
+            },
+            None => BlobClientUploadOptions {
+                if_none_match: Some(Etag::from("*")),
+                ..Default::default()
+            },
         };
-        match self.blob(key).await?.upload(RequestContent::from(body), Some(options)).await {
+        match self
+            .blob(key)
+            .await?
+            .upload(RequestContent::from(body), Some(options))
+            .await
+        {
             Ok(_) => Ok(Cas::Ok),
             Err(e) if is_precondition_failed(&e) => Ok(Cas::Conflict),
             Err(e) => Err(e).with_context(|| format!("couldn't write {key} to Azure Blob Storage")),
@@ -137,11 +152,20 @@ impl Backend for AzureBackend {
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         match self.blob(key).await?.delete(None).await {
-            Ok(_) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
-            Err(e) if is_not_found(&e) => Ok(DeleteOutcome { attempted: 1, confirmed: 1 }),
+            Ok(_) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
+            Err(e) if is_not_found(&e) => Ok(DeleteOutcome {
+                attempted: 1,
+                confirmed: 1,
+            }),
             Err(e) => {
                 eprintln!("warning: couldn't delete {key} from Azure Blob Storage: {e}");
-                Ok(DeleteOutcome { attempted: 1, confirmed: 0 })
+                Ok(DeleteOutcome {
+                    attempted: 1,
+                    confirmed: 0,
+                })
             }
         }
     }
@@ -154,8 +178,14 @@ impl Backend for AzureBackend {
         let container = match self.container().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("warning: couldn't delete {} keys from Azure Blob Storage: {e:#}", keys.len());
-                return Ok(DeleteOutcome { attempted: keys.len(), confirmed: 0 });
+                eprintln!(
+                    "warning: couldn't delete {} keys from Azure Blob Storage: {e:#}",
+                    keys.len()
+                );
+                return Ok(DeleteOutcome {
+                    attempted: keys.len(),
+                    confirmed: 0,
+                });
             }
         };
         let confirmed = AtomicUsize::new(0);
@@ -173,16 +203,28 @@ impl Backend for AzureBackend {
                 }
             })
             .await;
-        Ok(DeleteOutcome { attempted: keys.len(), confirmed: confirmed.load(Ordering::Relaxed) })
+        Ok(DeleteOutcome {
+            attempted: keys.len(),
+            confirmed: confirmed.load(Ordering::Relaxed),
+        })
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let container = self.container().await?;
-        let options = BlobContainerClientListBlobsOptions { prefix: Some(prefix.to_string()), ..Default::default() };
+        let options = BlobContainerClientListBlobsOptions {
+            prefix: Some(prefix.to_string()),
+            ..Default::default()
+        };
         let mut pages = container.list_blobs(Some(options))?.into_pages();
         let mut out = Vec::new();
-        while let Some(page) = pages.try_next().await.with_context(|| format!("listing {prefix} in Azure Blob Storage"))? {
-            let page = page.into_model().with_context(|| format!("listing {prefix} in Azure Blob Storage"))?;
+        while let Some(page) = pages
+            .try_next()
+            .await
+            .with_context(|| format!("listing {prefix} in Azure Blob Storage"))?
+        {
+            let page = page
+                .into_model()
+                .with_context(|| format!("listing {prefix} in Azure Blob Storage"))?;
             for item in page.blob_items {
                 let Some(name) = item.name else { continue };
                 let content_length = item.properties.as_ref().and_then(|p| p.content_length).unwrap_or(0);
@@ -235,7 +277,11 @@ impl Backend for AzureBackend {
                 .with_context(|| format!("uploading block {idx} of {key} to Azure Blob Storage"))?;
             block_ids.push(block_id);
         }
-        let block_list = BlockLookupList { committed: None, latest: Some(block_ids), uncommitted: None };
+        let block_list = BlockLookupList {
+            committed: None,
+            latest: Some(block_ids),
+            uncommitted: None,
+        };
         block_blob
             .commit_block_list(block_list.try_into().context("encoding block list")?, None)
             .await
@@ -255,7 +301,11 @@ impl Backend for AzureBackend {
         // — checked against the declared length so a body that ends early
         // fails loud instead of silently writing a short file to `dest`.
         let expected_len = result.properties.content_length;
-        let bytes = result.body.collect().await.with_context(|| format!("reading body of {key}"))?;
+        let bytes = result
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading body of {key}"))?;
         if let Some(expected_len) = expected_len
             && bytes.len() as u64 != expected_len
         {
@@ -268,7 +318,9 @@ impl Backend for AzureBackend {
         let mut file = tokio::fs::File::create(dest)
             .await
             .with_context(|| format!("creating {}", dest.display()))?;
-        file.write_all(&bytes).await.with_context(|| format!("writing {}", dest.display()))?;
+        file.write_all(&bytes)
+            .await
+            .with_context(|| format!("writing {}", dest.display()))?;
         // See the S3 driver's matching `flush()`: `tokio::fs::File` spawns
         // the last write without awaiting it, so without this it can still
         // be in flight when this returns.

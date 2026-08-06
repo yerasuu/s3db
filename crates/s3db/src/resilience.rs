@@ -69,7 +69,11 @@ impl Default for ResilienceConfig {
 }
 
 /// Builds the fixed composition order this module's doc comment describes.
-pub fn build_resilient_backend(inner: Arc<dyn Backend>, config: ResilienceConfig, metrics: SharedMetrics) -> Arc<dyn Backend> {
+pub fn build_resilient_backend(
+    inner: Arc<dyn Backend>,
+    config: ResilienceConfig,
+    metrics: SharedMetrics,
+) -> Arc<dyn Backend> {
     let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(inner, config.cache));
     let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(cached, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
@@ -164,13 +168,20 @@ pub struct RetryBackend {
 
 impl std::fmt::Debug for RetryBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RetryBackend").field("inner", &self.inner).field("max_retries", &self.max_retries).finish()
+        f.debug_struct("RetryBackend")
+            .field("inner", &self.inner)
+            .field("max_retries", &self.max_retries)
+            .finish()
     }
 }
 
 impl RetryBackend {
     pub fn new(inner: Arc<dyn Backend>, max_retries: u32, base_backoff: Duration) -> Self {
-        RetryBackend { inner, max_retries, base_backoff }
+        RetryBackend {
+            inner,
+            max_retries,
+            base_backoff,
+        }
     }
 
     /// Full jitter: a random delay in `[0, base * 2^attempt]` -- spreads
@@ -252,7 +263,10 @@ pub struct CircuitBreakerConfig {
 
 impl Default for CircuitBreakerConfig {
     fn default() -> Self {
-        CircuitBreakerConfig { failure_threshold: 5, open_duration: Duration::from_secs(10) }
+        CircuitBreakerConfig {
+            failure_threshold: 5,
+            open_duration: Duration::from_secs(10),
+        }
     }
 }
 
@@ -273,7 +287,11 @@ struct CircuitBreaker {
 
 impl CircuitBreaker {
     fn new(config: CircuitBreakerConfig) -> Self {
-        CircuitBreaker { config, consecutive_failures: AtomicU32::new(0), state: Mutex::new((CircuitState::Closed, None)) }
+        CircuitBreaker {
+            config,
+            consecutive_failures: AtomicU32::new(0),
+            state: Mutex::new((CircuitState::Closed, None)),
+        }
     }
 
     /// `true` if a call should even be attempted right now.
@@ -360,7 +378,8 @@ impl Backend for ThrottledBackend {
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
-        self.guarded(&self.put_permits, self.inner.put_cas(key, body, expected_etag)).await
+        self.guarded(&self.put_permits, self.inner.put_cas(key, body, expected_etag))
+            .await
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
@@ -377,7 +396,8 @@ impl Backend for ThrottledBackend {
 
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
-        self.guarded(&self.put_permits, self.inner.put_stream(key, source)).await
+        self.guarded(&self.put_permits, self.inner.put_stream(key, source))
+            .await
     }
 
     #[cfg(feature = "streaming")]
@@ -395,7 +415,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn local(root: &std::path::Path) -> Arc<dyn Backend> {
-        Arc::new(LocalBackend::new(&LocalParams { bucket: root.to_string_lossy().to_string() }))
+        Arc::new(LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+        }))
     }
 
     #[derive(Debug)]
@@ -440,7 +462,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let inner = local(dir.path());
         inner.put_cas("k", b"v".to_vec(), None).await.unwrap();
-        let flaky: Arc<dyn Backend> = Arc::new(FlakyBackend { inner, fail_next: AtomicUsize::new(2) });
+        let flaky: Arc<dyn Backend> = Arc::new(FlakyBackend {
+            inner,
+            fail_next: AtomicUsize::new(2),
+        });
         let retry = RetryBackend::new(flaky, 3, Duration::from_millis(1));
 
         let (bytes, _) = retry.get("k").await.unwrap();
@@ -451,7 +476,10 @@ mod tests {
     async fn retry_backend_gives_up_after_max_retries() {
         let dir = tempfile::tempdir().unwrap();
         let inner = local(dir.path());
-        let flaky: Arc<dyn Backend> = Arc::new(FlakyBackend { inner, fail_next: AtomicUsize::new(10) });
+        let flaky: Arc<dyn Backend> = Arc::new(FlakyBackend {
+            inner,
+            fail_next: AtomicUsize::new(10),
+        });
         let retry = RetryBackend::new(flaky, 2, Duration::from_millis(1));
 
         assert!(retry.get("k").await.is_err());
@@ -461,7 +489,10 @@ mod tests {
     async fn throttled_backend_limits_concurrency() {
         let dir = tempfile::tempdir().unwrap();
         let inner = local(dir.path());
-        let config = ResilienceConfig { max_concurrent_get: 2, ..ResilienceConfig::default() };
+        let config = ResilienceConfig {
+            max_concurrent_get: 2,
+            ..ResilienceConfig::default()
+        };
         let throttled = ThrottledBackend::new(inner, &config);
         assert_eq!(throttled.get_permits.available_permits(), 2);
     }
@@ -470,9 +501,15 @@ mod tests {
     async fn circuit_breaker_opens_after_consecutive_failures_and_fails_fast() {
         let dir = tempfile::tempdir().unwrap();
         let inner = local(dir.path());
-        let always_fails: Arc<dyn Backend> = Arc::new(FlakyBackend { inner, fail_next: AtomicUsize::new(usize::MAX) });
+        let always_fails: Arc<dyn Backend> = Arc::new(FlakyBackend {
+            inner,
+            fail_next: AtomicUsize::new(usize::MAX),
+        });
         let config = ResilienceConfig {
-            circuit_breaker: CircuitBreakerConfig { failure_threshold: 2, open_duration: Duration::from_secs(60) },
+            circuit_breaker: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_duration: Duration::from_secs(60),
+            },
             ..ResilienceConfig::default()
         };
         let throttled = ThrottledBackend::new(always_fails, &config);
@@ -498,7 +535,13 @@ mod tests {
         metered.get("k").await.unwrap();
 
         let counters = metrics.counters.lock().unwrap();
-        assert_eq!(counters.iter().filter(|(name, _)| name == "s3db_backend_get_total").count(), 2);
+        assert_eq!(
+            counters
+                .iter()
+                .filter(|(name, _)| name == "s3db_backend_get_total")
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,9 @@ mod tests {
     #[test]
     fn spreads_across_multiple_shards() {
         let shards: std::collections::HashSet<u32> = (0..1000).map(|i| shard_of(&format!("user-{i}"), 4)).collect();
-        assert!(shards.len() > 1, "1000 distinct inputs should not all land on the same shard");
+        assert!(
+            shards.len() > 1,
+            "1000 distinct inputs should not all land on the same shard"
+        );
     }
 }
