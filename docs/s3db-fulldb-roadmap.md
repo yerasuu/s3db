@@ -11,6 +11,14 @@
 > S3-compatible como primitivo, sin daemon de coordinación, un binario**
 > (mismo principio que el resto de gitquarry). Nada acá agrega un proceso
 > nuevo, un puerto nuevo, ni un protocolo de consenso.
+>
+> **Alcance de este documento: `s3db` extraído a proyecto nuevo,
+> independiente de gitquarry.** La sección de cifrado más abajo (opcional,
+> algoritmo elegible/expansible) es política de ese proyecto nuevo, **no**
+> un cambio a la regla actual de gitquarry (`CLAUDE.md`: cifrado
+> obligatorio, sin opt-out, XChaCha20Poly1305 fijo). Mientras `s3db` siga
+> viviendo dentro de este repo, gitquarry sigue consumiéndolo con cifrado
+> obligatorio como hoy — este documento no toca eso.
 
 ## Diagnóstico raíz: por qué el diseño actual no llega a "full DB"
 
@@ -124,6 +132,57 @@ que responde "quién es dueño de qué" — routear ahí es routear en el
 mismo lugar donde ya vive la fuente de verdad, no una capa nueva
 paralela.
 
+## Cifrado: opcional (on por defecto), algoritmo elegible y expansible
+
+Hoy `s3db-crypto::Cipher` es un único algoritmo fijo — `struct
+Cipher(XChaCha20Poly1305)`, sin variantes, cifrado obligatorio sin
+opt-out (política de gitquarry, ver disclaimer arriba). Para el proyecto
+nuevo, dos cambios sobre esa base, reusando el mecanismo que el propio
+`Cipher::seal` ya tiene para esto exacto: el **header byte bound-into-AAD**
+que hoy solo describe compresión (`compression_header`) se generaliza a
+describir también el algoritmo:
+
+```rust
+pub enum CipherAlgorithm {
+    XChaCha20Poly1305, // = 0x00, default, comportamiento actual sin cambios
+    Aes256Gcm,          // = 0x01
+    // variantes nuevas se agregan al final, nunca se renumeran ni se borran
+}
+
+pub enum EncryptionMode {
+    Enabled { algorithm: CipherAlgorithm }, // default: XChaCha20Poly1305
+    Disabled,                                // opt-out explícito, no default
+}
+```
+
+`seal` escribe el byte de algoritmo (o un byte reservado "sin cifrar" si
+`Disabled`) junto al de compresión, ambos bound-into-AAD igual que hoy —
+mismo argumento que ya está escrito para compresión: "sin esto, un
+storage provider malicioso podría flipear el header sin que `open` lo
+note". `open` lee el byte y despacha al algoritmo correcto — un bucket
+puede tener objetos sellados con distintos algoritmos a la vez (mismo
+principio que `CompressionStrategy` ya permite hoy por objeto), lo que
+habilita **rotar el algoritmo default sin tener que re-sellar todo el
+bucket de una vez** — mismo patrón gradual que `KeyRotationWorker` ya
+usa para rotar passphrases.
+
+**Expansible de verdad**: agregar `CipherAlgorithm::Nuevo` es un campo de
+enum más + un brazo de `match` en `seal`/`open` — ningún objeto viejo se
+rompe (su byte de header sigue apuntando a su algoritmo original), y
+ningún caller que no pida el nuevo algoritmo lo ve nunca.
+
+**Opcional, on por defecto**: `EncryptionMode::Enabled` es el default de
+la config del proyecto nuevo — un caller tiene que pasar `Disabled`
+explícitamente (mismo espíritu que "config explícita, no inferencia" del
+resto del crate) para apagarlo. Con `Disabled`, `seal`/`open` se vuelven
+passthrough (header marca "sin cifrar" para que un lector no adivine),
+sin AEAD, sin Argon2id, sin passphrase requerida.
+
+**Qué NO cambia**: el bootstrap de encryption (`bootstrap.rs`, verificador
+temprano de passphrase) sigue igual cuando `Enabled` — nada de esto
+debilita el caso por-defecto, solo agrega la puerta de salida explícita
+que gitquarry mismo nunca quiso tener.
+
 ## Qué se mantiene fuera de alcance (declarado, no prometido de más)
 
 - **Sin transacciones multi-tabla ACID cross-manifest.** Cada manifest
@@ -160,10 +219,13 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 4 | Formato de bloque columnar tipado + schema declarado | — |
 | 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
-| 7 (opcional) | Query builder mínimo sobre 1-5 | — |
+| 7 | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
+| 8 (opcional) | Query builder mínimo sobre 1-5 | — |
 
 **Orden real:** 1 → 2 son bloque mínimo funcional (sin esto no hay motor).
 3 puede esperar (SSTables sin compactar funcionan, solo degradan lectura
 con el tiempo). 4 y 5 son el valor central del pedido original (tipo +
 rango) y dependen de 1-2. 6 es independiente, se puede hacer en paralelo
-a 3-5. 7 al final, condicionado a uso real.
+a 3-5. 7 es independiente de todo lo anterior (toca `s3db-crypto`, no el
+motor LSM) — se puede hacer en cualquier momento, incluso primero. 8 al
+final, condicionado a uso real.

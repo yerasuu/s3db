@@ -8,6 +8,13 @@
 > sin billing por request, sin latencia de red), las restricciones que
 > justifican el diseño LSM del otro documento simplemente no aplican.
 > Ver `git log` para confirmar si alguna fase ya aterrizó.
+>
+> **Alcance: `s3db` extraído a proyecto nuevo, independiente de
+> gitquarry.** La sección de cifrado más abajo es política de ese
+> proyecto nuevo, no un cambio a la regla actual de gitquarry
+> (`CLAUDE.md`: cifrado obligatorio, sin opt-out). Mientras `s3db` siga
+> viviendo en este repo, gitquarry lo sigue consumiendo con cifrado
+> obligatorio como hoy.
 
 ## Restricción que se mantiene: mismo API público en ambos modos
 
@@ -126,6 +133,17 @@ incompatible con un único `.redb` — no es cambio aditivo.
    redb. **Nunca migración silenciosa al arrancar** — mismo principio que
    "nunca borrar datos reales sin avisar", aplicado acá a un cambio de
    formato local en vez de a un borrado.
+
+## Cifrado: mismo diseño que el documento LSM, aplica igual acá
+
+`LocalBackend` sobre `redb` sigue sellando cada `body` con
+`s3db_crypto::Cipher` antes de escribirlo a la tabla — el motor de
+storage cambia, el punto donde se cifra no. La sección de cifrado de
+`docs/s3db-fulldb-roadmap.md` (`CipherAlgorithm`/`EncryptionMode`, header
+byte bound-into-AAD, opt-out explícito, default on con
+`XChaCha20Poly1305`) aplica sin cambios acá — no hay nada específico de
+`redb` que la generalidad de algoritmo necesite tocar dos veces, es el
+mismo `Cipher` compartido.
 
 ## Dependencia nueva
 
