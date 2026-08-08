@@ -1,0 +1,4 @@
+/target
+# Library-only workspace: consumers resolve against their own lockfile, so a
+# lockfile committed here would only ever go stale.
+/Cargo.lock

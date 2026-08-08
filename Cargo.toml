@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/s3db", "crates/s3db-crypto", "crates/s3db-macros"]
+resolver = "2"
