@@ -254,7 +254,7 @@ impl<T> TypedCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalParams;
+    use crate::config::{LocalEngine, LocalParams};
     use crate::local::LocalBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -295,6 +295,7 @@ mod tests {
     fn local(root: &std::path::Path) -> LocalBackend {
         LocalBackend::new(&LocalParams {
             bucket: root.to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         })
     }
 

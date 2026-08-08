@@ -53,6 +53,31 @@ pub struct LocalParams {
     /// target, so every config entry shares one shape regardless of driver,
     /// even though a directory isn't literally a "bucket".
     pub bucket: String,
+    /// Which on-disk representation this directory uses. Defaults to
+    /// [`LocalEngine::Files`] — the format every existing deployment already
+    /// has on disk — so upgrading this crate never silently reinterprets a
+    /// directory nobody asked to migrate. See [`crate::local`]'s module doc
+    /// for what `Redb` gives up the file format for.
+    #[serde(default)]
+    pub engine: LocalEngine,
+}
+
+/// [`LocalParams::engine`]'s two on-disk representations for the `local`
+/// driver. Not additive/mergeable: a directory is entirely one or the other,
+/// never a mix, so changing this on a directory that already has data needs
+/// an explicit migration (`s3db-local-migrate`), not just flipping the
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalEngine {
+    /// One real file per key plus its CAS sidecars (`<key>.s3dbrev`,
+    /// `<key>.s3dblock`) — see [`crate::local::files`]. The long-standing
+    /// default; every directory that predates this field is one of these.
+    #[default]
+    Files,
+    /// A single `redb` database file — see [`crate::local::redb_backend`].
+    /// Real ACID transactions, native range scans, no CAS emulation.
+    Redb,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

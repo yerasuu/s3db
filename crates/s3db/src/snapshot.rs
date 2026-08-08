@@ -175,12 +175,13 @@ pub async fn list_leases(backend: &dyn Backend, cipher: &Cipher) -> Result<Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalParams;
+    use crate::config::{LocalEngine, LocalParams};
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
         let backend = LocalBackend::new(&LocalParams {
             bucket: root.to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         });
         let cipher = Cipher::derive("test passphrase", &[19u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)

@@ -2,7 +2,7 @@
 //! `Collection`/`SecondaryIndex` behavior a hand-written entity implements
 //! by hand.
 
-use s3db::{Cipher, Entity, LocalBackend, LocalParams};
+use s3db::{Cipher, Entity, LocalBackend, LocalEngine, LocalParams};
 
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize, Entity)]
 #[entity(collection = ".conf/accounts")]
@@ -32,6 +32,7 @@ struct Widget {
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
     let backend = LocalBackend::new(&LocalParams {
         bucket: root.to_string_lossy().to_string(),
+        engine: LocalEngine::Files,
     });
     let cipher = Cipher::derive("test passphrase", &[3u8; s3db::cipher::SALT_LEN]).unwrap();
     (backend, cipher)

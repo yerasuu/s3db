@@ -65,7 +65,7 @@ impl HealthProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalParams;
+    use crate::config::{LocalEngine, LocalParams};
     use crate::local::LocalBackend;
 
     #[tokio::test]
@@ -73,6 +73,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
             bucket: dir.path().to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         }));
         let probe = HealthProbe::new(backend);
         assert!(probe.ready().await);
@@ -126,6 +127,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
             bucket: dir.path().to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         }));
         let probe = HealthProbe::new(backend);
         assert!(!probe.last_ready());

@@ -324,12 +324,13 @@ pub async fn forget_key(backend: &dyn Backend, key_id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalParams;
+    use crate::config::{LocalEngine, LocalParams};
     use crate::local::LocalBackend;
 
     fn backend(root: &std::path::Path) -> LocalBackend {
         LocalBackend::new(&LocalParams {
             bucket: root.to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         })
     }
 

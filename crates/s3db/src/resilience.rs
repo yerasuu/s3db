@@ -409,7 +409,7 @@ impl Backend for ThrottledBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LocalParams;
+    use crate::config::{LocalEngine, LocalParams};
     use crate::local::LocalBackend;
     use crate::metrics::test_support::RecordingMetrics;
     use std::sync::atomic::AtomicUsize;
@@ -417,6 +417,7 @@ mod tests {
     fn local(root: &std::path::Path) -> Arc<dyn Backend> {
         Arc::new(LocalBackend::new(&LocalParams {
             bucket: root.to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
         }))
     }
 

@@ -54,7 +54,7 @@ pub use cache::{CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
-pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};
+pub use config::{AzureParams, BackendConfig, GcsParams, LocalEngine, LocalParams, R2Params, S3Params};
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
 pub use index::{IndexKey, SecondaryIndex, Segment};

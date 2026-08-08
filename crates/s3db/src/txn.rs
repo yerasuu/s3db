@@ -309,6 +309,7 @@ mod tests {
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
         let backend = LocalBackend::new(&crate::config::LocalParams {
             bucket: root.to_string_lossy().to_string(),
+            engine: crate::config::LocalEngine::Files,
         });
         let cipher = Cipher::derive("test passphrase", &[11u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
