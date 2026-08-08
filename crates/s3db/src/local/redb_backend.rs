@@ -22,10 +22,16 @@
 //! only approximate over S3-like backends with a durable record and crash
 //! recovery. See that trait's module doc for why no other backend here
 //! implements it.
+//!
+//! And [`RangeBackend`]: `list_prefix` above is already a native scan for
+//! prefix matches, and `range` extends the same B-tree traversal to an
+//! arbitrary `[start, end)` bound — the primitive
+//! [`crate::index::SecondaryIndex::resolve_range`] uses.
 
 use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome};
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
+use crate::range::RangeBackend;
 use anyhow::{Context, Result, bail};
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 #[cfg(feature = "streaming")]
@@ -404,6 +410,37 @@ impl AtomicBackend for RedbBackend {
         })
         .await
         .context("redb batch task panicked")?
+    }
+}
+
+#[async_trait::async_trait]
+impl RangeBackend for RedbBackend {
+    /// `[start_key, end_key)` maps directly onto redb's own
+    /// `RangeBounds<&str>` — no big-endian/bias encoding tricks needed the
+    /// way an S3-backed range query would (see `docs/s3db-fulldb-roadmap.md`):
+    /// redb's B-tree already orders keys by their raw bytes, so a caller's
+    /// own sortable string (a zero-padded id, an ISO-8601 timestamp) just
+    /// works.
+    async fn range(&self, start_key: &str, end_key: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let db = self.database().await?.clone();
+        let (start, end) = (start_key.to_string(), end_key.to_string());
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().context("beginning redb read transaction")?;
+            let table = match read_txn.open_table(TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(e).context("opening redb table"),
+            };
+            let mut out = Vec::new();
+            for entry in table.range(start.as_str()..end.as_str()).context("scanning redb")? {
+                let (key, value) = entry.context("reading redb range entry")?;
+                let (_, body) = value.value();
+                out.push((key.value().to_string(), body.to_vec()));
+            }
+            Ok(out)
+        })
+        .await
+        .context("redb range task panicked")?
     }
 }
 

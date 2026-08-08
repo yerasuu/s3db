@@ -35,6 +35,7 @@ pub mod key_rotation;
 pub mod maintenance;
 pub mod metrics;
 pub mod payload;
+pub mod range;
 pub mod request_cache;
 pub mod resilience;
 mod shard;
@@ -64,6 +65,7 @@ pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
 pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_json};
+pub use range::RangeBackend;
 pub use request_cache::RequestCache;
 pub use resilience::{
     CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend,

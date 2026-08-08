@@ -3,11 +3,18 @@
 //! reverse-uid, repo-name, ...) used to hand-roll separately: its own key
 //! builder, its own segment-encoding choice, and its own claim/conflict
 //! strategy.
+//!
+//! [`SecondaryIndex::resolve_range`] is the one method here that isn't
+//! backend-agnostic: it needs a real ordered range scan
+//! ([`crate::range::RangeBackend`]) underneath, which today only
+//! [`crate::local::RedbBackend`] gives.
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
+use crate::local::LocalBackend;
 use crate::payload::{delete_object, get_json, put_json};
-use anyhow::{Context, Result};
+use crate::range::RangeBackend;
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::borrow::Cow;
@@ -112,6 +119,36 @@ impl SecondaryIndex {
 
     pub fn key(&self, raw: &str) -> String {
         format!("{}/{}/{}.json", self.root, self.kind, self.segment.encode(raw))
+    }
+
+    /// Same prefix as [`Self::key`], deliberately *without* the `.json`
+    /// suffix — used only as a range bound (see [`Self::resolve_range`]),
+    /// never as an object key on its own.
+    ///
+    /// The suffix has to be left off here specifically because appending it
+    /// to `raw` first would corrupt the bound in exactly the case a range
+    /// query most needs to get right: one `raw` value that's a proper
+    /// prefix of another (`"ab"` vs. `"ab1"`). `"ab.json"` sorts *after*
+    /// `"ab1"` (`.` is `0x2e`, `1` is `0x31`), which would silently exclude
+    /// `"ab1"` from an upper bound of `"ab"`, or include `"ab"` past an
+    /// upper bound that should have excluded it right at `"ab"` itself.
+    /// Comparing the bound against `raw` directly, with no suffix on either
+    /// side, has no such edge case: extending a string (with `.json` or
+    /// anything else) can never make it sort before the string it extends.
+    fn segment_prefix(&self, raw: &str) -> String {
+        format!("{}/{}/{}", self.root, self.kind, self.segment.encode(raw))
+    }
+
+    /// The `raw` segment [`Self::segment_prefix`] came from, reversing
+    /// [`Self::key`]'s `.json` suffix and `{root}/{kind}/` prefix so
+    /// [`Self::resolve_range`] can hand a caller back the same `raw` value
+    /// [`Self::key`] would have taken, not a raw storage key.
+    fn raw_from_key(&self, key: &str) -> Result<String> {
+        let encoded = key
+            .strip_prefix(&format!("{}/{}/", self.root, self.kind))
+            .and_then(|s| s.strip_suffix(".json"))
+            .with_context(|| format!("{key}: not a valid key for this index"))?;
+        self.segment.decode(encoded)
     }
 
     /// Raw CAS write against an arbitrary `expected_etag` — the primitive
@@ -280,6 +317,53 @@ impl SecondaryIndex {
         let (entry, etag) = get_json::<(P, V)>(backend, &self.key(raw), cipher).await?;
         Ok(etag.map(|_| entry.1))
     }
+
+    /// Every pointer entry with `start_raw <= raw < end_raw`, ascending, in
+    /// one native range scan — see [`crate::range::RangeBackend`]'s module
+    /// doc for exactly which backend can honestly give this
+    /// (`docs/s3db-local-mode.md`'s whole point) and which can't. Requires
+    /// [`Segment::Raw`]: [`Segment::Base64`] doesn't preserve `raw`'s own
+    /// ordering, so a range bound over the encoded segment wouldn't mean
+    /// what a caller thinks it means.
+    ///
+    /// Callers own picking a `raw` representation that actually sorts the
+    /// way they want (zero-padded decimal, ISO-8601 timestamp, ...) — this
+    /// index has no notion of "this field is really a number," it only ever
+    /// compares the bytes it's given, same as [`Self::key`] always has.
+    pub async fn resolve_range<T: DeserializeOwned>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        start_raw: &str,
+        end_raw: &str,
+    ) -> Result<Vec<(String, T)>> {
+        if !matches!(self.segment, Segment::Raw) {
+            bail!("resolve_range needs Segment::Raw -- Segment::Base64 doesn't preserve the raw value's ordering");
+        }
+        let range =
+            as_range(backend).context("this backend has no native range capability (see docs/s3db-local-mode.md)")?;
+        let entries = range
+            .range(&self.segment_prefix(start_raw), &self.segment_prefix(end_raw))
+            .await?;
+        let mut out = Vec::with_capacity(entries.len());
+        for (key, sealed) in entries {
+            let plain = cipher.open(&key, &sealed)?;
+            let value: T = rmp_serde::from_slice(&plain).with_context(|| format!("{key} is invalid"))?;
+            out.push((self.raw_from_key(&key)?, value));
+        }
+        Ok(out)
+    }
+}
+
+/// Downcasts `backend` to a concrete type known to implement
+/// [`RangeBackend`] — same idiom, and the same single-implementor
+/// limitation, as [`crate::txn::run`]'s own capability detection (see that
+/// function's doc for the reasoning, which applies here unchanged).
+fn as_range(backend: &dyn Backend) -> Option<&dyn RangeBackend> {
+    match backend.as_any().downcast_ref::<LocalBackend>()? {
+        LocalBackend::Redb(inner) => Some(inner),
+        LocalBackend::Files(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -288,9 +372,16 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
+        test_backend_and_cipher_with(root, crate::config::LocalEngine::Files)
+    }
+
+    fn test_backend_and_cipher_with(
+        root: &std::path::Path,
+        engine: crate::config::LocalEngine,
+    ) -> (LocalBackend, Cipher) {
         let backend = LocalBackend::new(&crate::config::LocalParams {
             bucket: root.to_string_lossy().to_string(),
-            engine: crate::config::LocalEngine::Files,
+            engine,
         });
         let cipher = Cipher::derive("test passphrase", &[8u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
@@ -534,5 +625,112 @@ mod tests {
         idx.release(&backend, "alice").await;
         let (resolved, _etag) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
         assert_eq!(resolved, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_range_on_files_reports_no_native_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher(dir.path());
+        let idx = SecondaryIndex::new(".conf/index", "score", Segment::Raw);
+        idx.claim_once(&backend, &cipher, "05", &Pointer { owner: "a".into() })
+            .await
+            .unwrap();
+        let err = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "00", "10")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("native range capability"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_range_on_redb_returns_the_bounded_slice_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let idx = SecondaryIndex::new(".conf/index", "score", Segment::Raw);
+        // Zero-padded so lexicographic order matches numeric order -- the
+        // caller's job, not this index's (see the method's own doc).
+        for (raw, owner) in [("01", "a"), ("03", "b"), ("05", "c"), ("07", "d"), ("09", "e")] {
+            idx.claim_once(&backend, &cipher, raw, &Pointer { owner: owner.into() })
+                .await
+                .unwrap();
+        }
+
+        let found = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "03", "07")
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                ("03".to_string(), Pointer { owner: "b".into() }),
+                ("05".to_string(), Pointer { owner: "c".into() }),
+            ],
+            "upper bound must be exclusive, lower bound inclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_range_on_redb_is_empty_for_a_bound_with_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let idx = SecondaryIndex::new(".conf/index", "score", Segment::Raw);
+        idx.claim_once(&backend, &cipher, "01", &Pointer { owner: "a".into() })
+            .await
+            .unwrap();
+        let found = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "50", "99")
+            .await
+            .unwrap();
+        assert!(found.is_empty());
+    }
+
+    /// The exact edge case `segment_prefix`'s own doc comment reasons
+    /// through: one `raw` value that's a proper prefix of another. A naive
+    /// bound built from `key()` (which appends `.json` before comparing)
+    /// would get this wrong; `segment_prefix` must not.
+    #[tokio::test]
+    async fn resolve_range_handles_a_raw_value_that_prefixes_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let idx = SecondaryIndex::new(".conf/index", "namespace", Segment::Raw);
+        for raw in ["ab", "ab1", "ac"] {
+            idx.claim_once(&backend, &cipher, raw, &Pointer { owner: raw.into() })
+                .await
+                .unwrap();
+        }
+
+        // Upper bound "ab1" (exclusive) must include "ab" but not "ab1" itself.
+        let found = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "aa", "ab1")
+            .await
+            .unwrap();
+        assert_eq!(found, vec![("ab".to_string(), Pointer { owner: "ab".into() })]);
+
+        // Lower bound "ab1" (inclusive) must include "ab1" but not "ab".
+        let found = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "ab1", "ad")
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![
+                ("ab1".to_string(), Pointer { owner: "ab1".into() }),
+                ("ac".to_string(), Pointer { owner: "ac".into() }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_range_refuses_a_base64_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let idx = SecondaryIndex::new(".conf/index", "pubkey", Segment::Base64);
+        let err = idx
+            .resolve_range::<Pointer>(&backend, &cipher, "a", "z")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Segment::Raw"), "got: {err}");
     }
 }
