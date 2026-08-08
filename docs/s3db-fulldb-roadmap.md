@@ -220,7 +220,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 
 | Fase | Qué construye | Reemplaza |
 |---|---|---|
-| 1 | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
+| 1 ✅ | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
 | 2 | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
 | 3 | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
 | 4 | Formato de bloque columnar tipado + schema declarado | — |
@@ -228,6 +228,16 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
 | 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
 | 8 (opcional) | Query builder mínimo sobre 1-5 | — |
+
+**Fase 1 implementada** en `crates/s3db/src/lsm/` (`Wal`, `Memtable`,
+`sstable::build`, `Table::{open,put,delete,flush}`). Solo escritura, como
+dice la tabla — `Table` no tiene todavía forma de leer una fila ya
+flusheada (`get_unflushed` deliberadamente no se llama `get`: solo ve lo
+que sigue en memtable). El formato de objeto SSTable (bloques +
+block_index + bloom + footer) ya quedó completo desde esta fase porque
+separarlo de fase 2 hubiera significado rehacerlo; lo que fase 2 agrega es
+`Backend::get_range` en los 5 drivers, el manifest, y el camino de lectura
+que usa bloom+block_index para no traer el objeto entero.
 
 **Orden real:** 1 → 2 son bloque mínimo funcional (sin esto no hay motor).
 3 puede esperar (SSTables sin compactar funcionan, solo degradan lectura
