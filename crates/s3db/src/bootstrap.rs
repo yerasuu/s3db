@@ -11,7 +11,7 @@
 //! failures scattered throughout the code mid-operation.
 
 use crate::backend::{Backend, Cas};
-use crate::cipher::{Cipher, CompressionStrategy, SALT_LEN};
+use crate::cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode, SALT_LEN};
 use crate::payload::{get_json_plain, put_json_plain};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -36,15 +36,45 @@ struct EncryptionMeta {
     verifier: String,
 }
 
-/// Derives (or creates, if the bucket is new) this bucket's cipher.
+/// Derives (or creates, if the bucket is new) this bucket's cipher, with
+/// encryption on and the default algorithm — see [`get_or_create_cipher_for`]
+/// for the mode-aware form.
 pub async fn get_or_create_cipher(backend: &dyn Backend, passphrase: &str) -> Result<Cipher> {
+    get_or_create_cipher_for(backend, EncryptionMode::default(), passphrase).await
+}
+
+/// [`get_or_create_cipher`] for a caller that reads its
+/// [`EncryptionMode`] from config.
+///
+/// Under [`EncryptionMode::Disabled`] nothing is derived and nothing is
+/// written to the bucket — but a bucket that *was* bootstrapped encrypted is
+/// a hard error rather than a silent switch to plaintext writes. Turning
+/// encryption off for a bucket that already holds sealed objects is a
+/// migration, not a config flip, and this is the one place that can say so
+/// before any data moves.
+pub async fn get_or_create_cipher_for(backend: &dyn Backend, mode: EncryptionMode, passphrase: &str) -> Result<Cipher> {
+    let algorithm = match mode {
+        EncryptionMode::Enabled { algorithm } => algorithm,
+        EncryptionMode::Disabled => {
+            let (_, etag) = get_json_plain::<EncryptionMeta>(backend, ENCRYPTION_META_KEY).await?;
+            if etag.is_some() {
+                bail!(
+                    "this bucket was initialized with encryption enabled ({ENCRYPTION_META_KEY} exists), \
+                     but the configured encryption mode is disabled — nothing already sealed could be \
+                     read back, so this is refused instead of writing plaintext alongside it"
+                );
+            }
+            return Ok(Cipher::disabled());
+        }
+    };
+
     for _ in 0..MAX_BOOTSTRAP_RETRIES {
         let (meta, etag) = get_json_plain::<EncryptionMeta>(backend, ENCRYPTION_META_KEY).await?;
 
         if etag.is_none() {
             // New bucket (or nothing encrypted yet): we generate the salt.
             let salt = random_salt()?;
-            let cipher = Cipher::derive(passphrase, &salt)?;
+            let cipher = Cipher::derive_with(passphrase, &salt, algorithm)?;
             let meta = EncryptionMeta {
                 salt: BASE64.encode(salt),
                 verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
@@ -57,12 +87,16 @@ pub async fn get_or_create_cipher(backend: &dyn Backend, passphrase: &str) -> Re
             }
         }
 
-        return derive_and_verify(passphrase, &meta);
+        return derive_and_verify(passphrase, algorithm, &meta);
     }
     bail!("couldn't initialize bucket encryption after several attempts (high contention)")
 }
 
-fn derive_and_verify(passphrase: &str, meta: &EncryptionMeta) -> Result<Cipher> {
+/// The verifier is opened, never re-sealed, so `algorithm` only decides what
+/// this instance will *write* from here on — a bucket whose verifier was
+/// sealed by a different algorithm still validates, which is what makes
+/// changing the algorithm a config change rather than a re-encryption.
+fn derive_and_verify(passphrase: &str, algorithm: CipherAlgorithm, meta: &EncryptionMeta) -> Result<Cipher> {
     let salt_bytes = BASE64
         .decode(&meta.salt)
         .context(".conf/encryption.json: invalid salt (not base64)")?;
@@ -72,7 +106,7 @@ fn derive_and_verify(passphrase: &str, meta: &EncryptionMeta) -> Result<Cipher> 
             bytes.len()
         )
     })?;
-    let cipher = Cipher::derive(passphrase, &salt)?;
+    let cipher = Cipher::derive_with(passphrase, &salt, algorithm)?;
 
     let verifier = BASE64
         .decode(&meta.verifier)
@@ -91,27 +125,4 @@ fn random_salt() -> Result<[u8; SALT_LEN]> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrong_passphrase_fails_verification_clearly() {
-        let cipher = Cipher::derive("correct", &[3u8; SALT_LEN]).unwrap();
-        let meta = EncryptionMeta {
-            salt: BASE64.encode([3u8; SALT_LEN]),
-            verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
-        };
-        assert!(derive_and_verify("correct", &meta).is_ok());
-        let err = derive_and_verify("incorrect", &meta).unwrap_err();
-        assert!(format!("{err:#}").contains("doesn't match"));
-    }
-
-    #[test]
-    fn rejects_malformed_salt() {
-        let meta = EncryptionMeta {
-            salt: "not-base64!!".to_string(),
-            verifier: String::new(),
-        };
-        assert!(derive_and_verify("x", &meta).is_err());
-    }
-}
+mod tests;
