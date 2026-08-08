@@ -23,9 +23,11 @@
 //! can use to skip whole blocks), [`Table::scan`] (a range over the primary
 //! key, merging the memtable with every overlapping SSTable, skipping
 //! non-overlapping SSTables and blocks via the same manifest/block-index
-//! metadata [`Table::get`] already uses), and [`SecondaryLsmIndex`] (a
+//! metadata [`Table::get`] already uses), [`SecondaryLsmIndex`] (a
 //! second ordered [`Table`] for finding rows by a non-primary field —
-//! phase 5's other half).
+//! phase 5's other half), and [`location`] ([`TableLocation`]/[`BackendRegistry`],
+//! phase 6's multi-backend routing at the same manifest level every table
+//! already had).
 //!
 //! A row is opaque bytes in, opaque bytes out ([`Table::put`]/[`Table::get`])
 //! *unless* a table declares a [`value::Schema`] ([`TableConfig::schema`]),
@@ -35,6 +37,7 @@
 
 mod bloom;
 pub mod compactor;
+mod location;
 pub mod manifest;
 mod memtable;
 mod secondary_index;
@@ -45,6 +48,7 @@ pub mod value;
 mod wal;
 
 pub use compactor::{CompactionReport, compact, should_compact};
+pub use location::{BackendRegistry, DEFAULT_BACKEND_ID, TableLocation};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
 pub use secondary_index::SecondaryLsmIndex;

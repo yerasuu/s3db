@@ -157,8 +157,10 @@ Min/max por bloque (`BlockIndexEntry::column_stats`, uno por columna,
 `None` para tipos no ordenables o un bloque enteramente tombstoned)
 habilita poda real de I/O: `WHERE age > 30` podría saltar bloques
 enteros sin leerlos, no solo evitar deserializar filas que no matchean
-— el cálculo de stats ya existe, el scan que las consuma para podar es
-trabajo de las fases 5/8.
+— el cálculo de stats ya existe, pero el `Table::scan` de fase 5 poda por
+`min_key`/`max_key` de key primaria, no por predicado de columna; consumir
+`column_stats` para podar por `WHERE columna > X` queda como trabajo de
+fase 8.
 
 ## Multi-sitio — routing a nivel de manifest, no de objeto individual
 
@@ -176,6 +178,19 @@ Más natural que en el diseño anterior porque el manifest ya es la unidad
 que responde "quién es dueño de qué" — routear ahí es routear en el
 mismo lugar donde ya vive la fuente de verdad, no una capa nueva
 paralela.
+
+> **Implementado** (fase 6) en `crates/s3db/src/lsm/location.rs`.
+> `BackendRegistry` es un `HashMap<&'static str, Arc<dyn Backend>>`
+> construido una vez al levantar el proceso; `resolve`/`table_config`
+> traducen un `TableLocation` al `Arc<dyn Backend>` real y al
+> `TableConfig` que `Table::open`/`SecondaryLsmIndex::open` ya esperaban,
+> sin que ningún caller tenga que conocer el resto de los campos de
+> `TableConfig` solo para rutear una tabla. `TableLocation::new` asume
+> `DEFAULT_BACKEND_ID = "primary"` — el deployment de un solo backend
+> (el caso común) nunca tiene que pensar en esto. Dos `TableLocation`
+> con el mismo `root` pero distinto `backend_id` no colisionan: son
+> backends `Arc<dyn Backend>` genuinamente distintos, no un prefijo
+> compartido dentro de uno solo.
 
 ## Cifrado: opcional (on por defecto), algoritmo elegible y expansible
 
@@ -273,7 +288,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 3 ✅ | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
 | 4 ✅ | Formato de bloque columnar tipado + schema declarado | — |
 | 5 ✅ | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
-| 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
+| 6 ✅ | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
 | 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
 | 8 (opcional) | Query builder mínimo sobre 1-5 | — |
 
