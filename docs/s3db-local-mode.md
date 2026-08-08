@@ -158,7 +158,15 @@ rolled), sin este ni ningún otro dependency nuevo.
 | 2 ✅ | `s3db-local-migrate` (files → redb) | 1 |
 | 3 ✅ | `AtomicBackend` + `txn::run` lo detecta y usa cuando está presente (updates reales) | 1 |
 | 4 ✅ | `SecondaryIndex::resolve_range` sobre Local vía rango nativo redb | 1 |
-| 5 | Fila + índice en la misma transacción atómica | 3, 4 |
+| 5 ✅ | Fila + índice en la misma transacción atómica | 3, 4 |
 
 **Orden real:** 1 primero (nada más aplica sin esto). 2 y 3 en paralelo
 una vez 1 esté. 4 depende solo de 1. 5 depende de 3 y 4 juntos.
+
+**Todo el modo local, implementado.** `atomic::put_with_index` (fase 5) es
+la pieza final: una `Collection` y un `SecondaryIndex` escriben su fila y su
+puntero dentro del mismo `AtomicBackend::commit_batch`, así que un lector
+nunca ve uno sin el otro. Sobre S3/R2/Azure/GCS sigue sin existir un
+equivalente — no hay transacción nativa que darle, y esa es exactamente la
+brecha que el documento LSM (`docs/s3db-fulldb-roadmap.md`) ataca desde otro
+ángulo.

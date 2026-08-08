@@ -10,10 +10,10 @@
 //! sorted SSTable blocks), a different mechanism for a different substrate.
 //!
 //! Detected the same way as [`crate::atomic::AtomicBackend`]: downcasting
-//! `&dyn Backend` (see [`crate::index::SecondaryIndex::resolve_range`]'s
-//! detection helper), not by widening [`Backend`] itself.
+//! `&dyn Backend` (see [`as_range`]), not by widening [`Backend`] itself.
 
 use crate::backend::Backend;
+use crate::local::LocalBackend;
 use anyhow::Result;
 
 /// See the module doc for which backends can honestly implement this.
@@ -25,4 +25,15 @@ pub trait RangeBackend: Backend {
     /// know about [`crate::cipher::Cipher`] any more than [`Backend`] itself
     /// does.
     async fn range(&self, start_key: &str, end_key: &str) -> Result<Vec<(String, Vec<u8>)>>;
+}
+
+/// Downcasts `backend` to a concrete type known to implement
+/// [`RangeBackend`] — same idiom, and the same single-implementor
+/// limitation, as [`crate::atomic::as_atomic`] (see that function's doc for
+/// the reasoning, which applies here unchanged).
+pub(crate) fn as_range(backend: &dyn Backend) -> Option<&dyn RangeBackend> {
+    match backend.as_any().downcast_ref::<LocalBackend>()? {
+        LocalBackend::Redb(inner) => Some(inner),
+        LocalBackend::Files(_) => None,
+    }
 }

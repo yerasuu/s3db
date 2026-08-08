@@ -7,13 +7,18 @@
 //! (`TxnRecord` + crash recovery), which is the only way to approximate
 //! atomicity without a native transaction to lean on.
 //!
-//! Detected by downcasting `&dyn Backend` (see [`crate::txn::run`]'s own
-//! detection helper), not by widening [`Backend`] itself — every backend
-//! keeps implementing the same small required surface either way; this is
-//! strictly additive for the one backend that can actually back it up.
+//! Detected by downcasting `&dyn Backend` (see [`as_atomic`]), not by
+//! widening [`Backend`] itself — every backend keeps implementing the same
+//! small required surface either way; this is strictly additive for the one
+//! backend that can actually back it up.
 
 use crate::backend::Backend;
+use crate::cipher::{Cipher, CompressionStrategy};
+use crate::collection::Collection;
+use crate::index::SecondaryIndex;
+use crate::local::LocalBackend;
 use anyhow::Result;
+use serde::Serialize;
 
 /// One op inside a [`AtomicBackend::commit_batch`] call.
 #[derive(Debug, Clone)]
@@ -57,3 +62,88 @@ pub enum BatchOutcome {
 pub trait AtomicBackend: Backend {
     async fn commit_batch(&self, ops: Vec<BatchOp>) -> Result<BatchOutcome>;
 }
+
+/// Downcasts `backend` to a concrete type known to implement
+/// [`AtomicBackend`] — currently only [`LocalBackend::Redb`]. A `dyn
+/// Backend` can't be downcast straight to a trait object of a *different*
+/// trait, so this has to name every concrete type that might implement
+/// [`AtomicBackend`] explicitly; today there's exactly one. Shared by
+/// [`crate::txn::run`] and [`put_with_index`] so the detection logic (and
+/// its one limitation) lives in exactly one place.
+///
+/// Detection is on the concrete type at the top of the `Arc<dyn Backend>`,
+/// not on what it might wrap — a `RedbBackend` behind
+/// [`crate::cache::CachedBackend`] or another decorator won't be found here,
+/// since the decorator itself is what `as_any` returns. That's an accepted
+/// limitation, not a bug.
+pub(crate) fn as_atomic(backend: &dyn Backend) -> Option<&dyn AtomicBackend> {
+    match backend.as_any().downcast_ref::<LocalBackend>()? {
+        LocalBackend::Redb(inner) => Some(inner),
+        LocalBackend::Files(_) => None,
+    }
+}
+
+/// Writes one [`Collection`] entry and claims one [`SecondaryIndex`]
+/// pointer for it inside a single [`AtomicBackend::commit_batch`] call —
+/// `docs/s3db-local-mode.md` phase 5: "row and index entry in the same
+/// atomic transaction." Without this, a row write and its index write are
+/// two separate [`Backend::put_cas`] calls with an unavoidable window
+/// between them where the index points at nothing yet (if the row hasn't
+/// landed) or the row exists with no index entry pointing at it yet (if the
+/// order is reversed) — a reader can observe either half-applied state. One
+/// transaction closes that window entirely: a reader either sees both writes
+/// or neither, never one without the other.
+///
+/// `expected_etag`/`index_expected_etag` follow the same convention as
+/// [`Backend::put_cas`] (`None` = "must not exist yet") — this covers both
+/// a fresh create and an update of an existing row+pointer pair, unlike
+/// [`crate::txn::TxnOp`]'s create-only protocol.
+///
+/// Returns an error if `backend` doesn't implement [`AtomicBackend`] — there
+/// is no meaningful two-step fallback that would still give the atomicity
+/// this function exists for; a caller on a backend without this capability
+/// has to decide for itself whether a non-atomic two-write fallback is
+/// acceptable for its own use case, this function won't silently offer one.
+#[allow(clippy::too_many_arguments)]
+pub async fn put_with_index<T: Serialize, P: Serialize>(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    collection: &Collection,
+    name: &str,
+    value: &T,
+    expected_etag: Option<&str>,
+    index: &SecondaryIndex,
+    index_raw: &str,
+    pointer: &P,
+    index_expected_etag: Option<&str>,
+) -> Result<BatchOutcome> {
+    let atomic = as_atomic(backend).ok_or_else(|| {
+        anyhow::anyhow!("this backend has no native transaction capability (see docs/s3db-local-mode.md)")
+    })?;
+
+    let row_key = collection.key(name);
+    let row_plain = rmp_serde::to_vec_named(value)?;
+    let row_sealed = cipher.seal(&row_key, &row_plain, CompressionStrategy::None);
+
+    let index_key = index.key(index_raw);
+    let index_plain = rmp_serde::to_vec_named(pointer)?;
+    let index_sealed = cipher.seal(&index_key, &index_plain, CompressionStrategy::None);
+
+    atomic
+        .commit_batch(vec![
+            BatchOp::Put {
+                key: row_key,
+                body: row_sealed,
+                expected_etag: expected_etag.map(str::to_string),
+            },
+            BatchOp::Put {
+                key: index_key,
+                body: index_sealed,
+                expected_etag: index_expected_etag.map(str::to_string),
+            },
+        ])
+        .await
+}
+
+#[cfg(test)]
+mod tests;

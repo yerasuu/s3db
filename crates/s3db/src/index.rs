@@ -11,9 +11,8 @@
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
-use crate::local::LocalBackend;
 use crate::payload::{delete_object, get_json, put_json};
-use crate::range::RangeBackend;
+use crate::range::as_range;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -352,17 +351,6 @@ impl SecondaryIndex {
             out.push((self.raw_from_key(&key)?, value));
         }
         Ok(out)
-    }
-}
-
-/// Downcasts `backend` to a concrete type known to implement
-/// [`RangeBackend`] — same idiom, and the same single-implementor
-/// limitation, as [`crate::txn::run`]'s own capability detection (see that
-/// function's doc for the reasoning, which applies here unchanged).
-fn as_range(backend: &dyn Backend) -> Option<&dyn RangeBackend> {
-    match backend.as_any().downcast_ref::<LocalBackend>()? {
-        LocalBackend::Redb(inner) => Some(inner),
-        LocalBackend::Files(_) => None,
     }
 }
 

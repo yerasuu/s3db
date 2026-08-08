@@ -22,10 +22,9 @@
 //! either way — a caller that specifically wants an atomic *update* batch
 //! calls [`crate::atomic::AtomicBackend::commit_batch`] directly.
 
-use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome};
+use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome, as_atomic};
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
-use crate::local::LocalBackend;
 use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -137,25 +136,6 @@ fn random_txn_id() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating transaction id: {e}"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Downcasts `backend` to a concrete type known to implement
-/// [`AtomicBackend`] — currently only [`LocalBackend::Redb`]. A `dyn
-/// Backend` can't be downcast straight to a trait object of a *different*
-/// trait, so this has to name every concrete type that might implement
-/// [`AtomicBackend`] explicitly; today there's exactly one.
-///
-/// Detection is on the concrete type at the top of the `Arc<dyn Backend>`,
-/// not on what it might wrap — a `RedbBackend` behind
-/// [`crate::cache::CachedBackend`] or another decorator won't be found here,
-/// since the decorator itself is what `as_any` returns. That's an accepted
-/// limitation, not a bug: nothing in this crate currently wraps `Local` in a
-/// decorator before handing it to [`run`].
-fn as_atomic(backend: &dyn Backend) -> Option<&dyn AtomicBackend> {
-    match backend.as_any().downcast_ref::<LocalBackend>()? {
-        LocalBackend::Redb(inner) => Some(inner),
-        LocalBackend::Files(_) => None,
-    }
 }
 
 /// The [`AtomicBackend`] fast path for [`run_with_publisher`] — one real

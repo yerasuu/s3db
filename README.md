@@ -18,7 +18,7 @@ Start with [`crates/s3db/README.md`](crates/s3db/README.md) for the API, or [`do
 
 - [`docs/s3db.md`](docs/s3db.md) — architecture as it stands today.
 - [`docs/s3db-fulldb-roadmap.md`](docs/s3db-fulldb-roadmap.md) — planned LSM engine over object storage: WAL, memtable, SSTable flush, CAS-controlled manifest, compaction. Not implemented, except its encryption phase (`CipherAlgorithm`/`EncryptionMode`), which is.
-- [`docs/s3db-local-mode.md`](docs/s3db-local-mode.md) — planned `redb`-backed local mode with real ACID transactions. Not implemented.
+- [`docs/s3db-local-mode.md`](docs/s3db-local-mode.md) — `redb`-backed local mode with real ACID transactions. Implemented: `engine = "redb"`, `s3db-local-migrate`, `AtomicBackend`, `RangeBackend`, `atomic::put_with_index`.
 
 ## Status
 
