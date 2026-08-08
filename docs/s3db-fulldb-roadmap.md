@@ -83,10 +83,15 @@ Fuente única de verdad de qué existe; se actualiza con `put_cas` igual
 que hoy — single-writer por manifest, mismo principio ya aceptado (sin
 consenso multi-writer, ver sección final).
 
-**5. Compactor en background** — merge estándar LSM (leveled o tiered)
-de SSTables viejos en uno nuevo, purga tombstones expirados. Reemplaza
-`gc.rs`/`maintenance.rs` con una sola responsabilidad clara: mantener el
-número de SSTables acotado y la amplificación de lectura baja.
+**5. Compactor — implementado, tiered completo, no leveled.** Cada
+llamada mergea *todas* las SSTables de la tabla en una sola (o en cero, si
+todo terminó tombstoned), nunca un subconjunto — eso es lo que permite
+purgar tombstones sin ventana de retención: si el merge cubre todo el
+manifest no queda nada más viejo sin mergear que un tombstone todavía
+necesite tapar. Reemplaza `gc.rs`/`maintenance.rs` para tablas LSM.
+`should_compact`/`compact` en `crates/s3db/src/lsm/compactor.rs`, invocado
+explícitamente por quien llame (mismo patrón que `MaintenanceScanner`), no
+un task en background dentro del crate.
 
 **6. Lectura.**
 - *Point lookup*: bloom filter por SSTable descarta las que no contienen
@@ -232,7 +237,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 |---|---|---|
 | 1 ✅ | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
 | 2 ✅ | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
-| 3 | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
+| 3 ✅ | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
 | 4 | Formato de bloque columnar tipado + schema declarado | — |
 | 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |

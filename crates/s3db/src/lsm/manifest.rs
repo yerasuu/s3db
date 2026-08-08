@@ -22,8 +22,9 @@ const MAX_APPEND_ATTEMPTS: u32 = 10;
 /// [`super::sstable::open_footer_bytes`]/[`super::sstable::decode_block`]
 /// need to fetch and open it without a preliminary round trip just to learn
 /// sizes. `level` is recorded from phase 1 on (the roadmap's own manifest
-/// shape includes it) even though nothing reads it until phase 3's
-/// compactor exists to assign anything other than `0`.
+/// shape includes it), but every SSTable this crate produces is `0`:
+/// [`super::compactor`] does full, tiered merges (see its module doc for
+/// why), never leveled ones, so there's only ever one tier to be in.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub key: String,
@@ -69,6 +70,26 @@ pub(crate) async fn append(backend: &dyn Backend, cipher: &Cipher, root: &str, e
         }
     }
     bail!("couldn't update the manifest at {root} after {MAX_APPEND_ATTEMPTS} attempts (high contention)")
+}
+
+/// Replaces the whole `sstables` list in one CAS write -- the compactor's
+/// primitive (phase 3): swap out however many old SSTables for the merged
+/// replacement (or for nothing, if compaction found the table entirely
+/// tombstoned away), atomically, with a single expected-etag check against
+/// whatever [`load`] the caller already did before merging. A single
+/// attempt, not a retry loop like [`append`] -- the compactor's own caller
+/// decides what a conflict here means (something else changed the manifest
+/// mid-compaction) rather than this function silently retrying over a
+/// merge result that might no longer reflect the current manifest at all.
+pub(crate) async fn replace(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    root: &str,
+    sstables: Vec<ManifestEntry>,
+    expected_etag: Option<&str>,
+) -> Result<Cas> {
+    let manifest = Manifest { sstables };
+    put_json(backend, &manifest_key(root), &manifest, expected_etag, cipher).await
 }
 
 #[cfg(test)]

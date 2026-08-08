@@ -63,7 +63,10 @@ pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
 pub use index::{IndexKey, SecondaryIndex, Segment};
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
-pub use lsm::{FlushedSSTable, LsmKey, Manifest, ManifestEntry, MemValue, Memtable, Table, TableConfig};
+pub use lsm::{
+    CompactionReport, FlushedSSTable, LsmKey, Manifest, ManifestEntry, MemValue, Memtable, Table, TableConfig, compact,
+    should_compact,
+};
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
 pub use payload::{MAX_OBJECT_BYTES, delete_object, get_json, list_all_keys, put_json};

@@ -45,6 +45,25 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// `{root}/sst/{millis}-{random hex}.sst` -- monotonic-ish for readability
+/// when listing a bucket by hand, unique via the random suffix without
+/// needing a persistent counter that would itself need to survive restarts.
+/// Returns the same `millis` it embedded in the key, so a caller's manifest
+/// entry records exactly the time the key itself implies, not a second,
+/// separately-taken timestamp that could disagree with it. Shared by
+/// [`super::Table::flush`] and the phase-3 compactor -- both name a new
+/// SSTable object the same way.
+pub(crate) fn new_object_key(root: &str) -> Result<(String, u64)> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock before unix epoch")?
+        .as_millis() as u64;
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).context("generating SSTable key suffix")?;
+    let suffix = suffix.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    Ok((format!("{root}/sst/{millis}-{suffix}.sst"), millis))
+}
+
 /// A block's AAD -- binds a sealed block to this exact SSTable key and its
 /// position among that key's blocks.
 fn block_aad(sstable_key: &str, block_idx: usize) -> String {

@@ -6,31 +6,32 @@
 //! "one entity = one S3 object = one request" hits the partition-request
 //! ceiling `docs/s3db.md` documents no matter how the keys are spread.
 //!
-//! Phases 1+2 of the roadmap, the "minimum functional block": [`Wal`]
-//! (local durability so [`Table::put`] acks without touching the bucket),
-//! [`Memtable`] (in-memory order, no network round trip), [`sstable`]
-//! (serializing a full memtable into one immutable, per-block-encrypted
-//! object per flush — the move that turns "N requests for N rows" into
-//! "one request per flush"), [`manifest`] (the CAS-controlled record of
-//! which SSTables currently exist), and [`Table::get`] (memtable first,
-//! then the manifest's SSTables newest-to-oldest, each one's bloom filter
-//! and block index driving targeted [`crate::backend::Backend::get_range`]
-//! reads instead of ever fetching a whole SSTable object).
+//! Phases 1-3 of the roadmap: [`Wal`] (local durability so [`Table::put`]
+//! acks without touching the bucket), [`Memtable`] (in-memory order, no
+//! network round trip), [`sstable`] (serializing a full memtable into one
+//! immutable, per-block-encrypted object per flush — the move that turns
+//! "N requests for N rows" into "one request per flush"), [`manifest`] (the
+//! CAS-controlled record of which SSTables currently exist), [`Table::get`]
+//! (memtable first, then the manifest's SSTables newest-to-oldest, each
+//! one's bloom filter and block index driving targeted
+//! [`crate::backend::Backend::get_range`] reads instead of ever fetching a
+//! whole SSTable object), and [`compactor`] (merges every SSTable into one,
+//! purging tombstones, so read amplification doesn't grow unbounded with
+//! flush count).
 //!
 //! A "row" at this layer is opaque bytes in, opaque bytes out — typed,
 //! columnar values ([`docs/s3db-fulldb-roadmap.md`]'s block format) are
 //! phase 4's job, layered on top of this without changing anything here.
-//! Compaction (phase 3) isn't implemented yet either: SSTables only ever
-//! accumulate, never merge, so read amplification grows unbounded with
-//! flush count until that lands.
 
 mod bloom;
+pub mod compactor;
 pub mod manifest;
 mod memtable;
 pub mod sstable;
 mod table;
 mod wal;
 
+pub use compactor::{CompactionReport, compact, should_compact};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
 pub use table::{FlushedSSTable, Table, TableConfig};

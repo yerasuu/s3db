@@ -7,6 +7,7 @@
 //! [`crate::backend::Backend::get_range`] calls rather than the whole
 //! object.
 
+use super::compactor::{self, CompactionReport};
 use super::manifest::{self, ManifestEntry};
 use super::memtable::MemValue;
 use super::{LsmKey, Memtable, Wal, sstable};
@@ -215,7 +216,7 @@ impl Table {
         // Decided before building: every block and the footer bind this key
         // into their own AAD (see `sstable`'s module doc), so `build` needs
         // to know it up front, not after sealing.
-        let (key, flushed_at_ms) = flush_object_key(&self.root)?;
+        let (key, flushed_at_ms) = sstable::new_object_key(&self.root)?;
         let (object, meta) = sstable::build(&self.cipher, &key, &drained, self.rows_per_block);
 
         match self.backend.put_cas(&key, object, None).await? {
@@ -238,7 +239,7 @@ impl Table {
                 max_key: meta.max_key.clone(),
                 byte_len: meta.byte_len,
                 footer_len: meta.footer_len,
-                level: 0, // no compaction yet (phase 3); every SSTable starts at level 0
+                level: 0, // full-tiered compaction only -- see `compactor`'s module doc
                 flushed_at_ms,
             },
         )
@@ -253,6 +254,28 @@ impl Table {
             byte_len: meta.byte_len,
             footer_len: meta.footer_len,
         }))
+    }
+
+    /// `true` once this table's manifest has accumulated enough SSTables
+    /// that [`Self::compact`] is worth its write amplification — see
+    /// [`compactor::should_compact`] for the threshold. A caller (a
+    /// periodic maintenance job) checks this on whatever schedule it likes;
+    /// nothing here compacts on its own.
+    pub async fn should_compact(&self) -> Result<bool> {
+        let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
+        Ok(compactor::should_compact(manifest.sstables.len()))
+    }
+
+    /// Merges every SSTable this table currently has into one, dropping
+    /// tombstones — see [`compactor::compact`] for the full contract
+    /// (including what happens to a concurrent flush/compaction, and why a
+    /// merge with fewer than two SSTables is a no-op). Doesn't touch this
+    /// `Table`'s own WAL or memtable at all: compaction only ever operates
+    /// on what's already durable in the manifest, so it's equally valid to
+    /// run from a separate maintenance process that never writes through
+    /// this `Table` handle at all.
+    pub async fn compact(&self) -> Result<CompactionReport> {
+        compactor::compact(self.backend.as_ref(), &self.cipher, &self.root, self.rows_per_block).await
     }
 }
 
@@ -304,23 +327,6 @@ async fn lookup_in_sstable(
         .with_context(|| format!("fetching block {block_idx} of {}", entry.key))?;
     let rows = sstable::decode_block(cipher, &entry.key, block_idx, &sealed_block)?;
     Ok(rows.into_iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v))
-}
-
-/// `{root}/sst/{millis}-{random hex}.sst` -- monotonic-ish for readability
-/// when listing a bucket by hand, unique via the random suffix without
-/// needing a persistent counter that would itself need to survive restarts.
-/// Returns the same `millis` it embedded in the key, so the manifest entry
-/// records exactly the flush time the key itself implies, not a second,
-/// separately-taken timestamp that could disagree with it.
-fn flush_object_key(root: &str) -> Result<(String, u64)> {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system clock before unix epoch")?
-        .as_millis() as u64;
-    let mut suffix = [0u8; 8];
-    getrandom::fill(&mut suffix).context("generating SSTable key suffix")?;
-    let suffix = suffix.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    Ok((format!("{root}/sst/{millis}-{suffix}.sst"), millis))
 }
 
 #[cfg(test)]
