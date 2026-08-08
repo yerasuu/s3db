@@ -96,12 +96,22 @@ número de SSTables acotado y la amplificación de lectura baja.
   con la query — ya están ordenados por construcción, es un scan
   contiguo real, no N gets.
 
-**Cambio de trait necesario.** `Backend` hoy declara explícitamente "no
-byte-range" (`backend.rs`, doc del trait). Este diseño necesita
-`get_range(key, offset, len) -> Result<Vec<u8>>` — los 5 drivers ya
-hablan HTTP y soportan `Range` nativo (S3/R2/GCS/Azure vía header
-estándar, `Local` vía `seek`), así que es una implementación mecánica por
-driver, no una capacidad nueva que haya que inventar.
+**Cambio de trait necesario — implementado.** `Backend::get_range(key,
+offset, len) -> Result<Vec<u8>>` ya está en los 5 drivers (`Range` header
+en S3/R2/GCS/Azure, `seek`+`read_exact` en `Files`, slice en memoria en
+`Redb`) más cada decorator (`Cached`/`Metered`/`Retry`/`Throttled`/
+`RequestCache`).
+
+**Corrección de diseño encontrada al implementar fase 2**: este documento
+no decía cómo cifrado y lectura parcial conviven, y la respuesta obvia
+("sellar el objeto entero, como todo lo demás") es criptográficamente
+incompatible con `get_range` — un AEAD no se puede descifrar/autenticar
+por partes, hace falta el ciphertext completo para verificar el tag. La
+solución: cada bloque y el footer se sellan por separado
+(`Cipher::seal`/`open` con su propio nonce+tag), AAD =
+`{sstable_key}#block{idx}` / `{sstable_key}#footer` — así un
+`get_range` trae una unidad AEAD completa y autoverificable, nunca un
+fragmento de una más grande. Documentado en `crates/s3db/src/lsm/sstable.rs`.
 
 ## Tipos de dato — resueltos por el formato de bloque, no por un enum ad-hoc
 
@@ -221,7 +231,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | Fase | Qué construye | Reemplaza |
 |---|---|---|
 | 1 ✅ | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
-| 2 | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
+| 2 ✅ | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
 | 3 | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
 | 4 | Formato de bloque columnar tipado + schema declarado | — |
 | 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |

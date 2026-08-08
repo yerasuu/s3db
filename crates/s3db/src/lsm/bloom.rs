@@ -63,13 +63,6 @@ impl Bloom {
 
     /// `false` is a definitive "not in this SSTable"; `true` means "maybe"
     /// (could be a false positive) — see the module doc.
-    ///
-    /// Not called from this crate's own code yet: phase 1 has no read path
-    /// to call it from (see `docs/s3db-fulldb-roadmap.md`), only this
-    /// module's own tests exercise it directly. `#[allow(dead_code)]` here
-    /// documents that as deliberate, not a leftover to prune -- phase 2's
-    /// point lookup is the real caller.
-    #[allow(dead_code)]
     pub(crate) fn contains(&self, key: &[u8]) -> bool {
         self.bit_positions(key)
             .all(|pos| self.bits[(pos / 64) as usize] & (1u64 << (pos % 64)) != 0)
@@ -89,9 +82,6 @@ impl Bloom {
         out
     }
 
-    /// Not called from this crate's own code yet -- same "phase 2 is the
-    /// real caller" reasoning as [`Self::contains`] above.
-    #[allow(dead_code)]
     pub(crate) fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(bytes.len() >= 12, "bloom filter bytes too short for header");
         let num_bits = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
