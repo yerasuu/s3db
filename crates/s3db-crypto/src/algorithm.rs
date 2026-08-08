@@ -153,15 +153,81 @@ impl Keyed {
     }
 }
 
-/// Rejects an object whose header names an algorithm this build doesn't
-/// know — a forward-compatibility guard, not an authentication one: an
-/// object sealed by a newer version must fail loudly here rather than be
-/// misread as one of the algorithms that does exist.
-pub(crate) fn algorithm_from_code(code: u8) -> Result<CipherAlgorithm> {
-    match code {
-        0x0 => Ok(CipherAlgorithm::XChaCha20Poly1305),
-        0x1 => Ok(CipherAlgorithm::Aes256Gcm),
-        other => bail!("invalid ciphertext (unknown cipher algorithm {other:#x})"),
+/// Header nibble for an object that isn't encrypted at all
+/// ([`EncryptionMode::Disabled`]). Deliberately at the top of the range
+/// rather than the next free code, so adding algorithms one at a time can
+/// never walk into it.
+pub(crate) const UNENCRYPTED_CODE: u8 = 0xF;
+
+/// Every supported AEAD's tag length. Both are 128-bit; a future algorithm
+/// with a different tag would have to make this per-[`Sealer`] instead —
+/// [`crate::stream`]'s size accounting is the only thing that reads it.
+pub(crate) const TAG_LEN: usize = 16;
+
+/// What actually sealed an object: an AEAD, or nothing at all. The
+/// unencrypted case is deliberately *not* a [`CipherAlgorithm`] variant —
+/// callers pick an algorithm, and "no encryption" must never be reachable by
+/// picking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sealer {
+    Algorithm(CipherAlgorithm),
+    Plaintext,
+}
+
+impl Sealer {
+    pub(crate) const fn code(self) -> u8 {
+        match self {
+            Sealer::Algorithm(a) => a.code(),
+            Sealer::Plaintext => UNENCRYPTED_CODE,
+        }
+    }
+
+    /// Rejects an object whose header names something this build doesn't
+    /// know — a forward-compatibility guard, not an authentication one: an
+    /// object sealed by a newer version must fail loudly here rather than be
+    /// misread as one of the algorithms that does exist.
+    pub(crate) fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0x0 => Ok(Sealer::Algorithm(CipherAlgorithm::XChaCha20Poly1305)),
+            0x1 => Ok(Sealer::Algorithm(CipherAlgorithm::Aes256Gcm)),
+            UNENCRYPTED_CODE => Ok(Sealer::Plaintext),
+            other => bail!("invalid ciphertext (unknown cipher algorithm {other:#x})"),
+        }
+    }
+
+    /// Bytes of authentication tag this sealer appends. Zero for
+    /// [`Sealer::Plaintext`] — which is the whole point of the mode, and why
+    /// nothing sealed that way can detect tampering.
+    pub(crate) const fn tag_len(self) -> usize {
+        match self {
+            Sealer::Algorithm(_) => TAG_LEN,
+            Sealer::Plaintext => 0,
+        }
+    }
+}
+
+/// Whether a [`crate::Cipher`] encrypts at all, and with what. `Enabled` is
+/// the default: turning encryption off takes an explicit `Disabled`, never
+/// an omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionMode {
+    Enabled {
+        algorithm: CipherAlgorithm,
+    },
+    /// No AEAD, no key derivation, no passphrase required — objects are
+    /// stored as-is, marked unencrypted in their header so a reader never
+    /// has to guess. Nothing sealed this way is confidential *or*
+    /// tamper-evident: with no tag, a storage provider can rewrite content
+    /// undetectably. Only for a caller that genuinely doesn't want
+    /// encryption-at-rest, not as a performance knob.
+    Disabled,
+}
+
+impl Default for EncryptionMode {
+    fn default() -> Self {
+        EncryptionMode::Enabled {
+            algorithm: CipherAlgorithm::default(),
+        }
     }
 }
 

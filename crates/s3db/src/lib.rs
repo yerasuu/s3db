@@ -51,7 +51,7 @@ pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
 pub use backup::{BackupConsistency, BackupManifest};
 pub use batch_loader::{BatchLoader, MemoryBudget};
 pub use cache::{CacheConfig, CachedBackend, TypedCache};
-pub use cipher::{Cipher, CompressionStrategy};
+pub use cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalParams, R2Params, S3Params};

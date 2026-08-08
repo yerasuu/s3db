@@ -29,7 +29,7 @@ mod compression;
 mod kdf;
 mod stream;
 
-pub use algorithm::CipherAlgorithm;
+pub use algorithm::{CipherAlgorithm, EncryptionMode};
 pub use cipher::Cipher;
 pub use compression::CompressionStrategy;
 pub use kdf::SALT_LEN;

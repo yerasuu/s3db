@@ -19,8 +19,8 @@ fn a_bare_compression_byte_reads_back_as_the_default_algorithm() {
         let (algorithm_code, compression_code) = unpack_header(compression);
         assert_eq!(compression_code, compression);
         assert_eq!(
-            algorithm_from_code(algorithm_code).unwrap(),
-            CipherAlgorithm::XChaCha20Poly1305
+            Sealer::from_code(algorithm_code).unwrap(),
+            Sealer::Algorithm(CipherAlgorithm::XChaCha20Poly1305)
         );
     }
 }
@@ -29,7 +29,10 @@ fn a_bare_compression_byte_reads_back_as_the_default_algorithm() {
 fn algorithm_codes_are_unique_and_match_their_index() {
     for (i, algorithm) in CipherAlgorithm::ALL.into_iter().enumerate() {
         assert_eq!(algorithm.index(), i, "ALL must be in wire-code order");
-        assert_eq!(algorithm_from_code(algorithm.code()).unwrap(), algorithm);
+        assert_eq!(
+            Sealer::from_code(algorithm.code()).unwrap(),
+            Sealer::Algorithm(algorithm)
+        );
     }
 }
 

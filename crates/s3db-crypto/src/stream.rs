@@ -6,7 +6,7 @@
 //! all.
 
 use crate::Cipher;
-use crate::algorithm::CipherAlgorithm;
+use crate::algorithm::{CipherAlgorithm, Sealer};
 use crate::cipher::NONCE_LEN;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
@@ -26,26 +26,35 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const STREAM_MAGIC_PREFIX: &[u8; 7] = b"GQCSTRM";
 const STREAM_MAGIC_LEN: usize = STREAM_MAGIC_PREFIX.len() + 1;
 
-/// The magic's algorithm byte. Permanent per algorithm, same rule as
-/// [`CipherAlgorithm::code`]: never renumbered, never reused.
-const fn magic_suffix(algorithm: CipherAlgorithm) -> u8 {
-    match algorithm {
-        CipherAlgorithm::XChaCha20Poly1305 => b'1',
-        CipherAlgorithm::Aes256Gcm => b'2',
-    }
-}
+/// The magic's algorithm byte, one entry per [`Sealer`]. Permanent, same
+/// rule as [`CipherAlgorithm::code`]: never renumbered, never reused. One
+/// table rather than two matches, so a new entry can't be added to the write
+/// side and forgotten on the read side.
+const STREAM_SEALERS: [(u8, Sealer); 3] = [
+    (b'0', Sealer::Plaintext),
+    (b'1', Sealer::Algorithm(CipherAlgorithm::XChaCha20Poly1305)),
+    (b'2', Sealer::Algorithm(CipherAlgorithm::Aes256Gcm)),
+];
 
-fn algorithm_from_magic(magic: &[u8; STREAM_MAGIC_LEN]) -> Result<CipherAlgorithm> {
-    CipherAlgorithm::ALL
+fn magic_suffix(sealer: Sealer) -> u8 {
+    STREAM_SEALERS
         .into_iter()
-        .find(|&a| magic_suffix(a) == magic[STREAM_MAGIC_PREFIX.len()])
-        .with_context(|| "invalid ciphertext (stream sealed by an unknown cipher algorithm)".to_string())
+        .find_map(|(byte, s)| (s == sealer).then_some(byte))
+        .expect("every Sealer has a stream magic byte")
 }
 
-fn stream_magic(algorithm: CipherAlgorithm) -> [u8; STREAM_MAGIC_LEN] {
+fn sealer_from_magic(magic: &[u8; STREAM_MAGIC_LEN]) -> Result<Sealer> {
+    let byte = magic[STREAM_MAGIC_PREFIX.len()];
+    STREAM_SEALERS
+        .into_iter()
+        .find_map(|(b, s)| (b == byte).then_some(s))
+        .with_context(|| format!("invalid ciphertext (stream sealed by an unknown cipher algorithm {byte:#x})"))
+}
+
+fn stream_magic(sealer: Sealer) -> [u8; STREAM_MAGIC_LEN] {
     let mut magic = [0u8; STREAM_MAGIC_LEN];
     magic[..STREAM_MAGIC_PREFIX.len()].copy_from_slice(STREAM_MAGIC_PREFIX);
-    magic[STREAM_MAGIC_PREFIX.len()] = magic_suffix(algorithm);
+    magic[STREAM_MAGIC_PREFIX.len()] = magic_suffix(sealer);
     magic
 }
 /// Plaintext bytes per chunk in [`seal_stream`]'s framing. Bounds peak
@@ -108,8 +117,8 @@ pub(crate) async fn seal_stream(cipher: &Cipher, aad: &str, plaintext_path: &Pat
         .await
         .with_context(|| format!("creating {}", sealed_path.display()))?;
 
-    let algorithm = cipher.algorithm();
-    output.write_all(&stream_magic(algorithm)).await?;
+    let sealer = cipher.sealer();
+    output.write_all(&stream_magic(sealer)).await?;
     output.write_all(&total_len.to_le_bytes()).await?;
 
     let mut remaining = total_len;
@@ -125,9 +134,7 @@ pub(crate) async fn seal_stream(cipher: &Cipher, aad: &str, plaintext_path: &Pat
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes).expect("system RNG unavailable");
         let chunk_aad = format!("{aad}\0stream\0{total_len}\0{idx}");
-        let ciphertext = cipher
-            .keyed(algorithm)
-            .encrypt(&nonce_bytes, &plain, chunk_aad.as_bytes());
+        let ciphertext = cipher.seal_chunk(&nonce_bytes, &plain, chunk_aad.as_bytes());
 
         output.write_all(&(ciphertext.len() as u32).to_le_bytes()).await?;
         output.write_all(&nonce_bytes).await?;
@@ -157,7 +164,8 @@ pub(crate) async fn seal_stream(cipher: &Cipher, aad: &str, plaintext_path: &Pat
         .await
         .with_context(|| format!("verifying size of {}", sealed_path.display()))?
         .len();
-    let expected_len = STREAM_MAGIC_LEN as u64 + 8 + num_chunks * (4 + NONCE_LEN as u64 + 16) + total_len;
+    let expected_len =
+        STREAM_MAGIC_LEN as u64 + 8 + num_chunks * (4 + NONCE_LEN as u64 + sealer.tag_len() as u64) + total_len;
     if actual_len != expected_len {
         bail!(
             "incomplete sealing: {} ended up at {actual_len} bytes, expected {expected_len} \
@@ -197,7 +205,10 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
     if &magic[..STREAM_MAGIC_PREFIX.len()] != STREAM_MAGIC_PREFIX.as_slice() {
         bail!("invalid ciphertext (not an s3db stream)");
     }
-    let algorithm = algorithm_from_magic(&magic)?;
+    let sealer = sealer_from_magic(&magic)?;
+    // Fail on a mode mismatch before reading a single chunk, so the error
+    // names the real problem instead of surfacing as a decrypt failure.
+    cipher.accept(sealer)?;
     let mut total_len_bytes = [0u8; 8];
     input
         .read_exact(&mut total_len_bytes)
@@ -229,14 +240,8 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
 
         let chunk_aad = format!("{aad}\0stream\0{total_len}\0{idx}");
         let plain = cipher
-            .keyed(algorithm)
-            .decrypt(&nonce_bytes, &ciphertext, chunk_aad.as_bytes())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "couldn't decrypt (wrong passphrase, out-of-order chunk, or the \
-                     data was modified/moved from a different key)"
-                )
-            })?;
+            .open_chunk(sealer, &nonce_bytes, &ciphertext, chunk_aad.as_bytes())
+            .context("couldn't decrypt (wrong passphrase, out-of-order chunk, or the data was modified)")?;
 
         // Belt-and-suspenders: every chunk but the last must be exactly
         // STREAM_CHUNK_LEN, the last exactly whatever's left. A chunk that
@@ -429,7 +434,10 @@ mod tests {
                 .unwrap();
 
             let (magic, _, _) = read_stream_chunks(&sealed_path).await;
-            assert_eq!(magic[STREAM_MAGIC_PREFIX.len()], magic_suffix(sealer_algorithm));
+            assert_eq!(
+                magic[STREAM_MAGIC_PREFIX.len()],
+                magic_suffix(Sealer::Algorithm(sealer_algorithm))
+            );
 
             for reader_algorithm in CipherAlgorithm::ALL {
                 let opened_path = dir.path().join(format!("opened-{reader_algorithm:?}"));
@@ -440,6 +448,47 @@ mod tests {
                 assert_eq!(tokio::fs::read(&opened_path).await.unwrap(), plain);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_disabled_cipher_streams_plaintext_and_refuses_encrypted_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain_path = dir.path().join("plain");
+        let sealed_path = dir.path().join("sealed");
+        let opened_path = dir.path().join("opened");
+        let plain = vec![0x7Bu8; STREAM_CHUNK_LEN + 10]; // 2 chunks
+        tokio::fs::write(&plain_path, &plain).await.unwrap();
+
+        let disabled = Cipher::disabled();
+        disabled
+            .seal_stream("repo/pack", &plain_path, &sealed_path)
+            .await
+            .unwrap();
+        disabled
+            .open_stream("repo/pack", &sealed_path, &opened_path)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&opened_path).await.unwrap(), plain);
+
+        // Both directions of the downgrade guard, on the stream format too.
+        let err = test_cipher()
+            .open_stream("repo/pack", &sealed_path, &opened_path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encryption enabled"), "got: {err}");
+
+        let encrypted_path = dir.path().join("encrypted");
+        test_cipher()
+            .seal_stream("repo/pack", &plain_path, &encrypted_path)
+            .await
+            .unwrap();
+        let err = disabled
+            .open_stream("repo/pack", &encrypted_path, &opened_path)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("encryption disabled"), "got: {err}");
     }
 
     #[tokio::test]

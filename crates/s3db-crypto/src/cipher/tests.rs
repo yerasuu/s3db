@@ -95,7 +95,7 @@ fn rejects_a_sealed_blob_too_short_to_contain_a_header() {
 fn every_algorithm_roundtrips() {
     for algorithm in CipherAlgorithm::ALL {
         let c = test_cipher_with(algorithm);
-        assert_eq!(c.algorithm(), algorithm);
+        assert_eq!(c.mode(), EncryptionMode::Enabled { algorithm });
         let sealed = c.seal("k", b"secret content", CompressionStrategy::None);
         assert_eq!(algorithm::unpack_header(sealed[NONCE_LEN]).0, algorithm.code());
         assert_eq!(c.open("k", &sealed).unwrap(), b"secret content");
@@ -125,7 +125,12 @@ fn a_cipher_opens_objects_sealed_by_any_algorithm() {
 #[test]
 fn the_default_algorithm_leaves_the_header_byte_unchanged_from_the_original_format() {
     let c = test_cipher();
-    assert_eq!(c.algorithm(), CipherAlgorithm::XChaCha20Poly1305);
+    assert_eq!(
+        c.mode(),
+        EncryptionMode::Enabled {
+            algorithm: CipherAlgorithm::XChaCha20Poly1305
+        }
+    );
     let raw = c.seal("k", b"x", CompressionStrategy::None);
     assert_eq!(raw[NONCE_LEN], compression::NONE);
     let zstd = c.seal(
@@ -145,6 +150,67 @@ fn rejects_an_unknown_algorithm_code() {
     sealed[NONCE_LEN] = algorithm::pack_header(0xE, compression::NONE);
     let err = c.open("k", &sealed).unwrap_err().to_string();
     assert!(err.contains("unknown cipher algorithm"), "got: {err}");
+}
+
+#[test]
+fn disabled_roundtrips_and_marks_the_object_unencrypted() {
+    let c = Cipher::disabled();
+    assert_eq!(c.mode(), EncryptionMode::Disabled);
+    let sealed = c.seal("k", b"public content", CompressionStrategy::None);
+    assert_eq!(
+        algorithm::unpack_header(sealed[NONCE_LEN]).0,
+        algorithm::UNENCRYPTED_CODE
+    );
+    // No AEAD, so the payload really is the plaintext -- that's the mode's
+    // whole point, and worth pinning down rather than assuming.
+    assert_eq!(&sealed[NONCE_LEN + 1..], b"public content");
+    assert_eq!(c.open("k", &sealed).unwrap(), b"public content");
+}
+
+#[test]
+fn disabled_still_compresses_when_asked() {
+    let c = Cipher::disabled();
+    let plaintext = b"repeat repeat repeat repeat ".repeat(200);
+    let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+    assert!(sealed.len() < plaintext.len());
+    assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
+}
+
+/// The downgrade attack `accept` exists to stop: anything able to write to
+/// the bucket could otherwise swap a sealed object for a plaintext one and
+/// have an encrypting reader hand the content straight back.
+#[test]
+fn an_encrypting_cipher_refuses_an_unencrypted_object() {
+    let unencrypted = Cipher::disabled().seal("k", b"attacker content", CompressionStrategy::None);
+    let err = test_cipher().open("k", &unencrypted).unwrap_err().to_string();
+    assert!(err.contains("encryption enabled"), "got: {err}");
+}
+
+#[test]
+fn a_disabled_cipher_refuses_an_encrypted_object() {
+    let sealed = test_cipher().seal("k", b"secret content", CompressionStrategy::None);
+    let err = Cipher::disabled().open("k", &sealed).unwrap_err().to_string();
+    assert!(err.contains("encryption disabled"), "got: {err}");
+}
+
+#[test]
+fn derive_for_builds_what_the_mode_asks_for() {
+    for algorithm in CipherAlgorithm::ALL {
+        let mode = EncryptionMode::Enabled { algorithm };
+        assert_eq!(Cipher::derive_for(mode, "pw", &[7u8; SALT_LEN]).unwrap().mode(), mode);
+    }
+    let disabled = Cipher::derive_for(EncryptionMode::Disabled, "pw", &[7u8; SALT_LEN]).unwrap();
+    assert_eq!(disabled.mode(), EncryptionMode::Disabled);
+}
+
+#[test]
+fn the_default_mode_is_encryption_on() {
+    assert_eq!(
+        EncryptionMode::default(),
+        EncryptionMode::Enabled {
+            algorithm: CipherAlgorithm::XChaCha20Poly1305
+        }
+    );
 }
 
 #[test]
