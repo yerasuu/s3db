@@ -25,6 +25,7 @@ use futures::stream::{self, StreamExt};
 use google_cloud_auth::credentials::service_account;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_storage::client::{Storage, StorageControl};
+use google_cloud_storage::model_ext::ReadRange;
 #[cfg(feature = "streaming")]
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,6 +114,26 @@ impl Backend for GcsBackend {
             bytes.extend_from_slice(&chunk);
         }
         Ok((bytes, Some(etag)))
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let (storage, _) = self.client_pair().await?;
+        let mut resp = storage
+            .read_object(self.bucket_resource(), key)
+            .set_read_range(ReadRange::segment(offset, len))
+            .send()
+            .await
+            .with_context(|| format!("couldn't read range of {key} from Google Cloud Storage"))?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp
+            .next()
+            .await
+            .transpose()
+            .with_context(|| format!("reading ranged body of {key}"))?
+        {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {

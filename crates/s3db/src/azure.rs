@@ -24,7 +24,9 @@ use azure_core::http::{Etag, RequestContent, StatusCode, Url};
 use azure_identity::ClientSecretCredential;
 #[cfg(feature = "streaming")]
 use azure_storage_blob::models::BlockLookupList;
-use azure_storage_blob::models::{BlobClientUploadOptions, BlobContainerClientListBlobsOptions};
+use azure_storage_blob::models::{
+    BlobClientDownloadOptions, BlobClientUploadOptions, BlobContainerClientListBlobsOptions,
+};
 use azure_storage_blob::{BlobContainerClient, BlobServiceClient};
 use futures::TryStreamExt;
 use futures::stream::{self, StreamExt};
@@ -129,6 +131,25 @@ impl Backend for AzureBackend {
             Err(e) if is_not_found(&e) => Ok((Vec::new(), None)),
             Err(e) => Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
         }
+    }
+
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let options = BlobClientDownloadOptions {
+            range: Some((offset..offset + len).into()),
+            ..Default::default()
+        };
+        let result = self
+            .blob(key)
+            .await?
+            .download(Some(options))
+            .await
+            .with_context(|| format!("couldn't read range of {key} from Azure Blob Storage"))?;
+        let bytes = result
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading ranged body of {key}"))?;
+        Ok(bytes.to_vec())
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {

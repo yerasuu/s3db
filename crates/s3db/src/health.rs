@@ -109,6 +109,9 @@ mod tests {
         async fn list_prefix(&self, _prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
             unreachable!()
         }
+        async fn get_range(&self, _key: &str, _offset: u64, _len: u64) -> anyhow::Result<Vec<u8>> {
+            unreachable!()
+        }
         #[cfg(feature = "streaming")]
         async fn put_stream(&self, _key: &str, _source: &std::path::Path) -> anyhow::Result<()> {
             unreachable!()

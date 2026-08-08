@@ -174,6 +174,10 @@ impl Backend for CachedBackend {
         self.inner.list_prefix(prefix).await
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         self.inner.put_stream(key, source).await
@@ -289,6 +293,9 @@ mod tests {
         }
         async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
             self.inner.list_prefix(prefix).await
+        }
+        async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(key, offset, len).await
         }
         #[cfg(feature = "streaming")]
         async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {

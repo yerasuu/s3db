@@ -131,6 +131,28 @@ impl Backend for S3Backend {
         }
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        // `Range` is an inclusive-end HTTP byte range: `len` bytes starting
+        // at `offset` ends at `offset + len - 1`.
+        let range = format!("bytes={offset}-{}", offset + len - 1);
+        let out = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range)
+            .send()
+            .await
+            .with_context(|| format!("couldn't read range of {key} from S3"))?;
+        let bytes = out
+            .body
+            .collect()
+            .await
+            .with_context(|| format!("reading ranged body of {key}"))?
+            .into_bytes();
+        Ok(bytes.to_vec())
+    }
+
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         let req = self
             .client

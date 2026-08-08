@@ -295,3 +295,32 @@ async fn commit_batch_of_only_creates_matches_bulk_load_shape() {
     assert_eq!(b.get("a").await.unwrap().0, b"1");
     assert_eq!(b.get("b").await.unwrap().0, b"2");
 }
+
+#[tokio::test]
+async fn get_range_returns_exactly_the_requested_slice() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    b.put_cas("k", b"0123456789".to_vec(), None).await.unwrap();
+    assert_eq!(b.get_range("k", 3, 4).await.unwrap(), b"3456");
+    assert_eq!(b.get_range("k", 0, 10).await.unwrap(), b"0123456789");
+}
+
+#[tokio::test]
+async fn get_range_errors_on_a_missing_key() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(backend(dir.path()).get_range("nope", 0, 1).await.is_err());
+}
+
+#[tokio::test]
+async fn get_range_errors_on_a_brand_new_db_with_no_table_yet() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(backend(dir.path()).get_range("nope", 0, 1).await.is_err());
+}
+
+#[tokio::test]
+async fn get_range_errors_when_the_range_exceeds_the_stored_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    b.put_cas("k", b"short".to_vec(), None).await.unwrap();
+    assert!(b.get_range("k", 0, 1000).await.is_err());
+}

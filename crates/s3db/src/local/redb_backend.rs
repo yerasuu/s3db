@@ -154,6 +154,33 @@ impl Backend for RedbBackend {
         .context("redb read task panicked")?
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let db = self.database().await?.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().context("beginning redb read transaction")?;
+            let table = match read_txn.open_table(TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => anyhow::bail!("{key} doesn't exist"),
+                Err(e) => return Err(e).context("opening redb table"),
+            };
+            let guard = table
+                .get(key.as_str())
+                .context("reading from redb")?
+                .with_context(|| format!("{key} doesn't exist"))?;
+            let (_, body) = guard.value();
+            let (start, end) = (offset as usize, (offset + len) as usize);
+            anyhow::ensure!(
+                end <= body.len(),
+                "requested range {start}..{end} of {key} exceeds its {} stored bytes",
+                body.len()
+            );
+            Ok(body[start..end].to_vec())
+        })
+        .await
+        .context("redb range task panicked")?
+    }
+
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         let db = self.database().await?.clone();
         let key = key.to_string();

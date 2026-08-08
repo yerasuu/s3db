@@ -185,6 +185,22 @@ impl Backend for FilesBackend {
         Ok((bytes, etag))
     }
 
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let data_path = self.data_path(key);
+        let mut file = File::open(&data_path)
+            .await
+            .with_context(|| format!("opening {}", data_path.display()))?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .with_context(|| format!("seeking {} to offset {offset}", data_path.display()))?;
+        let mut buf = vec![0u8; len as usize];
+        file.read_exact(&mut buf)
+            .await
+            .with_context(|| format!("reading {len} bytes at offset {offset} of {}", data_path.display()))?;
+        Ok(buf)
+    }
+
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         let lock_file = lock_key(&self.lock_path(key)).await?;
         let rev_path = self.rev_path(key);

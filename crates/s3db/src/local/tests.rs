@@ -126,3 +126,13 @@ async fn both_engines_round_trip_put_stream_and_get_stream() {
         );
     }
 }
+
+#[tokio::test]
+async fn both_engines_get_range_returns_the_same_slice() {
+    for engine in [LocalEngine::Files, LocalEngine::Redb] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), engine);
+        b.put_cas("k", b"0123456789".to_vec(), None).await.unwrap();
+        assert_eq!(b.get_range("k", 2, 5).await.unwrap(), b"23456", "engine {engine:?}");
+    }
+}

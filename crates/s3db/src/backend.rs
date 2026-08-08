@@ -76,6 +76,23 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome>;
     /// Every `(key, size)` under `prefix`, fully paginated internally.
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>>;
+    /// Fetches exactly `len` bytes starting at `offset` in `key`'s stored
+    /// object — the primitive `crate::lsm`'s read path is built on
+    /// (`docs/s3db-fulldb-roadmap.md` phase 2): a point lookup or range scan
+    /// fetches only the footer and the one or two blocks it actually needs,
+    /// never a whole multi-megabyte SSTable object. Every driver here
+    /// already speaks HTTP and supports native byte-range reads (S3/R2/GCS/
+    /// Azure via the standard `Range` header, `Local`/`Redb` via a seek or a
+    /// slice) — mechanical per driver, not a capability that had to be
+    /// invented. Required (not feature-gated like streaming): unlike large
+    /// blobs, every existing driver can give this for free, there's no
+    /// dependency or memory-profile tradeoff to opt out of.
+    ///
+    /// `offset + len` past the object's actual end is an error, not a
+    /// short read — a caller that computed `offset`/`len` from a manifest
+    /// entry (the only place they should come from) has a real bug if they
+    /// don't match what's actually stored.
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>>;
     /// Uploads `source` (a file already on local disk, already-sealed
     /// ciphertext) to `key`, streaming — bounded memory regardless of the
     /// file's size, unlike a buffered `put`. Deliberately no CAS variant:
