@@ -1,6 +1,6 @@
 [package]
 name = "s3db"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Typed, encrypted, CAS-consistent database over S3-compatible object storage"
