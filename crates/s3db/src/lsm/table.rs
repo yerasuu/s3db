@@ -10,6 +10,7 @@
 use super::compactor::{self, CompactionReport};
 use super::manifest::{self, ManifestEntry};
 use super::memtable::MemValue;
+use super::value::{Schema, Value};
 use super::{LsmKey, Memtable, Wal, sstable};
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
@@ -45,6 +46,16 @@ pub struct TableConfig {
     pub wal_path: PathBuf,
     pub flush_threshold_bytes: usize,
     pub rows_per_block: usize,
+    /// `None` (the default): rows are opaque bytes in, opaque bytes out --
+    /// [`Table::put`]/[`Table::get`]. `Some`: every block this table
+    /// flushes is columnar-encoded against this exact schema (phase 4, see
+    /// `crate::lsm::typed_block`'s module doc), and rows go through
+    /// [`Table::put_typed`]/[`Table::get_typed`] instead. Fixed for this
+    /// table's lifetime once [`Table::open`] is called -- there's no
+    /// migration path for changing a table's schema after rows already
+    /// exist under it, any more than there's one for retroactively
+    /// re-encoding old blocks.
+    pub schema: Option<Schema>,
 }
 
 impl TableConfig {
@@ -56,6 +67,7 @@ impl TableConfig {
             wal_path,
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD_BYTES,
             rows_per_block: DEFAULT_ROWS_PER_BLOCK,
+            schema: None,
         }
     }
 
@@ -66,6 +78,11 @@ impl TableConfig {
 
     pub fn with_rows_per_block(mut self, rows: usize) -> Self {
         self.rows_per_block = rows;
+        self
+    }
+
+    pub fn with_schema(mut self, schema: Schema) -> Self {
+        self.schema = Some(schema);
         self
     }
 }
@@ -94,6 +111,7 @@ pub struct Table {
     root: String,
     flush_threshold_bytes: usize,
     rows_per_block: usize,
+    schema: Option<Schema>,
     state: Mutex<State>,
 }
 
@@ -118,6 +136,7 @@ impl Table {
             root: config.root,
             flush_threshold_bytes: config.flush_threshold_bytes,
             rows_per_block: config.rows_per_block,
+            schema: config.schema,
             state: Mutex::new(State { wal, memtable }),
         })
     }
@@ -149,6 +168,34 @@ impl Table {
         self.state.lock().await.memtable.get(key).cloned()
     }
 
+    /// [`Self::put`] for a table with a declared [`TableConfig::schema`] --
+    /// `row` must match it exactly ([`Schema::validate`]), checked here so
+    /// a mismatch fails immediately with a clear error instead of only
+    /// surfacing later at [`Self::flush`] time when the whole block it
+    /// landed in fails to columnarize.
+    pub async fn put_typed(&self, key: LsmKey, row: Vec<Value>) -> Result<()> {
+        let schema = self
+            .schema
+            .as_ref()
+            .context("put_typed needs a schema (see TableConfig::with_schema)")?;
+        schema.validate(&row)?;
+        let bytes = rmp_serde::to_vec_named(&row).context("serializing a typed row never fails")?;
+        self.put(key, bytes).await
+    }
+
+    /// [`Self::get`] for a table with a declared [`TableConfig::schema`].
+    pub async fn get_typed(&self, key: &[u8]) -> Result<Option<Vec<Value>>> {
+        anyhow::ensure!(
+            self.schema.is_some(),
+            "get_typed needs a schema (see TableConfig::with_schema)"
+        );
+        let Some(bytes) = self.get(key).await? else {
+            return Ok(None);
+        };
+        let row = rmp_serde::from_slice(&bytes).context("decoding a typed row")?;
+        Ok(Some(row))
+    }
+
     /// The complete read: the current memtable first (always the freshest
     /// state, since anything in it hasn't been flushed yet), then the
     /// manifest's SSTables from most to least recently flushed, stopping at
@@ -171,7 +218,9 @@ impl Table {
             if key < entry.min_key.as_slice() || key > entry.max_key.as_slice() {
                 continue; // key can't possibly be in this SSTable's range
             }
-            if let Some(value) = lookup_in_sstable(self.backend.as_ref(), &self.cipher, entry, key).await? {
+            if let Some(value) =
+                lookup_in_sstable(self.backend.as_ref(), &self.cipher, self.schema.as_ref(), entry, key).await?
+            {
                 return Ok(mem_value_to_get_result(value));
             }
         }
@@ -217,7 +266,7 @@ impl Table {
         // into their own AAD (see `sstable`'s module doc), so `build` needs
         // to know it up front, not after sealing.
         let (key, flushed_at_ms) = sstable::new_object_key(&self.root)?;
-        let (object, meta) = sstable::build(&self.cipher, &key, &drained, self.rows_per_block);
+        let (object, meta) = sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block)?;
 
         match self.backend.put_cas(&key, object, None).await? {
             Cas::Ok => {}
@@ -275,7 +324,14 @@ impl Table {
     /// run from a separate maintenance process that never writes through
     /// this `Table` handle at all.
     pub async fn compact(&self) -> Result<CompactionReport> {
-        compactor::compact(self.backend.as_ref(), &self.cipher, &self.root, self.rows_per_block).await
+        compactor::compact(
+            self.backend.as_ref(),
+            &self.cipher,
+            &self.root,
+            self.schema.as_ref(),
+            self.rows_per_block,
+        )
+        .await
     }
 }
 
@@ -294,6 +350,7 @@ fn mem_value_to_get_result(value: MemValue) -> Option<Vec<u8>> {
 async fn lookup_in_sstable(
     backend: &dyn Backend,
     cipher: &Cipher,
+    schema: Option<&Schema>,
     entry: &ManifestEntry,
     key: &[u8],
 ) -> Result<Option<MemValue>> {
@@ -325,7 +382,7 @@ async fn lookup_in_sstable(
         .get_range(&entry.key, candidate.offset, candidate.len as u64)
         .await
         .with_context(|| format!("fetching block {block_idx} of {}", entry.key))?;
-    let rows = sstable::decode_block(cipher, &entry.key, block_idx, &sealed_block)?;
+    let rows = sstable::decode_block(cipher, &entry.key, schema, block_idx, &sealed_block)?;
     Ok(rows.into_iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v))
 }
 

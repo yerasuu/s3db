@@ -6,7 +6,7 @@
 //! "one entity = one S3 object = one request" hits the partition-request
 //! ceiling `docs/s3db.md` documents no matter how the keys are spread.
 //!
-//! Phases 1-3 of the roadmap: [`Wal`] (local durability so [`Table::put`]
+//! Phases 1-4 of the roadmap: [`Wal`] (local durability so [`Table::put`]
 //! acks without touching the bucket), [`Memtable`] (in-memory order, no
 //! network round trip), [`sstable`] (serializing a full memtable into one
 //! immutable, per-block-encrypted object per flush — the move that turns
@@ -15,13 +15,18 @@
 //! (memtable first, then the manifest's SSTables newest-to-oldest, each
 //! one's bloom filter and block index driving targeted
 //! [`crate::backend::Backend::get_range`] reads instead of ever fetching a
-//! whole SSTable object), and [`compactor`] (merges every SSTable into one,
+//! whole SSTable object), [`compactor`] (merges every SSTable into one,
 //! purging tombstones, so read amplification doesn't grow unbounded with
-//! flush count).
+//! flush count), and [`value`]/[`typed_block`] (a table declared with a
+//! [`value::Schema`] stores real typed, columnar blocks instead of opaque
+//! bytes, with per-column min/max stats a future range scan or query
+//! builder — phases 5, 8 — can use to skip whole blocks).
 //!
-//! A "row" at this layer is opaque bytes in, opaque bytes out — typed,
-//! columnar values ([`docs/s3db-fulldb-roadmap.md`]'s block format) are
-//! phase 4's job, layered on top of this without changing anything here.
+//! A row is opaque bytes in, opaque bytes out ([`Table::put`]/[`Table::get`])
+//! *unless* a table declares a [`value::Schema`] ([`TableConfig::schema`]),
+//! in which case it's [`value::Value`]s in and out
+//! ([`Table::put_typed`]/[`Table::get_typed`]) instead — a per-table choice
+//! fixed at creation, not something that varies block to block.
 
 mod bloom;
 pub mod compactor;
@@ -29,12 +34,16 @@ pub mod manifest;
 mod memtable;
 pub mod sstable;
 mod table;
+mod typed_block;
+pub mod value;
 mod wal;
 
 pub use compactor::{CompactionReport, compact, should_compact};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
 pub use table::{FlushedSSTable, Table, TableConfig};
+pub use typed_block::ColumnStats;
+pub use value::{ColumnDef, Schema, Value, ValueKind};
 pub use wal::Wal;
 
 /// A row's sort key in an LSM [`Table`] — arbitrary bytes, ordering is

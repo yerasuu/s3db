@@ -25,6 +25,7 @@
 //! job) checks before calling [`compact`].
 
 use super::memtable::MemValue;
+use super::value::Schema;
 use super::{LsmKey, manifest, sstable};
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
@@ -70,6 +71,7 @@ pub async fn compact(
     backend: &dyn Backend,
     cipher: &Cipher,
     root: &str,
+    schema: Option<&Schema>,
     rows_per_block: usize,
 ) -> Result<CompactionReport> {
     let (manifest, etag) = manifest::load(backend, cipher, root).await?;
@@ -97,7 +99,7 @@ pub async fn compact(
                 old_entry.key
             );
         }
-        let rows = sstable::read_all(cipher, &old_entry.key, &object)?;
+        let rows = sstable::read_all(cipher, &old_entry.key, schema, &object)?;
         rows_read += rows.len();
         merged.extend(rows);
     }
@@ -112,7 +114,7 @@ pub async fn compact(
         Vec::new()
     } else {
         let (new_key, flushed_at_ms) = sstable::new_object_key(root)?;
-        let (object, meta) = sstable::build(cipher, &new_key, &live, rows_per_block);
+        let (object, meta) = sstable::build(cipher, &new_key, schema, &live, rows_per_block)?;
         match backend.put_cas(&new_key, object, None).await? {
             Cas::Ok => {}
             Cas::Conflict => bail!("compacted SSTable key collision at {new_key} (should never happen)"),

@@ -1,6 +1,7 @@
 use super::*;
 use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
+use crate::lsm::value::{ColumnDef, ValueKind};
 
 fn test_backend(root: &std::path::Path) -> Arc<dyn Backend> {
     Arc::new(LocalBackend::new(&LocalParams {
@@ -127,7 +128,7 @@ async fn a_flushed_object_is_encrypted_and_decodes_back_to_the_same_rows() {
         "plaintext row content must not appear in the stored object"
     );
 
-    let rows = sstable::read_all(&cipher, &flushed.key, &object).unwrap();
+    let rows = sstable::read_all(&cipher, &flushed.key, None, &object).unwrap();
     assert_eq!(rows, vec![(b"a".to_vec(), MemValue::Put(b"secret value".to_vec()))]);
 }
 
@@ -343,4 +344,176 @@ async fn get_of_a_key_outside_every_sstables_range_is_none() {
     table.flush().await.unwrap();
     assert_eq!(table.get(b"a").await.unwrap(), None); // before the range
     assert_eq!(table.get(b"z").await.unwrap(), None); // after the range
+}
+
+fn people_schema() -> Schema {
+    Schema::new(vec![
+        ColumnDef {
+            name: "age".to_string(),
+            kind: ValueKind::Int64,
+        },
+        ColumnDef {
+            name: "name".to_string(),
+            kind: ValueKind::Text,
+        },
+    ])
+}
+
+async fn open_typed_table(dir: &std::path::Path) -> Table {
+    let backend = test_backend(dir);
+    let config = TableConfig::new(backend, test_cipher(), "people", dir.join("table.wal")).with_schema(people_schema());
+    Table::open(config).await.unwrap()
+}
+
+#[tokio::test]
+async fn put_typed_then_get_typed_round_trips_before_any_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())])
+        .await
+        .unwrap();
+    assert_eq!(
+        table.get_typed(b"a").await.unwrap(),
+        Some(vec![Value::Int64(30), Value::Text("alice".into())])
+    );
+}
+
+#[tokio::test]
+async fn put_typed_rejects_a_row_that_does_not_match_the_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    let err = table
+        .put_typed(b"a".to_vec(), vec![Value::Text("wrong shape".into())])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("value"), "got: {err}");
+}
+
+#[tokio::test]
+async fn put_typed_on_a_schema_less_table_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await; // no schema
+    let err = table.put_typed(b"a".to_vec(), vec![Value::Int64(1)]).await.unwrap_err();
+    assert!(err.to_string().contains("schema"), "got: {err}");
+}
+
+#[tokio::test]
+async fn get_typed_on_a_schema_less_table_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    let err = table.get_typed(b"a").await.unwrap_err();
+    assert!(err.to_string().contains("schema"), "got: {err}");
+}
+
+/// The actual point of phase 4: a typed row survives a real flush (through
+/// the columnar block encoder) and reads back correctly through the
+/// ordinary `get_range`-driven path, indistinguishable from the outside.
+#[tokio::test]
+async fn put_typed_survives_a_flush_and_reads_back_via_get_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())])
+        .await
+        .unwrap();
+    table
+        .put_typed(b"b".to_vec(), vec![Value::Int64(25), Value::Text("bob".into())])
+        .await
+        .unwrap();
+    table.flush().await.unwrap();
+
+    assert_eq!(
+        table.get_typed(b"a").await.unwrap(),
+        Some(vec![Value::Int64(30), Value::Text("alice".into())])
+    );
+    assert_eq!(
+        table.get_typed(b"b").await.unwrap(),
+        Some(vec![Value::Int64(25), Value::Text("bob".into())])
+    );
+}
+
+/// A flushed typed block's `column_stats` (fetched exactly the way a real
+/// point lookup would -- via the footer's own `get_range`) must reflect the
+/// actual min/max of what got written, which is the whole reason phase 4
+/// exists: a future range scan can trust these without decoding the block.
+#[tokio::test]
+async fn a_flushed_typed_blocks_column_stats_reflect_its_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let cipher = test_cipher();
+    let config = TableConfig::new(backend.clone(), cipher.clone(), "people", dir.path().join("table.wal"))
+        .with_schema(people_schema());
+    let table = Table::open(config).await.unwrap();
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(30), Value::Text("charlie".into())])
+        .await
+        .unwrap();
+    table
+        .put_typed(b"b".to_vec(), vec![Value::Int64(10), Value::Text("alice".into())])
+        .await
+        .unwrap();
+    table.flush().await.unwrap();
+
+    let (manifest, _) = manifest::load(backend.as_ref(), &cipher, "people").await.unwrap();
+    let entry = &manifest.sstables[0];
+    let footer_offset = entry.byte_len - 8 - entry.footer_len;
+    let sealed_footer = backend
+        .get_range(&entry.key, footer_offset, entry.footer_len)
+        .await
+        .unwrap();
+    let (_, block_index) = sstable::open_footer_bytes(&cipher, &entry.key, &sealed_footer).unwrap();
+    assert_eq!(block_index.len(), 1);
+    let stats = &block_index[0].column_stats;
+    assert_eq!(stats[0].min, Some(Value::Int64(10)));
+    assert_eq!(stats[0].max, Some(Value::Int64(30)));
+    assert_eq!(stats[1].min, Some(Value::Text("alice".into())));
+    assert_eq!(stats[1].max, Some(Value::Text("charlie".into())));
+}
+
+/// A schema-less table's blocks must not suddenly grow stats -- there's no
+/// schema to have per-column stats about.
+#[tokio::test]
+async fn a_schema_less_tables_blocks_have_no_column_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let cipher = test_cipher();
+    let table = open_table(dir.path()).await;
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+
+    let (manifest, _) = manifest::load(backend.as_ref(), &cipher, "audit_log").await.unwrap();
+    let entry = &manifest.sstables[0];
+    let footer_offset = entry.byte_len - 8 - entry.footer_len;
+    let sealed_footer = backend
+        .get_range(&entry.key, footer_offset, entry.footer_len)
+        .await
+        .unwrap();
+    let (_, block_index) = sstable::open_footer_bytes(&cipher, &entry.key, &sealed_footer).unwrap();
+    assert!(block_index[0].column_stats.is_empty());
+}
+
+/// Compaction works the same way on a typed table -- merges through the
+/// columnar codec, not the row-oriented one.
+#[tokio::test]
+async fn compact_works_on_a_typed_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(1), Value::Text("old".into())])
+        .await
+        .unwrap();
+    table.flush().await.unwrap();
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(2), Value::Text("new".into())])
+        .await
+        .unwrap();
+    table.flush().await.unwrap();
+
+    let report = table.compact().await.unwrap();
+    assert_eq!(report.sstables_after, 1);
+    assert_eq!(
+        table.get_typed(b"a").await.unwrap(),
+        Some(vec![Value::Int64(2), Value::Text("new".into())])
+    );
 }

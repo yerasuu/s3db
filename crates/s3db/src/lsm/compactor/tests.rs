@@ -28,7 +28,7 @@ async fn compact_of_zero_or_one_sstable_is_a_no_op() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = (test_backend(dir.path()), test_cipher());
 
-    let report = compact(backend.as_ref(), &cipher, "t", 500).await.unwrap();
+    let report = compact(backend.as_ref(), &cipher, "t", None, 500).await.unwrap();
     assert_eq!(report, CompactionReport::default());
 
     let table = Table::open(TableConfig::new(
@@ -42,7 +42,7 @@ async fn compact_of_zero_or_one_sstable_is_a_no_op() {
     table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
     table.flush().await.unwrap();
 
-    let report = compact(backend.as_ref(), &cipher, "t", 500).await.unwrap();
+    let report = compact(backend.as_ref(), &cipher, "t", None, 500).await.unwrap();
     assert_eq!(report.sstables_before, 1);
     assert_eq!(report.sstables_after, 1);
 }
@@ -67,7 +67,7 @@ async fn compact_merges_several_sstables_into_one_keeping_the_newest_value() {
     table.put(b"c".to_vec(), b"1".to_vec()).await.unwrap();
     table.flush().await.unwrap();
 
-    let report = compact(backend.as_ref(), &cipher, "t", 500).await.unwrap();
+    let report = compact(backend.as_ref(), &cipher, "t", None, 500).await.unwrap();
     assert_eq!(report.sstables_before, 2);
     assert_eq!(report.sstables_after, 1);
     assert_eq!(report.rows_read, 4);
@@ -97,7 +97,7 @@ async fn compact_drops_tombstones_for_keys_fully_covered_by_the_merge() {
     table.delete(b"a".to_vec()).await.unwrap();
     table.flush().await.unwrap();
 
-    let report = compact(backend.as_ref(), &cipher, "t", 500).await.unwrap();
+    let report = compact(backend.as_ref(), &cipher, "t", None, 500).await.unwrap();
     assert_eq!(report.rows_after, 0, "the tombstoned key must not survive the merge");
     assert_eq!(
         report.sstables_after, 0,
@@ -130,7 +130,7 @@ async fn compact_deletes_the_old_sstable_objects() {
     let (before, _) = manifest::load(backend.as_ref(), &cipher, "t").await.unwrap();
     let old_keys: Vec<String> = before.sstables.iter().map(|e| e.key.clone()).collect();
 
-    compact(backend.as_ref(), &cipher, "t", 500).await.unwrap();
+    compact(backend.as_ref(), &cipher, "t", None, 500).await.unwrap();
 
     for key in old_keys {
         let (_, etag) = backend.get(&key).await.unwrap();

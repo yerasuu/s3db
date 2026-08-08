@@ -120,12 +120,25 @@ fragmento de una más grande. Documentado en `crates/s3db/src/lsm/sstable.rs`.
 
 ## Tipos de dato — resueltos por el formato de bloque, no por un enum ad-hoc
 
+> **Implementado** en `crates/s3db/src/lsm/{value,typed_block}.rs`. Un
+> `Table` sin `TableConfig::schema` sigue con bytes opacos
+> (`put`/`get`, formato de fase 1-3 sin cambios); uno con schema usa
+> `put_typed`/`get_typed` y cada bloque que flushea es struct-of-arrays
+> (un `Vec<Option<T>>` por columna) en vez de `Vec<(key, value)>`
+> row-oriented — eso es lo que permite calcular min/max por columna en un
+> solo pase homogéneo. `Array<T>` no columnariza sus elementos (serían
+> repeated fields reales, tipo Parquet — fuera de alcance de la "versión
+> mínima"); se guarda como blob por fila.
+
 Cada `Block` tiene columnas tipadas (mismo principio que Arrow/Parquet,
 versión mínima): `Int64`, `Float64`, `Text`, `Bytes`, `Timestamp`,
 `Bool`, `Array<T>`, y `Json` como escape hatch para schema no declarado.
-Min/max por bloque (ya en `block_index`) habilita poda real de I/O:
-`WHERE age > 30` salta bloques enteros sin leerlos, no solo evita
-deserializar filas que no matchean.
+Min/max por bloque (`BlockIndexEntry::column_stats`, uno por columna,
+`None` para tipos no ordenables o un bloque enteramente tombstoned)
+habilita poda real de I/O: `WHERE age > 30` podría saltar bloques
+enteros sin leerlos, no solo evitar deserializar filas que no matchean
+— el cálculo de stats ya existe, el scan que las consuma para podar es
+trabajo de las fases 5/8.
 
 ## Multi-sitio — routing a nivel de manifest, no de objeto individual
 
@@ -238,7 +251,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 1 ✅ | WAL + memtable + flush a SSTable (sin compactar) | Bootstrap del motor, nada existente |
 | 2 ✅ | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
 | 3 ✅ | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
-| 4 | Formato de bloque columnar tipado + schema declarado | — |
+| 4 ✅ | Formato de bloque columnar tipado + schema declarado | — |
 | 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
 | 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |

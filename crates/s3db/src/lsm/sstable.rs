@@ -20,10 +20,13 @@
 //! different position in the same one — into another without `open`
 //! failing.
 //!
-//! A block's plaintext payload is `rmp_serde`-encoded `Vec<(LsmKey,
-//! MemValue)>` — row-oriented for now (`docs/s3db-fulldb-roadmap.md` phase
-//! 4 replaces this with real per-column arrays; nothing outside this
-//! module's internals needs to change when it does). The footer's
+//! A block's plaintext payload is either `rmp_serde`-encoded `Vec<(LsmKey,
+//! MemValue)>` (row-oriented, for a schema-less table) or a
+//! [`super::typed_block`] columnar body (for a table with a declared
+//! [`super::value::Schema`], `docs/s3db-fulldb-roadmap.md` phase 4) — every
+//! function here that reads or writes a block takes `schema: Option<&Schema>`
+//! and picks the matching format; a [`super::Table`]'s schema is fixed for
+//! its lifetime, so a caller always knows which one to pass. The footer's
 //! plaintext is `[bloom_len: u32 LE][bloom][block_index]`, written once at
 //! the very end so a reader who knows this object's total size and the
 //! footer's sealed length (both recorded in the manifest, phase 2) can
@@ -40,6 +43,8 @@
 use super::LsmKey;
 use super::bloom::Bloom;
 use super::memtable::MemValue;
+use super::typed_block::{self, ColumnStats};
+use super::value::Schema;
 use crate::cipher::{Cipher, CompressionStrategy};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -86,6 +91,14 @@ pub struct BlockIndexEntry {
     pub max_key: LsmKey,
     pub offset: u64,
     pub len: u32,
+    /// One entry per [`Schema`] column, `None`'s min/max for a non-orderable
+    /// kind or an all-tombstone block (see [`super::typed_block::ColumnStats`]).
+    /// Empty for a schema-less table's blocks -- there's no schema to have
+    /// stats per column of. `#[serde(default)]` so a block index encoded
+    /// before this field existed still decodes (as empty, same as
+    /// schema-less), though nothing has published one of those yet.
+    #[serde(default)]
+    pub column_stats: Vec<ColumnStats>,
 }
 
 /// What [`build`] hands back alongside the object bytes — everything a
@@ -109,13 +122,20 @@ pub struct SSTableMeta {
 /// every `rows_per_block` entries into their own encrypted block under
 /// `sstable_key` (the S3 key this object is about to be written to — bound
 /// into every unit's AAD, so it must be decided before calling this, not
-/// after).
+/// after). `schema` selects the block body format -- `Some` columnarizes
+/// each block and fills in its [`BlockIndexEntry::column_stats`] (phase 4);
+/// `None` keeps the row-oriented format phases 1-3 already use. Returns an
+/// error only in the `Some` case, when a row's bytes don't decode as
+/// `Vec<Value>` matching `schema` (see [`typed_block::encode`]) --
+/// `panic`s instead for the invariants a caller controls directly (a
+/// non-empty, already-sorted memtable drain).
 pub fn build(
     cipher: &Cipher,
     sstable_key: &str,
+    schema: Option<&Schema>,
     rows: &BTreeMap<LsmKey, MemValue>,
     rows_per_block: usize,
-) -> (Vec<u8>, SSTableMeta) {
+) -> Result<(Vec<u8>, SSTableMeta)> {
     assert!(
         !rows.is_empty(),
         "build() needs at least one row; caller checks this before flushing"
@@ -134,13 +154,14 @@ pub fn build(
             write_block(
                 cipher,
                 sstable_key,
+                schema,
                 &mut object,
                 &mut block_index,
                 std::mem::take(&mut chunk),
-            );
+            )?;
         }
     }
-    write_block(cipher, sstable_key, &mut object, &mut block_index, chunk); // trailing partial block, if any
+    write_block(cipher, sstable_key, schema, &mut object, &mut block_index, chunk)?; // trailing partial block, if any
 
     let bloom_bytes = bloom.to_bytes();
     let block_index_bytes = rmp_serde::to_vec_named(&block_index).expect("serializing a block index never fails");
@@ -165,23 +186,30 @@ pub fn build(
         footer_len: sealed_footer.len() as u64,
         block_index,
     };
-    (object, meta)
+    Ok((object, meta))
 }
 
 fn write_block(
     cipher: &Cipher,
     sstable_key: &str,
+    schema: Option<&Schema>,
     object: &mut Vec<u8>,
     block_index: &mut Vec<BlockIndexEntry>,
     chunk: Vec<(LsmKey, MemValue)>,
-) {
+) -> Result<()> {
     if chunk.is_empty() {
-        return;
+        return Ok(());
     }
     let block_idx = block_index.len();
     let min_key = chunk.first().expect("checked non-empty above").0.clone();
     let max_key = chunk.last().expect("checked non-empty above").0.clone();
-    let plain = rmp_serde::to_vec_named(&chunk).expect("serializing a block never fails");
+    let (plain, column_stats) = match schema {
+        Some(schema) => typed_block::encode(schema, &chunk)?,
+        None => (
+            rmp_serde::to_vec_named(&chunk).expect("serializing a block never fails"),
+            Vec::new(),
+        ),
+    };
     let sealed = cipher.seal(
         &block_aad(sstable_key, block_idx),
         &plain,
@@ -195,12 +223,21 @@ fn write_block(
         max_key,
         offset,
         len: sealed.len() as u32,
+        column_stats,
     });
+    Ok(())
 }
 
 /// The footer's own parsed (and decrypted) form: the bloom filter and block
 /// index, plus where the footer itself starts (== the byte length of
 /// everything that came before it, i.e. all the sealed blocks).
+///
+/// `bloom`/`block_index` aren't read by [`read_all`], [`open_footer`]'s only
+/// non-test caller -- a full linear scan has no use for either (it reads
+/// every block regardless, in order, needing only `blocks_end` to know
+/// where to stop). This module's own tests do read both, checking that a
+/// full-object open agrees with [`open_footer_bytes`]'s ranged-fetch
+/// equivalent -- kept here rather than duplicated onto a test-only type.
 #[allow(dead_code)]
 pub(crate) struct Footer {
     pub(crate) bloom: Bloom,
@@ -231,7 +268,6 @@ fn parse_footer_plaintext(plain: &[u8]) -> Result<(Bloom, Vec<BlockIndexEntry>)>
 /// [`open_footer_bytes`] directly on that — this function's job is purely
 /// locating the footer within a full object and figuring out `blocks_end`,
 /// which only makes sense when the whole object is in hand.
-#[allow(dead_code)]
 pub(crate) fn open_footer(cipher: &Cipher, sstable_key: &str, object: &[u8]) -> Result<Footer> {
     ensure!(object.len() >= 8, "SSTable object too short to contain a footer length");
     let (body, footer_len_bytes) = object.split_at(object.len() - 8);
@@ -273,27 +309,38 @@ pub(crate) fn open_footer_bytes(
 /// Opens and decodes one block's rows from its raw *sealed* bytes and
 /// index — exactly what a [`BlockIndexEntry`]'s `(offset, len)` locates,
 /// whether those bytes came from a full in-memory object ([`read_all`]) or
-/// a single targeted `get_range` (phase 2's point lookup).
+/// a single targeted `get_range` (phase 2's point lookup). `schema` picks
+/// the plaintext format the same way [`build`] did when it wrote this block
+/// -- must match, or decoding fails (usually as a clear "wrong shape"
+/// error rather than silently wrong data, since a schema mismatch almost
+/// always also mismatches column count/type).
 pub(crate) fn decode_block(
     cipher: &Cipher,
     sstable_key: &str,
+    schema: Option<&Schema>,
     block_idx: usize,
     sealed: &[u8],
 ) -> Result<Vec<(LsmKey, MemValue)>> {
     let plain = cipher
         .open(&block_aad(sstable_key, block_idx), sealed)
         .with_context(|| format!("opening block {block_idx} of {sstable_key}"))?;
-    rmp_serde::from_slice(&plain).context("decoding SSTable block")
+    match schema {
+        Some(schema) => typed_block::decode(schema, &plain),
+        None => rmp_serde::from_slice(&plain).context("decoding SSTable block"),
+    }
 }
 
 /// Every row in a complete SSTable object, in ascending key order — a full
-/// linear scan, no bloom/block-index pruning. Not called from this crate's
-/// own non-test code yet: `Table::get` (phase 2) always prunes via the
-/// bloom filter and block index instead of reading a whole object, so this
-/// path is what the phase-3 compactor will use to merge whole tables, and
-/// what this module's own tests use today to verify a flush round-trips.
-#[allow(dead_code)]
-pub(crate) fn read_all(cipher: &Cipher, sstable_key: &str, object: &[u8]) -> Result<Vec<(LsmKey, MemValue)>> {
+/// linear scan, no bloom/block-index pruning. `Table::get` (phase 2) always
+/// prunes via the bloom filter and block index instead of reading a whole
+/// object; this path is what the phase-3 compactor uses to merge whole
+/// tables, where every row has to be read anyway.
+pub(crate) fn read_all(
+    cipher: &Cipher,
+    sstable_key: &str,
+    schema: Option<&Schema>,
+    object: &[u8],
+) -> Result<Vec<(LsmKey, MemValue)>> {
     let footer = open_footer(cipher, sstable_key, object)?;
     let mut out = Vec::new();
     let mut pos = 0usize;
@@ -309,6 +356,7 @@ pub(crate) fn read_all(cipher: &Cipher, sstable_key: &str, object: &[u8]) -> Res
         out.extend(decode_block(
             cipher,
             sstable_key,
+            schema,
             block_idx,
             &object[sealed_start..sealed_start + sealed_len],
         )?);
