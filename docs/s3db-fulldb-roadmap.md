@@ -131,12 +131,22 @@ paralela.
 
 ## Cifrado: opcional (on por defecto), algoritmo elegible y expansible
 
-Hoy `s3db-crypto::Cipher` es un único algoritmo fijo — `struct
+> **Implementado.** Esta sección se conserva como el diseño acordado; lo
+> que aterrizó difiere en dos detalles que el diseño no había fijado, y
+> ambos están documentados en `crates/s3db/README.md`: el byte de header
+> se reparte en nibbles (algoritmo arriba, compresión abajo) en vez de ser
+> dos bytes, y el campo de nonce queda fijo en 24 bytes para que el header
+> conserve su offset. Además `open` rechaza cruzar los modos (un `Cipher`
+> con cifrado activo no acepta un objeto marcado "sin cifrar", ni al
+> revés) — sin eso, `Disabled` sería un downgrade attack contra cualquier
+> deployment cifrado.
+
+`s3db-crypto::Cipher` era un único algoritmo fijo — `struct
 Cipher(XChaCha20Poly1305)`, sin variantes, cifrado obligatorio sin
 opt-out (herencia de gitquarry, ver disclaimer arriba). Dos cambios sobre
 esa base, reusando el mecanismo que el propio
 `Cipher::seal` ya tiene para esto exacto: el **header byte bound-into-AAD**
-que hoy solo describe compresión (`compression_header`) se generaliza a
+que solo describía compresión (`compression_header`) se generaliza a
 describir también el algoritmo:
 
 ```rust
@@ -216,7 +226,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 4 | Formato de bloque columnar tipado + schema declarado | — |
 | 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
-| 7 | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
+| 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
 | 8 (opcional) | Query builder mínimo sobre 1-5 | — |
 
 **Orden real:** 1 → 2 son bloque mínimo funcional (sin esto no hay motor).

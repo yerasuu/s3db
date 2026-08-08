@@ -46,13 +46,19 @@ let backend: Arc<dyn Backend> = build_backend(&cfg);
 
 ## Encryption
 
-Mandatory, no opt-out. XChaCha20Poly1305 (24-byte nonce), key derived with Argon2id at fixed params (19 MiB / 2 iterations / 1 thread — OWASP's low-memory profile), one random 16-byte salt per bucket.
+On by default. Key derived with Argon2id at fixed params (19 MiB / 2 iterations / 1 thread — OWASP's low-memory profile), one random 16-byte salt per bucket.
 
-`Cipher::seal(aad, plaintext, compression)` / `open(aad, sealed)` bind ciphertext to `aad` as AEAD associated data — every caller passes the object's own S3 key as `aad`, so ciphertext copied onto a different key fails to decrypt. Sealed format: `nonce(24) || compression_header(1) || ciphertext+tag`, header bound into the AAD alongside `aad` so it can't be flipped independently of the ciphertext.
+`EncryptionMode` picks the policy: `Enabled { algorithm }` (the default, `CipherAlgorithm::XChaCha20Poly1305`) or `Disabled`, which takes an explicit opt-out and gives up confidentiality *and* tamper-evidence — with no AEAD tag, a storage provider can rewrite content undetectably. `CipherAlgorithm` is `XChaCha20Poly1305` (24-byte nonce) or `Aes256Gcm` (12-byte).
+
+The two never mix by accident: an encrypting `Cipher` refuses an object marked unencrypted and vice versa, so `Disabled` can't be used to downgrade an encrypted deployment by writing plaintext into its bucket. `bootstrap::get_or_create_cipher_for` refuses `Disabled` outright against a bucket that was bootstrapped encrypted.
+
+`Cipher::seal(aad, plaintext, compression)` / `open(aad, sealed)` bind ciphertext to `aad` as AEAD associated data — every caller passes the object's own S3 key as `aad`, so ciphertext copied onto a different key fails to decrypt. Sealed format: `nonce(24) || header(1) || ciphertext+tag`, header bound into the AAD alongside `aad` so it can't be flipped independently of the ciphertext. The header's high nibble is the algorithm (or "unencrypted"), the low nibble the compression — so each object records what sealed it, and a `Cipher` opens objects sealed by any algorithm regardless of which one it writes with. Changing the algorithm therefore affects new writes only, never forcing a re-seal; and because the default algorithm's nibble is zero, objects written before the header carried an algorithm at all are still valid input.
+
+The nonce field is a fixed 24 bytes whichever algorithm sealed the object (AES-256-GCM uses the first 12 and ignores the rest) — the header that names the algorithm sits right after it, so a variable-length nonce would mean needing the algorithm to find the byte that tells you the algorithm.
 
 `compression: CompressionStrategy` is `None` (this crate's own default — see `payload::MAX_OBJECT_BYTES`, small uniform objects rarely compress worth the CPU) or `Auto { threshold_bytes }` (zstd above that size, falling back to raw if compression doesn't actually shrink the input). `seal_stream`/`open_stream` (below) deliberately don't compress at all — what goes through them is already-compressed git pack data, a second pass buys nothing.
 
-Streaming variants (`seal_stream`/`open_stream`, for `put_stream`/`get_stream`-sized payloads) chunk at 4 MiB, each chunk's AAD binding the base `aad`, the declared total length, and the chunk index — reordering, truncating, or duplicating chunks is detectable.
+Streaming variants (`seal_stream`/`open_stream`, for `put_stream`/`get_stream`-sized payloads) chunk at 4 MiB, each chunk's AAD binding the base `aad`, the declared total length, and the chunk index — reordering, truncating, or duplicating chunks is detectable. Its 8-byte magic carries the algorithm in its last byte (the chunk framing has nowhere else to put one), so streams get the same per-object dispatch as small objects.
 
 ```rust
 let cipher = s3db::bootstrap::get_or_create_cipher(backend.as_ref(), &passphrase).await?;
