@@ -101,6 +101,26 @@ un task en background dentro del crate.
   con la query — ya están ordenados por construcción, es un scan
   contiguo real, no N gets.
 
+> **Implementado** (fase 5) en `crates/s3db/src/lsm/table.rs`
+> (`Table::scan`/`scan_typed`) y `crates/s3db/src/lsm/secondary_index.rs`
+> (`SecondaryLsmIndex`). `Table::scan(start, end)` mergea el memtable con
+> cada SSTable cuyo `[min_key, max_key]` (del manifest) se solapa con el
+> rango pedido, y dentro de cada SSTable solo trae (`get_range`) los
+> bloques cuyo propio `min_key`/`max_key` (del `block_index`) también se
+> solapan — nunca el objeto entero, mismo criterio que ya usaba el point
+> lookup de fase 2. `SecondaryLsmIndex` es un segundo `Table` ordinario
+> cuya key es `secondary || 0x00 || primary` (sin guardar valor: un hit
+> solo necesita el `primary` para ir a buscarlo a la tabla real).
+> `lookup(secondary)` (igualdad exacta) usa como límite superior
+> `prefix_successor(secondary || 0x00)` — el separador tiene que estar
+> incluido en el prefijo antes de calcular el sucesor, si no una
+> `secondary` más larga que por casualidad empieza con los mismos bytes
+> (`"abc"` buscando `"ab"`) se colaría en el rango. `scan(start, end)`
+> (rango genuino sobre el campo secundario) en cambio compara los bounds
+> tal cual, sin separador — misma prueba que `SecondaryIndex::segment_prefix`
+> (`crates/s3db/src/index.rs`) ya usa: extender un string nunca lo hace
+> ordenar antes que el string que extiende.
+
 **Cambio de trait necesario — implementado.** `Backend::get_range(key,
 offset, len) -> Result<Vec<u8>>` ya está en los 5 drivers (`Range` header
 en S3/R2/GCS/Azure, `seek`+`read_exact` en `Files`, slice en memoria en
@@ -252,7 +272,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 2 ✅ | Manifest CAS + lectura (bloom + block index + `get_range`) | — |
 | 3 ✅ | Compactor (merge + purga de tombstones) | `gc.rs`/`maintenance.rs`, para tablas LSM |
 | 4 ✅ | Formato de bloque columnar tipado + schema declarado | — |
-| 5 | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
+| 5 ✅ | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
 | 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
 | 8 (opcional) | Query builder mínimo sobre 1-5 | — |

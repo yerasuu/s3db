@@ -517,3 +517,125 @@ async fn compact_works_on_a_typed_table() {
         Some(vec![Value::Int64(2), Value::Text("new".into())])
     );
 }
+
+fn scan_keys(rows: &[(LsmKey, Vec<u8>)]) -> Vec<&[u8]> {
+    rows.iter().map(|(k, _)| k.as_slice()).collect()
+}
+
+#[tokio::test]
+async fn scan_with_both_bounds_is_start_inclusive_end_exclusive_before_any_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    for key in [b"a", b"b", b"c", b"d"] {
+        table.put(key.to_vec(), key.to_vec()).await.unwrap();
+    }
+    let found = table.scan(Some(b"b"), Some(b"d")).await.unwrap();
+    assert_eq!(scan_keys(&found), vec![b"b".as_slice(), b"c".as_slice()]);
+}
+
+#[tokio::test]
+async fn scan_with_no_bounds_returns_everything_unflushed_and_flushed() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+    table.put(b"b".to_vec(), b"2".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+    table.put(b"c".to_vec(), b"3".to_vec()).await.unwrap(); // still unflushed
+
+    let found = table.scan(None, None).await.unwrap();
+    assert_eq!(
+        scan_keys(&found),
+        vec![b"a".as_slice(), b"b".as_slice(), b"c".as_slice()]
+    );
+}
+
+/// The memtable must win over an older flushed value for the same key, just
+/// like `get` -- scan merges the same way, just over a range.
+#[tokio::test]
+async fn scan_prefers_the_unflushed_value_over_an_older_flushed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    table.put(b"a".to_vec(), b"old".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+    table.put(b"a".to_vec(), b"new".to_vec()).await.unwrap();
+
+    let found = table.scan(None, None).await.unwrap();
+    assert_eq!(found, vec![(b"a".to_vec(), b"new".to_vec())]);
+}
+
+/// An unflushed tombstone must drop a key from the scan entirely, not just
+/// leave its old flushed value in place.
+#[tokio::test]
+async fn scan_excludes_a_key_deleted_after_its_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+    table.put(b"b".to_vec(), b"2".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+    table.delete(b"a".to_vec()).await.unwrap();
+
+    let found = table.scan(None, None).await.unwrap();
+    assert_eq!(found, vec![(b"b".to_vec(), b"2".to_vec())]);
+}
+
+/// Exercises the real multi-block, multi-SSTable path: a range that spans
+/// several blocks within one SSTable, plus a second SSTable entirely outside
+/// the requested range that must contribute nothing.
+#[tokio::test]
+async fn scan_finds_rows_across_many_blocks_and_skips_sstables_outside_the_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let config =
+        TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("table.wal")).with_rows_per_block(3);
+    let table = Table::open(config).await.unwrap();
+
+    for i in 0..30u32 {
+        table
+            .put(format!("k{i:03}").into_bytes(), format!("v{i}").into_bytes())
+            .await
+            .unwrap();
+    }
+    table.flush().await.unwrap();
+
+    // A second SSTable entirely outside the range below -- must be skipped.
+    table.put(b"z-outside".to_vec(), b"nope".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+
+    let found = table.scan(Some(b"k010"), Some(b"k015")).await.unwrap();
+    let expected: Vec<_> = (10..15u32)
+        .map(|i| (format!("k{i:03}").into_bytes(), format!("v{i}").into_bytes()))
+        .collect();
+    assert_eq!(found, expected);
+}
+
+#[tokio::test]
+async fn scan_typed_on_a_schema_less_table_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    let err = table.scan_typed(None, None).await.unwrap_err();
+    assert!(err.to_string().contains("schema"), "got: {err}");
+}
+
+#[tokio::test]
+async fn scan_typed_decodes_rows_across_memtable_and_a_flushed_sstable() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())])
+        .await
+        .unwrap();
+    table.flush().await.unwrap();
+    table
+        .put_typed(b"b".to_vec(), vec![Value::Int64(25), Value::Text("bob".into())])
+        .await
+        .unwrap();
+
+    let found = table.scan_typed(None, None).await.unwrap();
+    assert_eq!(
+        found,
+        vec![
+            (b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())]),
+            (b"b".to_vec(), vec![Value::Int64(25), Value::Text("bob".into())]),
+        ]
+    );
+}

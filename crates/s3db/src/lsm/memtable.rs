@@ -79,6 +79,26 @@ impl Memtable {
         self.approx_bytes = 0;
         std::mem::take(&mut self.entries)
     }
+
+    /// Every entry with `start <= key < end` (either bound `None` for
+    /// unbounded), ascending -- the memtable's own contribution to
+    /// [`super::Table::scan`], always the freshest since anything in here
+    /// hasn't been flushed yet.
+    pub fn range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<(LsmKey, MemValue)> {
+        use std::ops::Bound;
+        let start = match start {
+            Some(s) => Bound::Included(s.to_vec()),
+            None => Bound::Unbounded,
+        };
+        let end = match end {
+            Some(e) => Bound::Excluded(e.to_vec()),
+            None => Bound::Unbounded,
+        };
+        self.entries
+            .range((start, end))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

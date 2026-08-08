@@ -15,6 +15,7 @@ use super::{LsmKey, Memtable, Wal, sstable};
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -227,6 +228,75 @@ impl Table {
         Ok(None)
     }
 
+    /// Every live row with `start <= key < end` (either bound `None` for
+    /// unbounded), merged from the memtable and every overlapping SSTable —
+    /// `docs/s3db-fulldb-roadmap.md` phase 5's range scan: SSTables outside
+    /// `[start, end)` entirely are skipped via their manifest-recorded
+    /// `min_key`/`max_key` without a single request, and *within* an
+    /// overlapping SSTable only the blocks that could contain a matching
+    /// key are fetched (via `get_range`, per block's own `min_key`/`max_key`
+    /// in its `block_index` entry) -- never the whole object, same
+    /// discipline [`Self::get`]'s point lookup already applies.
+    ///
+    /// Merge order is oldest SSTable to newest, then the memtable last (so
+    /// it always wins) -- the same rule [`crate::lsm::compactor`] uses,
+    /// just scoped to a key range and read-only.
+    pub async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(LsmKey, Vec<u8>)>> {
+        let mut merged: BTreeMap<LsmKey, MemValue> = BTreeMap::new();
+
+        let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
+        for entry in &manifest.sstables {
+            if let Some(end) = end
+                && entry.min_key.as_slice() >= end
+            {
+                continue; // this whole SSTable starts at or after the range
+            }
+            if let Some(start) = start
+                && entry.max_key.as_slice() < start
+            {
+                continue; // this whole SSTable ends before the range
+            }
+            let rows = scan_sstable(
+                self.backend.as_ref(),
+                &self.cipher,
+                self.schema.as_ref(),
+                entry,
+                start,
+                end,
+            )
+            .await?;
+            merged.extend(rows);
+        }
+
+        // The memtable is always freshest -- applied last so it overrides
+        // whatever any SSTable had for the same key, tombstones included.
+        for (key, value) in self.state.lock().await.memtable.range(start, end) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged
+            .into_iter()
+            .filter_map(|(key, value)| mem_value_to_get_result(value).map(|bytes| (key, bytes)))
+            .collect())
+    }
+
+    /// [`Self::scan`] for a table with a declared [`TableConfig::schema`],
+    /// decoding each row the same way [`Self::get_typed`] does.
+    pub async fn scan_typed(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(LsmKey, Vec<Value>)>> {
+        anyhow::ensure!(
+            self.schema.is_some(),
+            "scan_typed needs a schema (see TableConfig::with_schema)"
+        );
+        self.scan(start, end)
+            .await?
+            .into_iter()
+            .map(|(key, bytes)| {
+                let row = rmp_serde::from_slice(&bytes).context("decoding a typed row")?;
+                Ok((key, row))
+            })
+            .collect()
+    }
+
     pub async fn should_flush(&self) -> bool {
         self.state.lock().await.memtable.approx_bytes() >= self.flush_threshold_bytes
     }
@@ -384,6 +454,53 @@ async fn lookup_in_sstable(
         .with_context(|| format!("fetching block {block_idx} of {}", entry.key))?;
     let rows = sstable::decode_block(cipher, &entry.key, schema, block_idx, &sealed_block)?;
     Ok(rows.into_iter().find(|(k, _)| k.as_slice() == key).map(|(_, v)| v))
+}
+
+/// [`Self::scan`]'s per-SSTable half: fetches the footer (one `get_range`,
+/// same as [`lookup_in_sstable`]), then fetches and decodes only the blocks
+/// whose `[min_key, max_key]` could contain something in `[start, end)` --
+/// blocks are non-overlapping and sorted (see `sstable`'s module doc), so
+/// this is a contiguous run, found and walked without ever touching a block
+/// outside it.
+async fn scan_sstable(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    schema: Option<&Schema>,
+    entry: &ManifestEntry,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> Result<Vec<(LsmKey, MemValue)>> {
+    let footer_offset = entry.byte_len - 8 - entry.footer_len;
+    let sealed_footer = backend
+        .get_range(&entry.key, footer_offset, entry.footer_len)
+        .await
+        .with_context(|| format!("fetching footer of {}", entry.key))?;
+    let (_, block_index) = sstable::open_footer_bytes(cipher, &entry.key, &sealed_footer)?;
+
+    // First block that could hold anything >= start: the first whose
+    // max_key doesn't sort strictly before start.
+    let first_idx = match start {
+        Some(start) => block_index.partition_point(|b| b.max_key.as_slice() < start),
+        None => 0,
+    };
+
+    let mut rows = Vec::new();
+    for (block_idx, block) in block_index.iter().enumerate().skip(first_idx) {
+        if let Some(end) = end
+            && block.min_key.as_slice() >= end
+        {
+            break; // this and every later block start at or after `end` -- nothing further overlaps
+        }
+        let sealed_block = backend
+            .get_range(&entry.key, block.offset, block.len as u64)
+            .await
+            .with_context(|| format!("fetching block {block_idx} of {}", entry.key))?;
+        let decoded = sstable::decode_block(cipher, &entry.key, schema, block_idx, &sealed_block)?;
+        rows.extend(decoded.into_iter().filter(|(key, _)| {
+            start.is_none_or(|start| key.as_slice() >= start) && end.is_none_or(|end| key.as_slice() < end)
+        }));
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]

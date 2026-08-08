@@ -60,3 +60,55 @@ fn rewriting_the_same_key_does_not_double_count_toward_approx_bytes() {
     assert_eq!(m.approx_bytes(), 3 + 2);
     assert_eq!(m.len(), 1);
 }
+
+fn keys_of(entries: &[(LsmKey, MemValue)]) -> Vec<&[u8]> {
+    entries.iter().map(|(k, _)| k.as_slice()).collect()
+}
+
+#[test]
+fn range_with_both_bounds_is_start_inclusive_end_exclusive() {
+    let mut m = Memtable::default();
+    for key in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()] {
+        m.put(key.clone(), key);
+    }
+    let found = m.range(Some(b"b"), Some(b"d"));
+    assert_eq!(keys_of(&found), vec![b"b".as_slice(), b"c".as_slice()]);
+}
+
+#[test]
+fn range_with_no_start_bound_includes_everything_up_to_end() {
+    let mut m = Memtable::default();
+    for key in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
+        m.put(key.clone(), key);
+    }
+    let found = m.range(None, Some(b"c"));
+    assert_eq!(keys_of(&found), vec![b"a".as_slice(), b"b".as_slice()]);
+}
+
+#[test]
+fn range_with_no_end_bound_includes_everything_from_start() {
+    let mut m = Memtable::default();
+    for key in [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()] {
+        m.put(key.clone(), key);
+    }
+    let found = m.range(Some(b"b"), None);
+    assert_eq!(keys_of(&found), vec![b"b".as_slice(), b"c".as_slice()]);
+}
+
+#[test]
+fn range_with_no_bounds_at_all_returns_everything() {
+    let mut m = Memtable::default();
+    for key in [b"a".to_vec(), b"b".to_vec()] {
+        m.put(key.clone(), key);
+    }
+    assert_eq!(m.range(None, None).len(), 2);
+}
+
+#[test]
+fn range_includes_tombstones() {
+    let mut m = Memtable::default();
+    m.put(b"a".to_vec(), b"1".to_vec());
+    m.delete(b"a".to_vec());
+    let found = m.range(None, None);
+    assert_eq!(found, vec![(b"a".to_vec(), MemValue::Tombstone)]);
+}

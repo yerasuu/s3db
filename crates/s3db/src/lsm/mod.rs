@@ -17,10 +17,15 @@
 //! [`crate::backend::Backend::get_range`] reads instead of ever fetching a
 //! whole SSTable object), [`compactor`] (merges every SSTable into one,
 //! purging tombstones, so read amplification doesn't grow unbounded with
-//! flush count), and [`value`]/[`typed_block`] (a table declared with a
+//! flush count), [`value`]/[`typed_block`] (a table declared with a
 //! [`value::Schema`] stores real typed, columnar blocks instead of opaque
-//! bytes, with per-column min/max stats a future range scan or query
-//! builder — phases 5, 8 — can use to skip whole blocks).
+//! bytes, with per-column min/max stats a future query builder — phase 8 —
+//! can use to skip whole blocks), [`Table::scan`] (a range over the primary
+//! key, merging the memtable with every overlapping SSTable, skipping
+//! non-overlapping SSTables and blocks via the same manifest/block-index
+//! metadata [`Table::get`] already uses), and [`SecondaryLsmIndex`] (a
+//! second ordered [`Table`] for finding rows by a non-primary field —
+//! phase 5's other half).
 //!
 //! A row is opaque bytes in, opaque bytes out ([`Table::put`]/[`Table::get`])
 //! *unless* a table declares a [`value::Schema`] ([`TableConfig::schema`]),
@@ -32,6 +37,7 @@ mod bloom;
 pub mod compactor;
 pub mod manifest;
 mod memtable;
+mod secondary_index;
 pub mod sstable;
 mod table;
 mod typed_block;
@@ -41,6 +47,7 @@ mod wal;
 pub use compactor::{CompactionReport, compact, should_compact};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
+pub use secondary_index::SecondaryLsmIndex;
 pub use table::{FlushedSSTable, Table, TableConfig};
 pub use typed_block::ColumnStats;
 pub use value::{ColumnDef, Schema, Value, ValueKind};
