@@ -85,6 +85,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Backend for AlwaysFailsBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         async fn get(&self, _key: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
             anyhow::bail!("simulated unreachable backend")
         }

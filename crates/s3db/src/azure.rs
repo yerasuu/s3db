@@ -111,6 +111,10 @@ fn is_precondition_failed(err: &AzureError) -> bool {
 
 #[async_trait::async_trait]
 impl Backend for AzureBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         match self.blob(key).await?.download(None).await {
             Ok(result) => {

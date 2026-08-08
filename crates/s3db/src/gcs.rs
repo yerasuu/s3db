@@ -91,6 +91,10 @@ fn status_code(err: &google_cloud_gax::error::Error) -> Option<u16> {
 
 #[async_trait::async_trait]
 impl Backend for GcsBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let (storage, _) = self.client_pair().await?;
         let mut resp = match storage.read_object(self.bucket_resource(), key).send().await {

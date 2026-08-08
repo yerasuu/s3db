@@ -18,6 +18,7 @@
 //! directly, so swapping drivers ([`build_backend`]) changes nothing above
 //! this line.
 
+pub mod atomic;
 pub mod backend;
 pub mod backup;
 pub mod batch_loader;
@@ -47,6 +48,7 @@ mod gcs;
 mod local;
 mod s3;
 
+pub use atomic::{AtomicBackend, BatchOp, BatchOutcome};
 pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
 pub use backup::{BackupConsistency, BackupManifest};
 pub use batch_loader::{BatchLoader, MemoryBudget};

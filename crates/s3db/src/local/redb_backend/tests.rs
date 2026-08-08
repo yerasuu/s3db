@@ -1,4 +1,5 @@
 use super::*;
+use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome};
 use crate::config::LocalEngine;
 
 fn backend(root: &std::path::Path) -> RedbBackend {
@@ -204,4 +205,93 @@ async fn get_stream_errors_on_a_missing_key() {
     let dest_dir = tempfile::tempdir().unwrap();
     let dest = dest_dir.path().join("dest");
     assert!(backend(dir.path()).get_stream("nope", &dest).await.is_err());
+}
+
+#[tokio::test]
+async fn commit_batch_applies_creates_updates_and_deletes_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    b.put_cas("to_update", b"old".to_vec(), None).await.unwrap();
+    b.put_cas("to_delete", b"gone soon".to_vec(), None).await.unwrap();
+    let (_, update_etag) = b.get("to_update").await.unwrap();
+
+    let outcome = b
+        .commit_batch(vec![
+            BatchOp::Put {
+                key: "to_create".to_string(),
+                body: b"new".to_vec(),
+                expected_etag: None,
+            },
+            BatchOp::Put {
+                key: "to_update".to_string(),
+                body: b"updated".to_vec(),
+                expected_etag: update_etag,
+            },
+            BatchOp::Delete {
+                key: "to_delete".to_string(),
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, BatchOutcome::Applied);
+    assert_eq!(b.get("to_create").await.unwrap().0, b"new");
+    assert_eq!(b.get("to_update").await.unwrap().0, b"updated");
+    assert!(b.get("to_delete").await.unwrap().1.is_none());
+}
+
+/// The core guarantee: one bad condition sinks the whole batch, including
+/// ops whose own condition would have been satisfied on their own.
+#[tokio::test]
+async fn commit_batch_applies_nothing_if_any_put_condition_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    b.put_cas("existing", b"v1".to_vec(), None).await.unwrap();
+
+    let outcome = b
+        .commit_batch(vec![
+            BatchOp::Put {
+                key: "fresh".to_string(),
+                body: b"would succeed alone".to_vec(),
+                expected_etag: None, // condition holds on its own
+            },
+            BatchOp::Put {
+                key: "existing".to_string(),
+                body: b"v2".to_vec(),
+                expected_etag: Some("stale".to_string()), // condition fails
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, BatchOutcome::Conflict);
+    assert!(
+        b.get("fresh").await.unwrap().1.is_none(),
+        "a satisfiable op must not have landed once a sibling op's condition failed"
+    );
+    assert_eq!(b.get("existing").await.unwrap().0, b"v1");
+}
+
+#[tokio::test]
+async fn commit_batch_of_only_creates_matches_bulk_load_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let outcome = b
+        .commit_batch(vec![
+            BatchOp::Put {
+                key: "a".to_string(),
+                body: b"1".to_vec(),
+                expected_etag: None,
+            },
+            BatchOp::Put {
+                key: "b".to_string(),
+                body: b"2".to_vec(),
+                expected_etag: None,
+            },
+        ])
+        .await
+        .unwrap();
+    assert_eq!(outcome, BatchOutcome::Applied);
+    assert_eq!(b.get("a").await.unwrap().0, b"1");
+    assert_eq!(b.get("b").await.unwrap().0, b"2");
 }

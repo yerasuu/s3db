@@ -3,16 +3,29 @@
 //! surviving a process crash mid-transaction.
 //!
 //! Deliberately narrow: every op's `expected_etag` is implicitly `None` (no
-//! updates in this version). That's what makes the rest of this module
-//! simple -- because every write is a create, the target object *is* its own
-//! lock: whoever's `put_cas` lands first owns that key, permanently, with no
-//! window for someone else to later steal it out from under a live holder.
-//! There's no staleness/liveness protocol here (unlike, say, a lock that can
-//! be released and re-acquired) because none is needed; that complexity only
-//! shows up once updates are in scope, which they explicitly aren't.
+//! updates in this version). That's what makes the CAS-sequential protocol
+//! below simple -- because every write is a create, the target object *is*
+//! its own lock: whoever's `put_cas` lands first owns that key, permanently,
+//! with no window for someone else to later steal it out from under a live
+//! holder. There's no staleness/liveness protocol here (unlike, say, a lock
+//! that can be released and re-acquired) because none is needed; that
+//! complexity only shows up once updates are in scope.
+//!
+//! That protocol is a real transaction only in the sense that it recovers
+//! from a crash partway through — durable record, sweep, rollback. On a
+//! backend with a native transaction (see [`crate::atomic::AtomicBackend`],
+//! today only [`crate::local::RedbBackend`]), none of that machinery is
+//! needed at all: [`as_atomic`] detects the capability and [`run`]/
+//! [`run_with_publisher`] commit the whole batch as one real transaction
+//! instead, skipping the durable record, the crash-recovery sweep, and the
+//! whole `.conf/txn/` bookkeeping trail. `TxnOp` itself stays create-only
+//! either way — a caller that specifically wants an atomic *update* batch
+//! calls [`crate::atomic::AtomicBackend::commit_batch`] directly.
 
+use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome};
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
+use crate::local::LocalBackend;
 use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -126,6 +139,64 @@ fn random_txn_id() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Downcasts `backend` to a concrete type known to implement
+/// [`AtomicBackend`] — currently only [`LocalBackend::Redb`]. A `dyn
+/// Backend` can't be downcast straight to a trait object of a *different*
+/// trait, so this has to name every concrete type that might implement
+/// [`AtomicBackend`] explicitly; today there's exactly one.
+///
+/// Detection is on the concrete type at the top of the `Arc<dyn Backend>`,
+/// not on what it might wrap — a `RedbBackend` behind
+/// [`crate::cache::CachedBackend`] or another decorator won't be found here,
+/// since the decorator itself is what `as_any` returns. That's an accepted
+/// limitation, not a bug: nothing in this crate currently wraps `Local` in a
+/// decorator before handing it to [`run`].
+fn as_atomic(backend: &dyn Backend) -> Option<&dyn AtomicBackend> {
+    match backend.as_any().downcast_ref::<LocalBackend>()? {
+        LocalBackend::Redb(inner) => Some(inner),
+        LocalBackend::Files(_) => None,
+    }
+}
+
+/// The [`AtomicBackend`] fast path for [`run_with_publisher`] — one real
+/// commit, no durable record, no rollback bookkeeping, because the backend
+/// itself already gives all-or-nothing.
+async fn run_atomic(
+    atomic: &dyn AtomicBackend,
+    cipher: &Cipher,
+    ops: Vec<TxnOp>,
+    publisher: &dyn ChangePublisher,
+) -> Result<Cas> {
+    let mut batch = Vec::with_capacity(ops.len());
+    for op in &ops {
+        // Same wire format as the CAS-sequential path below and as
+        // `payload::put_json` -- a `Collection`/entity reads this back
+        // through `get_json`/`Collection::get` either way, so the two
+        // protocols must produce byte-identical objects.
+        let plain = rmp_serde::to_vec_named(&op.value)?;
+        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
+        batch.push(BatchOp::Put {
+            key: op.key.clone(),
+            body: sealed,
+            expected_etag: None, // TxnOp is create-only; see the module doc.
+        });
+    }
+    match atomic.commit_batch(batch).await? {
+        BatchOutcome::Applied => {
+            for op in ops {
+                publisher
+                    .published(ChangeEvent {
+                        key: op.key,
+                        value: op.value,
+                    })
+                    .await;
+            }
+            Ok(Cas::Ok)
+        }
+        BatchOutcome::Conflict => Ok(Cas::Conflict),
+    }
+}
+
 /// Applies `ops` atomically: every key ends up created, or none do.
 pub async fn run(backend: &dyn Backend, cipher: &Cipher, ops: Vec<TxnOp>) -> Result<Cas> {
     run_with_publisher(backend, cipher, ops, &NoopChangePublisher).await
@@ -148,10 +219,18 @@ pub async fn run_with_publisher(
     mut ops: Vec<TxnOp>,
     publisher: &dyn ChangePublisher,
 ) -> Result<Cas> {
+    // A native transaction makes everything below unnecessary -- see
+    // `as_atomic`'s doc for exactly which backends this applies to.
+    if let Some(atomic) = as_atomic(backend) {
+        return run_atomic(atomic, cipher, ops, publisher).await;
+    }
+
     // Sorting first means any two transactions racing over an overlapping
     // key set always hit their first shared key in the same order -- one of
     // them deterministically loses there, so there's never a cycle where
-    // each is waiting on a key the other already grabbed.
+    // each is waiting on a key the other already grabbed. Only needed for
+    // the CAS-sequential protocol below; `run_atomic`'s single transaction
+    // has no such ordering hazard.
     ops.sort_by(|a, b| a.key.cmp(&b.key));
 
     let txn_id = random_txn_id()?;
@@ -307,9 +386,16 @@ mod tests {
     use crate::local::LocalBackend;
 
     fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
+        test_backend_and_cipher_with(root, crate::config::LocalEngine::Files)
+    }
+
+    fn test_backend_and_cipher_with(
+        root: &std::path::Path,
+        engine: crate::config::LocalEngine,
+    ) -> (LocalBackend, Cipher) {
         let backend = LocalBackend::new(&crate::config::LocalParams {
             bucket: root.to_string_lossy().to_string(),
-            engine: crate::config::LocalEngine::Files,
+            engine,
         });
         let cipher = Cipher::derive("test passphrase", &[11u8; crate::cipher::SALT_LEN]).unwrap();
         (backend, cipher)
@@ -508,5 +594,98 @@ mod tests {
             "the loser's non-conflicting op must have been rolled back too"
         );
         assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn as_atomic_finds_it_only_on_the_redb_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, _) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Files);
+        assert!(as_atomic(&files).is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let (redb, _) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        assert!(as_atomic(&redb).is_some());
+    }
+
+    /// Same observable behavior as `happy_path_creates_all_keys_and_no_leftover_record`,
+    /// but on the engine that takes the `run_atomic` fast path instead of the
+    /// CAS-sequential one -- pins down that switching protocols under the
+    /// hood doesn't change what a caller of `run` sees.
+    #[tokio::test]
+    async fn happy_path_on_redb_creates_all_keys_via_the_atomic_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+        ];
+        assert_eq!(run(&backend, &cipher, ops).await.unwrap(), Cas::Ok);
+        for (key, expected) in [("a.json", 1), ("b.json", 2)] {
+            let (value, etag) = get_json::<Widget>(&backend, key, &cipher).await.unwrap();
+            assert_eq!(value.count, expected);
+            assert!(etag.is_some());
+        }
+        // No durable record trail at all -- the atomic path never wrote one.
+        assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    }
+
+    /// On the CAS-sequential path a losing transaction can create, then roll
+    /// back, its earlier keys before hitting the conflict. The atomic path
+    /// has no such window: the whole batch is checked before anything is
+    /// written, so a conflicting op means literally nothing in the batch
+    /// ever touched the table.
+    #[tokio::test]
+    async fn conflicting_op_on_redb_applies_nothing_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        put_json(&backend, "b.json", &Widget { count: 99 }, None, &cipher)
+            .await
+            .unwrap();
+
+        let ops = vec![
+            TxnOp::create("a.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
+        ];
+        assert_eq!(run(&backend, &cipher, ops).await.unwrap(), Cas::Conflict);
+
+        let (_, a_etag) = get_json::<Widget>(&backend, "a.json", &cipher).await.unwrap();
+        assert!(a_etag.is_none(), "a.json must never have been written at all");
+        let (b, _) = get_json::<Widget>(&backend, "b.json", &cipher).await.unwrap();
+        assert_eq!(b.count, 99, "b.json's original content must be untouched");
+    }
+
+    #[tokio::test]
+    async fn two_overlapping_transactions_on_redb_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backend, cipher) = test_backend_and_cipher_with(dir.path(), crate::config::LocalEngine::Redb);
+        let ops_a = vec![
+            TxnOp::create("shared.json".to_string(), &Widget { count: 1 }).unwrap(),
+            TxnOp::create("only_a.json".to_string(), &Widget { count: 10 }).unwrap(),
+        ];
+        let ops_b = vec![
+            TxnOp::create("shared.json".to_string(), &Widget { count: 2 }).unwrap(),
+            TxnOp::create("only_b.json".to_string(), &Widget { count: 20 }).unwrap(),
+        ];
+
+        assert_eq!(run(&backend, &cipher, ops_a).await.unwrap(), Cas::Ok);
+        assert_eq!(run(&backend, &cipher, ops_b).await.unwrap(), Cas::Conflict);
+
+        let (shared, _) = get_json::<Widget>(&backend, "shared.json", &cipher).await.unwrap();
+        assert_eq!(shared.count, 1);
+        assert!(
+            get_json::<Widget>(&backend, "only_a.json", &cipher)
+                .await
+                .unwrap()
+                .1
+                .is_some()
+        );
+        assert!(
+            get_json::<Widget>(&backend, "only_b.json", &cipher)
+                .await
+                .unwrap()
+                .1
+                .is_none(),
+            "the loser's non-conflicting op must not have landed either"
+        );
     }
 }

@@ -40,6 +40,10 @@ impl RequestCache {
 
 #[async_trait::async_trait]
 impl Backend for RequestCache {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<CachedGet> {
         if let Some(hit) = self.reads.lock().unwrap().get(key) {
             return Ok(hit.clone());
@@ -119,6 +123,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Backend for CountingBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.get(key).await

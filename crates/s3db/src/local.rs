@@ -57,6 +57,10 @@ impl LocalBackend {
 
 #[async_trait::async_trait]
 impl Backend for LocalBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         self.inner().get(key).await
     }

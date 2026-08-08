@@ -50,7 +50,7 @@ impl DeleteOutcome {
 /// presign, multipart, byte-range, versioning, or ACLs anywhere in the
 /// tree).
 #[async_trait::async_trait]
-pub trait Backend: Send + Sync + std::fmt::Debug {
+pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// Raw body + an opaque version token ("etag"), or empty bytes and
     /// `None` if `key` doesn't exist yet.
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)>;
@@ -109,6 +109,15 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     async fn get_stream(&self, _key: &str, _dest: &Path) -> Result<()> {
         bail!("streaming is disabled (enable s3db's `streaming` cargo feature)")
     }
+
+    /// Lets a caller downcast `&dyn Backend` back to its concrete type to
+    /// check for a capability beyond this trait's minimal surface (see
+    /// `crate::atomic::AtomicBackend`). No default body: the unsizing
+    /// coercion from `&Self` to `&dyn Any` needs a concrete, sized `Self` at
+    /// the call site, which a trait's default method body -- compiled once,
+    /// generically, for every implementor at once -- can't give it. Every
+    /// implementor's body is the same one line, `self`.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Builds the right [`Backend`] for `cfg` — the single place that turns

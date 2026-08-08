@@ -110,6 +110,10 @@ impl MeteredBackend {
 
 #[async_trait::async_trait]
 impl Backend for MeteredBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let result = self.inner.get(key).await;
         self.record("get", &result);
@@ -216,6 +220,10 @@ impl RetryBackend {
 
 #[async_trait::async_trait]
 impl Backend for RetryBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         self.run(|| self.inner.get(key)).await
     }
@@ -373,6 +381,10 @@ impl ThrottledBackend {
 
 #[async_trait::async_trait]
 impl Backend for ThrottledBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         self.guarded(&self.get_permits, self.inner.get(key)).await
     }
@@ -429,6 +441,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Backend for FlakyBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
             if self.fail_next.load(Ordering::SeqCst) > 0 {
                 self.fail_next.fetch_sub(1, Ordering::SeqCst);

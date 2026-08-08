@@ -109,6 +109,10 @@ impl S3Backend {
 
 #[async_trait::async_trait]
 impl Backend for S3Backend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let resp = self.client.get_object().bucket(&self.bucket).key(key).send().await;
         match resp {

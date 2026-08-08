@@ -15,7 +15,15 @@
 //! [`tokio::task::spawn_blocking`] so a contended write transaction (redb
 //! serializes its own writers internally) stalls a blocking-pool thread,
 //! never the async runtime.
+//!
+//! Also implements [`AtomicBackend`]: a real write transaction can commit
+//! several keys — updates included, not just creates — as one all-or-
+//! nothing unit, which is exactly the guarantee [`crate::txn::run`] can
+//! only approximate over S3-like backends with a durable record and crash
+//! recovery. See that trait's module doc for why no other backend here
+//! implements it.
 
+use crate::atomic::{AtomicBackend, BatchOp, BatchOutcome};
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
 use anyhow::{Context, Result, bail};
@@ -111,6 +119,10 @@ impl RedbBackend {
 
 #[async_trait::async_trait]
 impl Backend for RedbBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let db = self.database().await?.clone();
         let key = key.to_string();
@@ -322,6 +334,76 @@ impl Backend for RedbBackend {
         tokio::fs::write(dest, &body)
             .await
             .with_context(|| format!("writing {}", dest.display()))
+    }
+}
+
+#[async_trait::async_trait]
+impl AtomicBackend for RedbBackend {
+    /// Two passes inside one write transaction: first every `Put`'s
+    /// condition is checked against the table as it stands *before this
+    /// batch touched anything*, and only if every single one holds does the
+    /// second pass actually write. A condition that fails aborts the whole
+    /// transaction — nothing from this batch lands, including `Put`s whose
+    /// own condition did hold and every `Delete`, exactly the "all or
+    /// nothing" [`AtomicBackend`] promises.
+    async fn commit_batch(&self, ops: Vec<BatchOp>) -> Result<BatchOutcome> {
+        let db = self.database().await?.clone();
+        tokio::task::spawn_blocking(move || -> Result<BatchOutcome> {
+            let write_txn = db.begin_write().context("beginning redb write transaction")?;
+            let outcome = {
+                let mut table = write_txn.open_table(TABLE).context("opening redb table")?;
+                let mut conflict = false;
+                for op in &ops {
+                    if let BatchOp::Put { key, expected_etag, .. } = op {
+                        let current_etag = table
+                            .get(key.as_str())
+                            .context("reading from redb")?
+                            .map(|g| g.value().0.to_string());
+                        if expected_etag.as_deref() != current_etag.as_deref() {
+                            conflict = true;
+                            break;
+                        }
+                    }
+                }
+                if conflict {
+                    BatchOutcome::Conflict
+                } else {
+                    for op in &ops {
+                        match op {
+                            BatchOp::Put { key, body, .. } => {
+                                // Re-reading the version here (rather than
+                                // reusing the check above) is what makes a
+                                // `Put` a real read-modify-write and not
+                                // just a validated blind write -- the two
+                                // happen in the same transaction either
+                                // way, so there's no window for it to have
+                                // changed between them.
+                                let next = table
+                                    .get(key.as_str())
+                                    .context("reading from redb")?
+                                    .map(|g| g.value().0)
+                                    .unwrap_or(0)
+                                    + 1;
+                                table
+                                    .insert(key.as_str(), (next, body.as_slice()))
+                                    .with_context(|| format!("writing {key}"))?;
+                            }
+                            BatchOp::Delete { key } => {
+                                table.remove(key.as_str()).with_context(|| format!("removing {key}"))?;
+                            }
+                        }
+                    }
+                    BatchOutcome::Applied
+                }
+            };
+            match outcome {
+                BatchOutcome::Applied => write_txn.commit().context("committing redb batch")?,
+                BatchOutcome::Conflict => write_txn.abort().context("aborting redb batch")?,
+            }
+            Ok(outcome)
+        })
+        .await
+        .context("redb batch task panicked")?
     }
 }
 

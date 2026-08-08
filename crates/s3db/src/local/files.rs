@@ -170,6 +170,10 @@ async fn lock_key(lock_path: &Path) -> Result<File> {
 
 #[async_trait::async_trait]
 impl Backend for FilesBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let data_path = self.data_path(key);
         let bytes = match fs::read(&data_path).await {

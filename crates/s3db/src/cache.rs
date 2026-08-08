@@ -133,6 +133,10 @@ impl CachedBackend {
 
 #[async_trait::async_trait]
 impl Backend for CachedBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         if let Some(hit) = self.get_fresh(key) {
             return Ok(hit);
@@ -266,6 +270,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Backend for CountingBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
             self.gets.fetch_add(1, Ordering::SeqCst);
             self.inner.get(key).await
