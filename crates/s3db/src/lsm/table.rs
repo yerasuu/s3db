@@ -11,7 +11,7 @@ use super::compactor::{self, CompactionReport};
 use super::manifest::{self, ManifestEntry};
 use super::memtable::MemValue;
 use super::value::{Schema, Value};
-use super::{LsmKey, Memtable, Wal, sstable};
+use super::{LsmKey, Memtable, Wal, query, sstable};
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
 use anyhow::{Context, Result, bail};
@@ -242,38 +242,7 @@ impl Table {
     /// it always wins) -- the same rule [`crate::lsm::compactor`] uses,
     /// just scoped to a key range and read-only.
     pub async fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<Vec<(LsmKey, Vec<u8>)>> {
-        let mut merged: BTreeMap<LsmKey, MemValue> = BTreeMap::new();
-
-        let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
-        for entry in &manifest.sstables {
-            if let Some(end) = end
-                && entry.min_key.as_slice() >= end
-            {
-                continue; // this whole SSTable starts at or after the range
-            }
-            if let Some(start) = start
-                && entry.max_key.as_slice() < start
-            {
-                continue; // this whole SSTable ends before the range
-            }
-            let rows = scan_sstable(
-                self.backend.as_ref(),
-                &self.cipher,
-                self.schema.as_ref(),
-                entry,
-                start,
-                end,
-            )
-            .await?;
-            merged.extend(rows);
-        }
-
-        // The memtable is always freshest -- applied last so it overrides
-        // whatever any SSTable had for the same key, tombstones included.
-        for (key, value) in self.state.lock().await.memtable.range(start, end) {
-            merged.insert(key, value);
-        }
-
+        let merged = self.scan_merged(start, end, &[]).await?;
         Ok(merged
             .into_iter()
             .filter_map(|(key, value)| mem_value_to_get_result(value).map(|bytes| (key, bytes)))
@@ -295,6 +264,89 @@ impl Table {
                 Ok((key, row))
             })
             .collect()
+    }
+
+    /// [`Self::scan_typed`] plus `predicates` (phase 8's query builder,
+    /// [`crate::lsm::query::Predicate`]) -- every returned row satisfies
+    /// every predicate, exactly as if they'd been applied as a plain
+    /// in-memory filter afterward. The difference is I/O, not correctness:
+    /// a block whose [`super::ColumnStats`] prove no row in it could
+    /// possibly match ([`query::Predicate::cannot_match`]) is skipped before ever
+    /// being fetched, on top of the key-range skip [`Self::scan`] already
+    /// does. A predicate that can't be decided from stats alone still gets
+    /// the real per-row check below -- pruning only ever removes work, it
+    /// never changes the answer.
+    pub async fn scan_typed_where(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        predicates: &[query::Predicate],
+    ) -> Result<Vec<(LsmKey, Vec<Value>)>> {
+        anyhow::ensure!(
+            self.schema.is_some(),
+            "scan_typed_where needs a schema (see TableConfig::with_schema)"
+        );
+        let merged = self.scan_merged(start, end, predicates).await?;
+        let mut out = Vec::new();
+        for (key, value) in merged {
+            let Some(bytes) = mem_value_to_get_result(value) else {
+                continue;
+            };
+            let row: Vec<Value> = rmp_serde::from_slice(&bytes).context("decoding a typed row")?;
+            if predicates.iter().all(|p| p.matches(&row)) {
+                out.push((key, row));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The shared merge behind [`Self::scan`]/[`Self::scan_typed_where`]:
+    /// every SSTable whose `[min_key, max_key]` overlaps `[start, end)`,
+    /// oldest to newest, then the memtable last (always freshest) -- same
+    /// order [`crate::lsm::compactor`] merges in. `predicates` (empty for
+    /// [`Self::scan`]) only ever affects which *blocks* get fetched inside
+    /// an overlapping SSTable, never which keys land in the result --
+    /// that final filter is each caller's own job.
+    async fn scan_merged(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        predicates: &[query::Predicate],
+    ) -> Result<BTreeMap<LsmKey, MemValue>> {
+        let mut merged: BTreeMap<LsmKey, MemValue> = BTreeMap::new();
+
+        let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
+        for entry in &manifest.sstables {
+            if let Some(end) = end
+                && entry.min_key.as_slice() >= end
+            {
+                continue; // this whole SSTable starts at or after the range
+            }
+            if let Some(start) = start
+                && entry.max_key.as_slice() < start
+            {
+                continue; // this whole SSTable ends before the range
+            }
+            let rows = scan_sstable(
+                self.backend.as_ref(),
+                &self.cipher,
+                self.schema.as_ref(),
+                entry,
+                start,
+                end,
+                predicates,
+            )
+            .await?;
+            merged.extend(rows);
+        }
+
+        // The memtable is always freshest -- applied last so it overrides
+        // whatever any SSTable had for the same key, tombstones included.
+        for (key, value) in self.state.lock().await.memtable.range(start, end) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged)
     }
 
     pub async fn should_flush(&self) -> bool {
@@ -469,6 +521,7 @@ async fn scan_sstable(
     entry: &ManifestEntry,
     start: Option<&[u8]>,
     end: Option<&[u8]>,
+    predicates: &[query::Predicate],
 ) -> Result<Vec<(LsmKey, MemValue)>> {
     let footer_offset = entry.byte_len - 8 - entry.footer_len;
     let sealed_footer = backend
@@ -485,11 +538,23 @@ async fn scan_sstable(
     };
 
     let mut rows = Vec::new();
-    for (block_idx, block) in block_index.iter().enumerate().skip(first_idx) {
+    'block: for (block_idx, block) in block_index.iter().enumerate().skip(first_idx) {
         if let Some(end) = end
             && block.min_key.as_slice() >= end
         {
             break; // this and every later block start at or after `end` -- nothing further overlaps
+        }
+        // Phase 8: a predicate this block's own column_stats definitively
+        // rules out means the block never gets fetched at all -- an
+        // out-of-range predicate column index (`.get` returns `None`) or a
+        // block with no stats for that column just means "can't decide,"
+        // never "prune."
+        for predicate in predicates {
+            if let Some(stats) = block.column_stats.get(predicate.column())
+                && predicate.cannot_match(stats)
+            {
+                continue 'block;
+            }
         }
         let sealed_block = backend
             .get_range(&entry.key, block.offset, block.len as u64)

@@ -65,8 +65,8 @@ pub use index::{IndexKey, SecondaryIndex, Segment};
 pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
 pub use lsm::{
     BackendRegistry, ColumnDef, ColumnStats, CompactionReport, DEFAULT_BACKEND_ID, FlushedSSTable, LsmKey, Manifest,
-    ManifestEntry, MemValue, Memtable, Schema, SecondaryLsmIndex, Table, TableConfig, TableLocation, Value, ValueKind,
-    compact, should_compact,
+    ManifestEntry, MemValue, Memtable, Predicate, Schema, SecondaryLsmIndex, Table, TableConfig, TableLocation, Value,
+    ValueKind, compact, should_compact,
 };
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};

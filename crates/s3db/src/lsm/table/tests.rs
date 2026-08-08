@@ -617,6 +617,109 @@ async fn scan_typed_on_a_schema_less_table_is_refused() {
 }
 
 #[tokio::test]
+async fn scan_typed_where_returns_only_rows_matching_every_predicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())])
+        .await
+        .unwrap();
+    table
+        .put_typed(b"b".to_vec(), vec![Value::Int64(25), Value::Text("bob".into())])
+        .await
+        .unwrap();
+    table
+        .put_typed(b"c".to_vec(), vec![Value::Int64(40), Value::Text("carol".into())])
+        .await
+        .unwrap();
+
+    let found = table
+        .scan_typed_where(None, None, &[query::Predicate::Gt(0, Value::Int64(25))])
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        vec![
+            (b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())]),
+            (b"c".to_vec(), vec![Value::Int64(40), Value::Text("carol".into())]),
+        ]
+    );
+}
+
+/// The actual point of phase 8: a predicate that a whole block's
+/// `column_stats` rules out must still produce the correct answer once
+/// merged with the blocks that do get read -- pruning is invisible from
+/// the result's point of view.
+#[tokio::test]
+async fn scan_typed_where_prunes_whole_blocks_but_still_returns_the_right_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let config = TableConfig::new(backend, test_cipher(), "people", dir.path().join("table.wal"))
+        .with_schema(people_schema())
+        .with_rows_per_block(2);
+    let table = Table::open(config).await.unwrap();
+
+    // Block 0: ages 0..2 (both < 100). Block 1: ages 2..4 (both >= 100).
+    for i in 0..4u32 {
+        let age = if i < 2 { i as i64 } else { 100 + i as i64 };
+        table
+            .put_typed(
+                format!("k{i:03}").into_bytes(),
+                vec![Value::Int64(age), Value::Text(format!("p{i}"))],
+            )
+            .await
+            .unwrap();
+    }
+    table.flush().await.unwrap();
+
+    let found = table
+        .scan_typed_where(None, None, &[query::Predicate::Gte(0, Value::Int64(100))])
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        vec![
+            (b"k002".to_vec(), vec![Value::Int64(102), Value::Text("p2".into())]),
+            (b"k003".to_vec(), vec![Value::Int64(103), Value::Text("p3".into())]),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn scan_typed_where_on_a_schema_less_table_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+    let err = table.scan_typed_where(None, None, &[]).await.unwrap_err();
+    assert!(err.to_string().contains("schema"), "got: {err}");
+}
+
+/// A predicate must also apply to unflushed memtable rows, not just
+/// SSTable ones -- `scan_merged` doesn't prune those (nothing to prune, no
+/// blocks), but the final per-row check still has to filter them.
+#[tokio::test]
+async fn scan_typed_where_filters_unflushed_rows_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_typed_table(dir.path()).await;
+    table
+        .put_typed(b"a".to_vec(), vec![Value::Int64(1), Value::Text("low".into())])
+        .await
+        .unwrap();
+    table
+        .put_typed(b"b".to_vec(), vec![Value::Int64(99), Value::Text("high".into())])
+        .await
+        .unwrap();
+
+    let found = table
+        .scan_typed_where(None, None, &[query::Predicate::Eq(1, Value::Text("high".into()))])
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        vec![(b"b".to_vec(), vec![Value::Int64(99), Value::Text("high".into())])]
+    );
+}
+
+#[tokio::test]
 async fn scan_typed_decodes_rows_across_memtable_and_a_flushed_sstable() {
     let dir = tempfile::tempdir().unwrap();
     let table = open_typed_table(dir.path()).await;

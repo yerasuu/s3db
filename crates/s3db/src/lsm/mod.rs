@@ -25,9 +25,13 @@
 //! non-overlapping SSTables and blocks via the same manifest/block-index
 //! metadata [`Table::get`] already uses), [`SecondaryLsmIndex`] (a
 //! second ordered [`Table`] for finding rows by a non-primary field —
-//! phase 5's other half), and [`location`] ([`TableLocation`]/[`BackendRegistry`],
+//! phase 5's other half), [`location`] ([`TableLocation`]/[`BackendRegistry`],
 //! phase 6's multi-backend routing at the same manifest level every table
-//! already had).
+//! already had), and [`query`] ([`Predicate`], phase 8's minimal query
+//! builder — [`Table::scan_typed_where`] uses a predicate's own
+//! [`query::Predicate::cannot_match`] against each block's [`ColumnStats`]
+//! to skip fetching whole blocks it can prove can't match, the reason
+//! phase 4 computed those stats in the first place).
 //!
 //! A row is opaque bytes in, opaque bytes out ([`Table::put`]/[`Table::get`])
 //! *unless* a table declares a [`value::Schema`] ([`TableConfig::schema`]),
@@ -40,6 +44,7 @@ pub mod compactor;
 mod location;
 pub mod manifest;
 mod memtable;
+pub mod query;
 mod secondary_index;
 pub mod sstable;
 mod table;
@@ -51,6 +56,7 @@ pub use compactor::{CompactionReport, compact, should_compact};
 pub use location::{BackendRegistry, DEFAULT_BACKEND_ID, TableLocation};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
+pub use query::Predicate;
 pub use secondary_index::SecondaryLsmIndex;
 pub use table::{FlushedSSTable, Table, TableConfig};
 pub use typed_block::ColumnStats;

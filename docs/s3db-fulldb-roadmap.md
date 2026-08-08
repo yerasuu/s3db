@@ -157,10 +157,10 @@ Min/max por bloque (`BlockIndexEntry::column_stats`, uno por columna,
 `None` para tipos no ordenables o un bloque enteramente tombstoned)
 habilita poda real de I/O: `WHERE age > 30` podría saltar bloques
 enteros sin leerlos, no solo evitar deserializar filas que no matchean
-— el cálculo de stats ya existe, pero el `Table::scan` de fase 5 poda por
-`min_key`/`max_key` de key primaria, no por predicado de columna; consumir
-`column_stats` para podar por `WHERE columna > X` queda como trabajo de
-fase 8.
+— el `Table::scan` de fase 5 poda por `min_key`/`max_key` de key
+primaria, no por predicado de columna; consumir `column_stats` para
+podar por `WHERE columna > X` es lo que hace `Table::scan_typed_where`
+(fase 8, ver más abajo).
 
 ## Multi-sitio — routing a nivel de manifest, no de objeto individual
 
@@ -191,6 +191,29 @@ paralela.
 > con el mismo `root` pero distinto `backend_id` no colisionan: son
 > backends `Arc<dyn Backend>` genuinamente distintos, no un prefijo
 > compartido dentro de uno solo.
+
+## Query builder mínimo — poda de bloques por predicado
+
+> **Implementado** (fase 8) en `crates/s3db/src/lsm/query.rs`
+> (`Predicate`) y `Table::scan_typed_where`
+> (`crates/s3db/src/lsm/table.rs`). Deliberadamente chico: un `Predicate`
+> es una sola comparación `columna <op> valor` (`Eq`/`Lt`/`Lte`/`Gt`/`Gte`
+> por posición de columna, no por nombre — mismo motivo que `Schema` ya
+> documentaba), sin joins ni agregación — no hay uso real todavía que
+> pida más, y "sin abstracciones especulativas" sigue aplicando.
+>
+> `Predicate::cannot_match(stats)` es la mitad que justifica esta fase:
+> compara el predicado contra el `ColumnStats` (min/max) de un bloque
+> *antes* de pedirlo, y solo devuelve `true` cuando puede probar que
+> ninguna fila del bloque podría matchear (p. ej. `Gt(v)` no puede
+> matchear un bloque cuyo `max <= v`). Cualquier caso no decidible —
+> tipos que no coinciden, columna no orderable, bloque sin stats (todo
+> tombstoned, o tabla sin schema) — devuelve `false`: nunca poda de más,
+> como mucho deja de podar. `Table::scan_typed_where` usa eso para saltar
+> bloques enteros sin `get_range` sobre ellos, y aun así vuelve a aplicar
+> el predicado real (`Predicate::matches`) fila por fila sobre lo que sí
+> se trajo — la poda nunca es la fuente de verdad de qué matchea, solo
+> decide qué I/O hace falta para averiguarlo.
 
 ## Cifrado: opcional (on por defecto), algoritmo elegible y expansible
 
@@ -290,7 +313,7 @@ auditoría, métricas, futuros issues/PRs a escala del roadmap de forge).
 | 5 ✅ | Range scan + índice secundario (segundo LSM ordenado por otra key) | — |
 | 6 ✅ | `TableLocation`/`BackendRegistry` (routing multi-backend) | — |
 | 7 ✅ | `CipherAlgorithm`/`EncryptionMode` (header de algoritmo, opt-out) | `s3db-crypto::Cipher` gana enum, sin romper objetos ya sellados |
-| 8 (opcional) | Query builder mínimo sobre 1-5 | — |
+| 8 ✅ | Query builder mínimo sobre 1-5 | — |
 
 **Fase 1 implementada** en `crates/s3db/src/lsm/` (`Wal`, `Memtable`,
 `sstable::build`, `Table::{open,put,delete,flush}`). Solo escritura, como
