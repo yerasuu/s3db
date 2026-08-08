@@ -1,9 +1,8 @@
 //! A [`Backend`] decorator that memoizes `get` within one request/
 //! operation's lifetime — deliberately *not* a process-wide cache.
-//! gitquarry runs multiple server instances against the same bucket, so a
-//! cached `User`/permission record that outlived the request it was built
-//! for could let a revoked permission or key stay "live" longer than it
-//! should. Callers are expected to build one `RequestCache` per connection
+//! several processes can run against the same bucket at once, so a cached
+//! record that outlived the request it was built for could let stale data
+//! (a revoked permission, say) stay "live" longer than it should. Callers are expected to build one `RequestCache` per connection
 //! or request and drop it afterward — never stash it somewhere long-lived.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};

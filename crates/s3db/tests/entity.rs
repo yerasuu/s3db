@@ -1,6 +1,6 @@
 //! End-to-end check that `#[derive(Entity)]` produces the same
-//! `Collection`/`SecondaryIndex` behavior a hand-written entity
-//! (`auth::access::User`, in gitquarry proper) already implements by hand.
+//! `Collection`/`SecondaryIndex` behavior a hand-written entity implements
+//! by hand.
 
 use s3db::{Cipher, Entity, LocalBackend, LocalParams};
 

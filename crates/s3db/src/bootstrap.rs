@@ -5,11 +5,10 @@
 //! (the only object in the bucket that stays in the clear on purpose: a
 //! salt isn't secret, and it needs to be readable before the key that
 //! decrypts everything else can be derived). Future instances read that
-//! salt, derive the same key with the local passphrase
-//! (`gitquarry.toml`, never in the bucket), and verify it against a
-//! witness value: that way a mistyped passphrase gives a clear error at
-//! startup, instead of decrypt failures scattered throughout the code in
-//! the middle of a push.
+//! salt, derive the same key with the passphrase from local config (never
+//! from the bucket), and verify it against a witness value: that way a
+//! mistyped passphrase gives a clear error at startup, instead of decrypt
+//! failures scattered throughout the code mid-operation.
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy, SALT_LEN};

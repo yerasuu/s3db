@@ -1,6 +1,6 @@
 //! Multi-key encryption rotation, additive to (never required by)
 //! [`crate::bootstrap`]'s single-`Cipher` bootstrap. An app that never
-//! rotates keys (gitquarry today) keeps using `bootstrap::get_or_create_cipher`
+//! rotates keys keeps using `bootstrap::get_or_create_cipher`
 //! and a bare [`Cipher`] everywhere, untouched -- `Collection`/`SecondaryIndex`/
 //! `txn::run`/`payload` all still take `&Cipher`, not `&KeyRing`, so adding
 //! this module changes nothing for a caller that doesn't opt in.

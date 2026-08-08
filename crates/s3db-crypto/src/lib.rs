@@ -2,10 +2,9 @@
 //! encryption-at-rest — derives a key from a passphrase and seals/opens
 //! bytes with AEAD, no storage backend, no `S3`/bucket concept at all. Split
 //! out from `s3db` itself into its own crate specifically so a caller that
-//! doesn't need object storage (gitquarry uses this directly to seal
-//! session/login cookies, unrelated to anything in a bucket) doesn't have
-//! to pull in `s3db`'s driver dependencies (`aws-sdk-s3`, Azure/GCS SDKs,
-//! ...) just to get `Cipher`. `s3db` itself re-exports this crate's types
+//! doesn't need object storage (sealing session cookies, say — unrelated to
+//! anything in a bucket) doesn't have to pull in `s3db`'s driver
+//! dependencies (`aws-sdk-s3`, Azure/GCS SDKs, ...) just to get `Cipher`. `s3db` itself re-exports this crate's types
 //! from its own `cipher` module unchanged, so nothing inside `s3db` had to
 //! change to use it from here instead.
 //!

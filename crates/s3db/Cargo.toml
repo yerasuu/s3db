@@ -14,7 +14,7 @@ default = []
 # uniformly-sized objects (see json/payload's MAX_OBJECT_BYTES guard), and
 # every driver's real chunking implementation is dead code, never exercised,
 # under that profile -- less surface to audit. A caller that does need it
-# (gitquarry's own git-hosting layer) just enables the feature.
+# just enables the feature.
 streaming = []
 
 [dependencies]

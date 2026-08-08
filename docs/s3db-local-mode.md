@@ -9,12 +9,10 @@
 > justifican el diseño LSM del otro documento simplemente no aplican.
 > Ver `git log` para confirmar si alguna fase ya aterrizó.
 >
-> **Alcance: `s3db` extraído a proyecto nuevo, independiente de
-> gitquarry.** La sección de cifrado más abajo es política de ese
-> proyecto nuevo, no un cambio a la regla actual de gitquarry
-> (`CLAUDE.md`: cifrado obligatorio, sin opt-out). Mientras `s3db` siga
-> viviendo en este repo, gitquarry lo sigue consumiendo con cifrado
-> obligatorio como hoy.
+> La sección de cifrado más abajo es política de este proyecto, ya
+> independiente: un consumidor puede seguir exigiendo cifrado obligatorio
+> por su cuenta (gitquarry lo hace), pero eso es decisión suya, no del
+> motor.
 
 ## Restricción que se mantiene: mismo API público en ambos modos
 
@@ -58,7 +56,7 @@ no de lo que un filesystem local podría dar).
 
 ## Rediseño: un único archivo `redb` como motor de `LocalBackend`
 
-- `{root}/gitquarry.redb` — una tabla `(key: &str) -> (version: u64, body: &[u8])`.
+- `{root}/s3db.redb` — una tabla `(key: &str) -> (version: u64, body: &[u8])`.
 - `get`: read-transaction, directo.
 - `put_cas`: write-transaction que lee `version` actual, compara contra
   `expected_etag`, escribe y comitea si coincide, aborta (sin tocar

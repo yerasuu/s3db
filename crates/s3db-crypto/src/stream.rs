@@ -17,8 +17,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// [`open_stream`] fails with a clear "not a stream" error instead of a
 /// confusing AEAD failure if ever pointed at the wrong kind of blob), no
 /// version byte beyond that — this is a single, deliberately breaking
-/// format with no predecessor to stay compatible with (see
-/// `storage::remote`'s callers: nothing reads pack objects any other way).
+/// format with no predecessor to stay compatible with.
+///
+/// The bytes themselves date from this crate's life inside gitquarry and
+/// stay as they are: every stream object already sealed in a live bucket
+/// carries this exact magic, so renaming it would make all of them
+/// unreadable for nothing but cosmetics.
 const STREAM_MAGIC: &[u8; 8] = b"GQCSTRM1";
 /// Plaintext bytes per chunk in [`seal_stream`]'s framing. Bounds peak
 /// memory for sealing/opening a pack to roughly this, regardless of the
@@ -41,10 +45,9 @@ fn stream_chunk_count(total_len: u64) -> u64 {
 /// callers don't need to read more than that to decide) starts with
 /// [`STREAM_MAGIC`] — for a caller that has to handle objects sealed by
 /// either format without knowing ahead of time which one a given object
-/// used (`storage::remote::Remote::copy_all_to`, re-encrypting every
-/// object under a repo's prefix regardless of whether it's a git pack
-/// sealed by [`seal_stream`] or a small JSON object sealed by
-/// [`crate::Cipher::seal`]).
+/// used (a re-encrypting sweep over every object under a prefix, say,
+/// regardless of whether each one is a large blob sealed by
+/// [`seal_stream`] or a small record sealed by [`crate::Cipher::seal`]).
 pub(crate) fn is_stream_sealed(prefix: &[u8]) -> bool {
     prefix.starts_with(STREAM_MAGIC.as_slice())
 }
@@ -170,9 +173,9 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
     input
         .read_exact(&mut magic)
         .await
-        .context("invalid ciphertext (not a gitquarry stream, incomplete header)")?;
+        .context("invalid ciphertext (not an s3db stream, incomplete header)")?;
     if &magic != STREAM_MAGIC {
-        bail!("invalid ciphertext (not a gitquarry stream)");
+        bail!("invalid ciphertext (not an s3db stream)");
     }
     let mut total_len_bytes = [0u8; 8];
     input

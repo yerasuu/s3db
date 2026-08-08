@@ -1,6 +1,6 @@
 //! `#[derive(Entity)]`: generates the `Collection`/`SecondaryIndex`
-//! boilerplate every hand-written entity (`User`, `Group`, `RepoConfig`, ...)
-//! in gitquarry already wrote by hand — one `key` field backing a
+//! boilerplate a hand-written entity otherwise has to spell out — one
+//! `key` field backing a
 //! `Collection`, plus one `SecondaryIndex` and its pointer-struct/claim/
 //! resolve/release trio per `#[entity(index)]` field. Never touches storage
 //! itself: every generated method just calls straight into `s3db::{Collection,
@@ -21,9 +21,9 @@ struct ContainerArgs {
 }
 
 /// One `#[entity(index)]`/`#[entity(index(segment = "base64"))]` field —
-/// `segment` defaults to `Segment::Raw`, same default shape as every
-/// hand-written index in `auth::access` that isn't base64-encoding a
-/// fingerprint/email. `root`/`kind`/`pointer_field` default to the
+/// `segment` defaults to `Segment::Raw`, the right shape for any index key
+/// that isn't base64-encoding something with unsafe characters (a
+/// fingerprint, an email). `root`/`kind`/`pointer_field` default to the
 /// collection's own prefix, the field's own name, and `"key"` respectively
 /// (matching a brand-new index with no prior on-disk shape); set them
 /// explicitly to land on the exact key/pointer-field-name an existing

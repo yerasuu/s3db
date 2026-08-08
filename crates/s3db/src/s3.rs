@@ -31,8 +31,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// fall out for free from deleting one `ListObjectsV2` page at a time (a
 /// page is never more than 1000 objects either, see `list_prefix`); now
 /// that every caller goes through [`Backend::delete_many`] this makes that
-/// same limit explicit instead of duplicated at each call site the way
-/// `remote.rs` and `fsck.rs` used to.
+/// same limit explicit in one place instead of duplicated at each call
+/// site.
 const DELETE_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug)]
@@ -79,7 +79,7 @@ impl S3Backend {
         endpoint_url: Option<&str>,
         path_style: bool,
     ) -> Self {
-        let creds = Credentials::new(access_key_id, secret_access_key, None, None, "gitquarry-config");
+        let creds = Credentials::new(access_key_id, secret_access_key, None, None, "s3db");
 
         let mut builder = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
@@ -156,7 +156,7 @@ impl Backend for S3Backend {
                 confirmed: 1,
             }),
             Err(err) => {
-                eprintln!("gitquarry: warning: couldn't delete {key} from S3: {err}");
+                eprintln!("s3db: warning: couldn't delete {key} from S3: {err}");
                 Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,
@@ -193,7 +193,7 @@ impl Backend for S3Backend {
             outcome.confirmed += out.deleted().len();
             for err in out.errors() {
                 eprintln!(
-                    "gitquarry: warning: couldn't delete {} from S3: {}",
+                    "s3db: warning: couldn't delete {} from S3: {}",
                     err.key().unwrap_or("?"),
                     err.message().unwrap_or("unknown error")
                 );

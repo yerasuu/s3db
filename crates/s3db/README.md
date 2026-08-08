@@ -1,6 +1,6 @@
 # s3db
 
-Typed, encrypted, CAS-consistent database over S3-compatible object storage (S3, R2, Azure Blob, GCS, or a plain local directory). Extracted from [gitquarry](../..): everything here started as gitquarry-specific plumbing (`storage::*`, `crypto::*`) that turned out to have no gitquarry dependency at all — a `Backend`, a passphrase, and JSON in and out is the whole surface.
+Typed, encrypted, CAS-consistent database over S3-compatible object storage (S3, R2, Azure Blob, GCS, or a plain local directory). A `Backend`, a passphrase, and typed values in and out is the whole surface.
 
 ## Design
 

@@ -9,16 +9,13 @@
 >
 > Restricción que se mantiene, sin negociar: **solo object storage
 > S3-compatible como primitivo, sin daemon de coordinación, un binario**
-> (mismo principio que el resto de gitquarry). Nada acá agrega un proceso
+> (heredado de gitquarry, donde nació el crate). Nada acá agrega un proceso
 > nuevo, un puerto nuevo, ni un protocolo de consenso.
 >
-> **Alcance de este documento: `s3db` extraído a proyecto nuevo,
-> independiente de gitquarry.** La sección de cifrado más abajo (opcional,
-> algoritmo elegible/expansible) es política de ese proyecto nuevo, **no**
-> un cambio a la regla actual de gitquarry (`CLAUDE.md`: cifrado
-> obligatorio, sin opt-out, XChaCha20Poly1305 fijo). Mientras `s3db` siga
-> viviendo dentro de este repo, gitquarry sigue consumiéndolo con cifrado
-> obligatorio como hoy — este documento no toca eso.
+> La sección de cifrado más abajo (opcional, algoritmo elegible/
+> expansible) es política de este proyecto, ya independiente: un
+> consumidor puede seguir exigiendo cifrado obligatorio por su cuenta
+> (gitquarry lo hace), pero eso es decisión suya, no del motor.
 
 ## Diagnóstico raíz: por qué el diseño actual no llega a "full DB"
 
@@ -136,8 +133,8 @@ paralela.
 
 Hoy `s3db-crypto::Cipher` es un único algoritmo fijo — `struct
 Cipher(XChaCha20Poly1305)`, sin variantes, cifrado obligatorio sin
-opt-out (política de gitquarry, ver disclaimer arriba). Para el proyecto
-nuevo, dos cambios sobre esa base, reusando el mecanismo que el propio
+opt-out (herencia de gitquarry, ver disclaimer arriba). Dos cambios sobre
+esa base, reusando el mecanismo que el propio
 `Cipher::seal` ya tiene para esto exacto: el **header byte bound-into-AAD**
 que hoy solo describe compresión (`compression_header`) se generaliza a
 describir también el algoritmo:
@@ -171,8 +168,8 @@ enum más + un brazo de `match` en `seal`/`open` — ningún objeto viejo se
 rompe (su byte de header sigue apuntando a su algoritmo original), y
 ningún caller que no pida el nuevo algoritmo lo ve nunca.
 
-**Opcional, on por defecto**: `EncryptionMode::Enabled` es el default de
-la config del proyecto nuevo — un caller tiene que pasar `Disabled`
+**Opcional, on por defecto**: `EncryptionMode::Enabled` es el default —
+un caller tiene que pasar `Disabled`
 explícitamente (mismo espíritu que "config explícita, no inferencia" del
 resto del crate) para apagarlo. Con `Disabled`, `seal`/`open` se vuelven
 passthrough (header marca "sin cifrar" para que un lector no adivine),

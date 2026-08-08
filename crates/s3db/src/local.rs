@@ -1,19 +1,17 @@
 //! [`Backend`] over a plain local filesystem directory — no external
 //! storage provider at all, `root` is just a directory this process reads/
-//! writes packs and metadata under.
+//! writes objects under.
 //!
 //! Unlike every other driver, a local filesystem has no native
 //! compare-and-swap primitive to build [`Backend::put_cas`] on. This
-//! backend adds one: a version-counter sidecar (`<key>.gqrev`) next to each
-//! object, updated under an exclusive `flock` on a second sidecar
-//! (`<key>.gqlock`) so the read-compare-write sequence is atomic. That
-//! gives real CAS semantics — the same guarantee `refs.json`'s CAS depends
-//! on to not lose a concurrent push — but only **within one machine**:
-//! `flock` has no meaning across a network filesystem shared by two
-//! different hosts, so this driver is scoped to "one gitquarry deployment,
-//! one machine", not a shared/clustered setup. Don't point two separate
-//! machines' `gitquarry.toml` at the same NFS-mounted root and expect the
-//! same safety S3/R2/Azure/GCS give.
+//! backend adds one: a version-counter sidecar (`<key>.s3dbrev`) next to
+//! each object, updated under an exclusive `flock` on a second sidecar
+//! (`<key>.s3dblock`) so the read-compare-write sequence is atomic. That
+//! gives real CAS semantics, but only **within one machine**: `flock` has
+//! no meaning across a network filesystem shared by two different hosts,
+//! so this driver is scoped to "one deployment, one machine", not a
+//! shared/clustered setup. Don't point two separate machines at the same
+//! NFS-mounted root and expect the same safety S3/R2/Azure/GCS give.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
@@ -24,8 +22,8 @@ use fs4::tokio::AsyncFileExt;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 
-const REV_SUFFIX: &str = ".gqrev";
-const LOCK_SUFFIX: &str = ".gqlock";
+const REV_SUFFIX: &str = ".s3dbrev";
+const LOCK_SUFFIX: &str = ".s3dblock";
 /// How many keys [`LocalBackend::delete_many`] deletes at once — each
 /// delete takes its own `flock`, so a bit of overlap is still worth
 /// something even though this is all local disk (no network round trip to
@@ -75,23 +73,21 @@ async fn read_rev(path: &Path) -> Result<Option<u64>> {
 }
 
 /// Writes `bytes` to `path` via a temp-file-then-rename so a reader never
-/// sees a half-written file — same discipline `storage::remote`'s own
-/// download-to-disk path already uses.
+/// sees a half-written file.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
     fs::create_dir_all(dir)
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
     let tmp = tempfile::Builder::new()
-        .prefix(".gitquarry-tmp-")
+        .prefix(".s3db-tmp-")
         .tempfile_in(dir)
         .with_context(|| format!("creating temp file in {}", dir.display()))?;
     let tmp_path = tmp.into_temp_path();
     fs::write(&tmp_path, bytes)
         .await
         .with_context(|| format!("writing {}", tmp_path.display()))?;
-    // fsync before the rename, same reasoning as `storage::remote`'s own
-    // download-to-disk path: a cut halfway through must not leave a valid
+    // fsync before the rename: a cut halfway through must not leave a valid
     // name pointing at half-written content.
     let file = File::open(&tmp_path)
         .await
@@ -116,7 +112,7 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
     let tmp = tempfile::Builder::new()
-        .prefix(".gitquarry-tmp-")
+        .prefix(".s3db-tmp-")
         .tempfile_in(dir)
         .with_context(|| format!("creating temp file in {}", dir.display()))?;
     let tmp_path = tmp.into_temp_path();
@@ -141,14 +137,13 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Opens (creating if missing) and exclusively locks `<key>.gqlock`,
+/// Opens (creating if missing) and exclusively locks `<key>.s3dblock`,
 /// serializing every write to this one key — across processes on this
 /// machine (see module doc), not just within this one call. `flock` itself
 /// is a blocking syscall; even `fs4`'s tokio support only forwards to it
 /// directly rather than offloading to a blocking-pool thread, so a
 /// contended call here can stall this task briefly. Acceptable: the only
-/// real contention is two gitquarry processes racing the same key at once
-/// (a server plus a concurrently-run `repack`/`fsck`, say) — a local
+/// real contention is two processes racing the same key at once — a local
 /// filesystem operation, not a network call, so the stall is bounded and
 /// short.
 async fn lock_key(lock_path: &Path) -> Result<File> {
@@ -228,10 +223,10 @@ impl Backend for LocalBackend {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
-        // Every prefix this codebase actually scans with ends in '/' (a
-        // real directory boundary — REPOS_PREFIX/, .conf/users/,
-        // .conf/audit/, a repo's own prefix, ...), so walking root.join
-        // (prefix) as a directory covers every real call site.
+        // Every prefix this crate actually scans with ends in '/' (a real
+        // directory boundary — `.conf/txn/`, a collection's own prefix,
+        // ...), so walking root.join(prefix) as a directory covers every
+        // real call site.
         let dir = self.root.join(prefix);
         let mut out = Vec::new();
         if dir.is_dir() {

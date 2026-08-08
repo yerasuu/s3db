@@ -45,9 +45,10 @@ impl DeleteOutcome {
 /// bucket, because there's nothing left to disambiguate once a `Backend` is
 /// built. This is the entire surface every driver (`s3`, `local`, and
 /// whatever else `driver = "..."` in the caller's config selects) has to
-/// implement; it's deliberately small — derived from an audit of every S3
-/// call gitquarry actually makes, not a speculative superset (no presign,
-/// multipart, byte-range, versioning, or ACLs anywhere in the tree).
+/// implement; it's deliberately small — derived from an audit of the S3
+/// calls a real caller actually makes, not a speculative superset (no
+/// presign, multipart, byte-range, versioning, or ACLs anywhere in the
+/// tree).
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + std::fmt::Debug {
     /// Raw body + an opaque version token ("etag"), or empty bytes and
@@ -56,8 +57,8 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// Compare-and-swap write. `expected_etag = None` means "must not exist
     /// yet". A driver with no native conditional-write support (e.g. a
     /// shared network filesystem) must still give this real CAS semantics,
-    /// not best-effort — `refs.json`'s CAS is what stops a concurrent push
-    /// from silently clobbering another one.
+    /// not best-effort — this is what stops one concurrent writer from
+    /// silently clobbering another.
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas>;
     /// Best-effort delete: missing-already isn't an error (the caller's
     /// goal, "this key is gone", already holds), and a single key's own
@@ -86,9 +87,9 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     /// every driver's real chunked-upload code is dead weight, never
     /// exercised, under that profile. Without the feature this is a provided
     /// method returning [`anyhow::Error`] ("streaming disabled") instead of a
-    /// required one — a caller that does need it (large blobs: packs, LFS
-    /// objects, ...) just enables the feature, no driver has to implement a
-    /// stub for the other case.
+    /// required one — a caller that does need it (large binary blobs) just
+    /// enables the feature, no driver has to implement a stub for the other
+    /// case.
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()>;
     #[cfg(not(feature = "streaming"))]

@@ -1,9 +1,7 @@
 //! `s3db`: a typed database over S3-compatible object storage (S3, R2,
 //! Azure Blob, GCS, or a plain local directory), encryption mandatory,
-//! CAS-consistent. Extracted from gitquarry: everything here used to be
-//! gitquarry-specific plumbing (`storage::*`, `crypto::*`) that turned out
-//! to have no gitquarry dependency at all — a `Backend`, a passphrase, and
-//! JSON in and out is the whole surface.
+//! CAS-consistent. A `Backend`, a passphrase, and typed values in and out
+//! is the whole surface.
 //!
 //! [`backend::Backend`] is the storage abstraction (5 implementors, one per
 //! driver); [`cipher::Cipher`]/[`bootstrap`] handle mandatory encryption at

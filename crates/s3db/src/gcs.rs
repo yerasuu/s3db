@@ -2,8 +2,8 @@
 //! (`google-cloud-storage`) rather than GCS's S3-interop XML endpoint:
 //! GCS's own generation-precondition semantics (`ifGenerationMatch`) give a
 //! documented CAS guarantee the S3-compatibility endpoint doesn't promise
-//! with the same confidence, and `refs.json`'s CAS is what stops a
-//! concurrent push from silently clobbering another one.
+//! with the same confidence, and CAS is the one guarantee every layer
+//! above [`Backend`] is built on.
 //!
 //! Two clients, matching how the crate itself splits the API: [`Storage`]
 //! (data plane — read/write object bytes) and [`StorageControl`] (control
@@ -136,7 +136,7 @@ impl Backend for GcsBackend {
         let clients = match self.client_pair().await {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e:#}");
+                eprintln!("s3db: warning: couldn't delete {key} from Google Cloud Storage: {e:#}");
                 return Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,
@@ -160,7 +160,7 @@ impl Backend for GcsBackend {
                 confirmed: 1,
             }),
             Err(e) => {
-                eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}");
+                eprintln!("s3db: warning: couldn't delete {key} from Google Cloud Storage: {e}");
                 Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,
@@ -191,7 +191,7 @@ impl Backend for GcsBackend {
                     Err(e) if status_code(&e) == Some(404) => {
                         confirmed_ref.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(e) => eprintln!("gitquarry: warning: couldn't delete {key} from Google Cloud Storage: {e}"),
+                    Err(e) => eprintln!("s3db: warning: couldn't delete {key} from Google Cloud Storage: {e}"),
                 }
             })
             .await;
