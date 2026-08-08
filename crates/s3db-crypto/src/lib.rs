@@ -12,20 +12,24 @@
 //! passphrase plus a durably-stored salt — that part does need `Backend`,
 //! so it stays in `s3db` proper, not here.
 //!
-//! Four independent concerns, one module each, so extending or swapping any
+//! Five independent concerns, one module each, so extending or swapping any
 //! one of them never touches the others -- this file itself is wiring only,
 //! no logic of its own:
 //! - [`kdf`] -- passphrase + salt -> key (Argon2id today).
+//! - [`algorithm`] -- which AEAD sealed an object, and the header byte that
+//!   records it.
 //! - [`compression`] -- optional pre-encryption compression (zstd today).
-//! - [`cipher`] -- the AEAD primitive and the small-object `seal`/`open`
-//!   format tying the two above together.
+//! - [`cipher`] -- the keyed AEAD instances and the small-object
+//!   `seal`/`open` format tying the three above together.
 //! - [`stream`] -- the separate, large-object streaming format.
 
+mod algorithm;
 mod cipher;
 mod compression;
 mod kdf;
 mod stream;
 
+pub use algorithm::CipherAlgorithm;
 pub use cipher::Cipher;
 pub use compression::CompressionStrategy;
 pub use kdf::SALT_LEN;

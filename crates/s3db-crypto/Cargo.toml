@@ -7,6 +7,7 @@ description = "Pure AEAD encryption primitive (XChaCha20Poly1305 + Argon2id + op
 license = "AGPL-3.0-or-later"
 
 [dependencies]
+aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 anyhow = "1.0.104"
 argon2 = { version = "0.5.3", features = ["std"] }
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
