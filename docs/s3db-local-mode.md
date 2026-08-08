@@ -155,7 +155,7 @@ rolled), sin este ni ningún otro dependency nuevo.
 | Fase | Qué construye | Depende de |
 |---|---|---|
 | 1 ✅ | `LocalBackend` sobre `redb` (get/put_cas/delete/list_prefix), detrás de `engine = "redb"` | — |
-| 2 | `s3db-local-migrate` (files → redb) | 1 |
+| 2 ✅ | `s3db-local-migrate` (files → redb) | 1 |
 | 3 | `AtomicBackend` + `txn::run` lo detecta y usa cuando está presente (updates reales) | 1 |
 | 4 | `SecondaryIndex::resolve_range` sobre Local vía rango nativo redb | 1 |
 | 5 | Fila + índice en la misma transacción atómica | 3, 4 |

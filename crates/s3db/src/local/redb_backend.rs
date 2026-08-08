@@ -18,10 +18,8 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
-#[cfg(feature = "streaming")]
-use anyhow::bail;
-use anyhow::{Context, Result};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use anyhow::{Context, Result, bail};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 #[cfg(feature = "streaming")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -69,6 +67,45 @@ impl RedbBackend {
                 .context("redb open task panicked")?
             })
             .await
+    }
+
+    /// Loads every `(key, body)` pair into this database's table in one
+    /// write transaction, each stamped with version `1` — the primitive
+    /// behind `s3db-local-migrate` (see that binary): a bulk load is a
+    /// one-time, offline operation, never a live [`Backend::put_cas`], so
+    /// there's no prior version to preserve or CAS to honor.
+    ///
+    /// Refuses to run against a table that already has rows in it, rather
+    /// than silently merging — a migration target should be a fresh
+    /// location, and a non-empty table here almost certainly means the
+    /// caller pointed this at the wrong directory or ran the tool twice.
+    pub async fn bulk_load_fresh(&self, entries: Vec<(String, Vec<u8>)>) -> Result<usize> {
+        let db = self.database().await?.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let write_txn = db.begin_write().context("beginning redb write transaction")?;
+            let mut inserted = 0;
+            {
+                let mut table = write_txn.open_table(TABLE).context("opening redb table")?;
+                let existing = table.len().context("reading redb table size")?;
+                if existing > 0 {
+                    bail!(
+                        "refusing to bulk-load: this redb table already has {existing} row(s) -- \
+                         point the migration at a fresh location, or confirm this table is meant \
+                         to be overwritten before deleting it yourself"
+                    );
+                }
+                for (key, body) in &entries {
+                    table
+                        .insert(key.as_str(), (1u64, body.as_slice()))
+                        .with_context(|| format!("writing {key}"))?;
+                    inserted += 1;
+                }
+            }
+            write_txn.commit().context("committing bulk load")?;
+            Ok(inserted)
+        })
+        .await
+        .context("redb bulk-load task panicked")?
     }
 }
 

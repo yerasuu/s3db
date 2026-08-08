@@ -142,6 +142,38 @@ async fn a_new_backend_instance_over_the_same_directory_sees_prior_writes() {
     assert!(etag.is_some());
 }
 
+#[tokio::test]
+async fn bulk_load_fresh_writes_every_entry_in_one_shot() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let entries = vec![("a".to_string(), b"1".to_vec()), ("b".to_string(), b"2".to_vec())];
+    assert_eq!(b.bulk_load_fresh(entries).await.unwrap(), 2);
+    assert_eq!(b.get("a").await.unwrap().0, b"1");
+    assert_eq!(b.get("b").await.unwrap().0, b"2");
+    // Loaded rows are real, versioned entries -- a normal CAS update works
+    // on them afterward, same as anything `put_cas` wrote directly.
+    let (_, etag) = b.get("a").await.unwrap();
+    assert_eq!(
+        b.put_cas("a", b"1-updated".to_vec(), etag.as_deref()).await.unwrap(),
+        Cas::Ok
+    );
+}
+
+#[tokio::test]
+async fn bulk_load_fresh_refuses_a_table_that_already_has_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    b.put_cas("existing", b"x".to_vec(), None).await.unwrap();
+    let err = b
+        .bulk_load_fresh(vec![("new".to_string(), b"y".to_vec())])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already has"), "got: {err}");
+    // The refused load must not have partially applied.
+    assert!(b.get("new").await.unwrap().1.is_none());
+}
+
 #[cfg(feature = "streaming")]
 #[tokio::test]
 async fn put_stream_then_get_stream_roundtrips_and_bumps_the_version() {

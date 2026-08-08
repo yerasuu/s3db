@@ -77,5 +77,5 @@ pub use s3db_macros::Entity;
 
 pub use azure::AzureBackend;
 pub use gcs::GcsBackend;
-pub use local::LocalBackend;
+pub use local::{FilesBackend, LocalBackend, RedbBackend};
 pub use s3::S3Backend;
