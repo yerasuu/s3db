@@ -140,4 +140,5 @@ impl SecondaryLsmIndex {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/secondary_index.rs"]
 mod tests;

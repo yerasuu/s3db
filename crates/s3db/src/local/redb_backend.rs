@@ -472,4 +472,5 @@ impl RangeBackend for RedbBackend {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/local/redb_backend.rs"]
 mod tests;

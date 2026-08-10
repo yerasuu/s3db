@@ -102,4 +102,5 @@ impl Memtable {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/memtable.rs"]
 mod tests;

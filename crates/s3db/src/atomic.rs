@@ -146,4 +146,5 @@ pub async fn put_with_index<T: Serialize, P: Serialize>(
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/atomic.rs"]
 mod tests;

@@ -308,4 +308,5 @@ fn bail_unless_consistent(block: &TypedBlock, schema: &Schema, row_count: usize)
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/typed_block.rs"]
 mod tests;

@@ -97,4 +97,5 @@ impl Backend for LocalBackend {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/local.rs"]
 mod tests;

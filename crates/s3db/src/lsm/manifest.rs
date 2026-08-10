@@ -93,4 +93,5 @@ pub(crate) async fn replace(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/manifest.rs"]
 mod tests;

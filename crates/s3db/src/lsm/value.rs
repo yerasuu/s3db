@@ -139,4 +139,5 @@ impl Schema {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/value.rs"]
 mod tests;

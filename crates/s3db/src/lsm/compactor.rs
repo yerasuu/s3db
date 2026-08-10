@@ -161,4 +161,5 @@ pub async fn compact(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/compactor.rs"]
 mod tests;

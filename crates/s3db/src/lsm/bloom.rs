@@ -103,4 +103,5 @@ impl Bloom {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/bloom.rs"]
 mod tests;

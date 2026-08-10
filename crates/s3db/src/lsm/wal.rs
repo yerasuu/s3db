@@ -149,4 +149,5 @@ fn parse_record(buf: &[u8]) -> Option<(usize, LsmKey, MemValue)> {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/wal.rs"]
 mod tests;

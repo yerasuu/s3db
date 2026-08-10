@@ -89,4 +89,5 @@ impl BackendRegistry {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/location.rs"]
 mod tests;

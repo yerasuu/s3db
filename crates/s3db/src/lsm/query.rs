@@ -117,4 +117,5 @@ impl Predicate {
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/query.rs"]
 mod tests;

@@ -569,4 +569,5 @@ async fn scan_sstable(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/table.rs"]
 mod tests;

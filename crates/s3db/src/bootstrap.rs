@@ -125,4 +125,5 @@ fn random_salt() -> Result<[u8; SALT_LEN]> {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/bootstrap.rs"]
 mod tests;

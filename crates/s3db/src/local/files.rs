@@ -332,4 +332,5 @@ fn walk_dir<'a>(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/local/files.rs"]
 mod tests;

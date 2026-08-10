@@ -367,4 +367,5 @@ pub(crate) fn read_all(
 }
 
 #[cfg(test)]
+#[path = "../../tests/unit/lsm/sstable.rs"]
 mod tests;
