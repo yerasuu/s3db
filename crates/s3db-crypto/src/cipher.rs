@@ -246,4 +246,5 @@ impl Cipher {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/cipher.rs"]
 mod tests;

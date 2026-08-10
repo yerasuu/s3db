@@ -232,4 +232,5 @@ impl Default for EncryptionMode {
 }
 
 #[cfg(test)]
+#[path = "../tests/unit/algorithm.rs"]
 mod tests;
