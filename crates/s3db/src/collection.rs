@@ -324,7 +324,7 @@ impl Collection {
             .await;
 
         let tombstone_key = self.tombstone_key(name);
-        let (_, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher)
+        let (_, mut tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher)
             .await
             .unwrap_or_default();
         let pending = Tombstone {
@@ -332,10 +332,26 @@ impl Collection {
             purge_state: PurgeState::Pending,
             restore_etag,
         };
-        if put_json(backend, &tombstone_key, &pending, tomb_etag.as_deref(), cipher)
-            .await
-            .is_err()
-        {
+        // CAS-with-reread, not a single blind attempt: a `Cas::Conflict`
+        // here means some other tombstone (with a different, or no,
+        // `restore_etag`) is already at this key -- silently treating that
+        // as success would proceed to purge under `pending`'s etag/archive
+        // while the *actually stored* tombstone still points `restore` at
+        // the wrong (or no) archived version.
+        let mut wrote_pending = false;
+        for _ in 0..3 {
+            match put_json(backend, &tombstone_key, &pending, tomb_etag.as_deref(), cipher).await {
+                Ok(Cas::Ok) => {
+                    wrote_pending = true;
+                    break;
+                }
+                Ok(Cas::Conflict) => {
+                    tomb_etag = get_json::<Tombstone>(backend, &tombstone_key, cipher).await.unwrap_or_default().1;
+                }
+                Err(_) => break,
+            }
+        }
+        if !wrote_pending {
             return; // couldn't even record intent -- nothing to retry from, bail
         }
 
