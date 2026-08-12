@@ -378,6 +378,16 @@ impl Table {
     ///   -- wasteful, not incorrect: [`Self::get`] already prefers the
     ///   newest manifest entry for any key, and overlapping SSTables are a
     ///   normal LSM state regardless of how they arose.
+    ///
+    /// Every failure path between the drain and the manifest append
+    /// restores the drained rows back into the memtable before returning:
+    /// without that, they'd only still exist in the (unreset) WAL, which
+    /// nothing re-replays into this already-open `Table` -- so within this
+    /// same process, `get`/`scan` would silently stop seeing them for as
+    /// long as the process keeps running, not just until the next
+    /// successful flush. Restoring them means a retried `flush()` (or a
+    /// plain read in the meantime) sees exactly the rows this attempt
+    /// failed to durably write.
     pub async fn flush(&self) -> Result<Option<FlushedSSTable>> {
         let mut state = self.state.lock().await;
         if state.memtable.is_empty() {
@@ -388,19 +398,33 @@ impl Table {
         // into their own AAD (see `sstable`'s module doc), so `build` needs
         // to know it up front, not after sealing.
         let (key, flushed_at_ms) = sstable::new_object_key(&self.root)?;
-        let (object, meta) = sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block)?;
+        let (object, meta) = match sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block)
+        {
+            Ok(v) => v,
+            Err(err) => {
+                state.memtable.restore(drained);
+                return Err(err);
+            }
+        };
 
-        match self.backend.put_cas(&key, object, None).await? {
-            Cas::Ok => {}
+        match self.backend.put_cas(&key, object, None).await {
+            Ok(Cas::Ok) => {}
             // The key includes a millisecond timestamp plus 128 bits of
             // randomness -- a genuine collision here would mean a bug
             // elsewhere, not a race worth retrying (same reasoning
             // `crate::txn::run_with_publisher` already applies to its own
             // random transaction id).
-            Cas::Conflict => bail!("SSTable key collision at {key} (should never happen)"),
+            Ok(Cas::Conflict) => {
+                state.memtable.restore(drained);
+                bail!("SSTable key collision at {key} (should never happen)");
+            }
+            Err(err) => {
+                state.memtable.restore(drained);
+                return Err(err);
+            }
         }
 
-        manifest::append(
+        if let Err(err) = manifest::append(
             self.backend.as_ref(),
             &self.cipher,
             &self.root,
@@ -414,7 +438,16 @@ impl Table {
                 flushed_at_ms,
             },
         )
-        .await?;
+        .await
+        {
+            // The SSTable object itself is already durable in the bucket at
+            // this point, just not yet referenced by the manifest -- restoring
+            // the rows here means a retried flush writes a second object and
+            // this one leaks, exactly the "future GC sweep can reclaim it"
+            // trade-off this method's own doc comment already accepts.
+            state.memtable.restore(drained);
+            return Err(err);
+        }
 
         state.wal.reset().await?;
         Ok(Some(FlushedSSTable {
@@ -476,7 +509,11 @@ async fn lookup_in_sstable(
     entry: &ManifestEntry,
     key: &[u8],
 ) -> Result<Option<MemValue>> {
-    let footer_offset = entry.byte_len - 8 - entry.footer_len;
+    let footer_offset = entry
+        .byte_len
+        .checked_sub(8)
+        .and_then(|n| n.checked_sub(entry.footer_len))
+        .with_context(|| format!("{}: manifest entry's byte_len/footer_len is corrupt", entry.key))?;
     let sealed_footer = backend
         .get_range(&entry.key, footer_offset, entry.footer_len)
         .await
@@ -523,7 +560,11 @@ async fn scan_sstable(
     end: Option<&[u8]>,
     predicates: &[query::Predicate],
 ) -> Result<Vec<(LsmKey, MemValue)>> {
-    let footer_offset = entry.byte_len - 8 - entry.footer_len;
+    let footer_offset = entry
+        .byte_len
+        .checked_sub(8)
+        .and_then(|n| n.checked_sub(entry.footer_len))
+        .with_context(|| format!("{}: manifest entry's byte_len/footer_len is corrupt", entry.key))?;
     let sealed_footer = backend
         .get_range(&entry.key, footer_offset, entry.footer_len)
         .await

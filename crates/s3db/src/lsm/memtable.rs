@@ -80,6 +80,17 @@ impl Memtable {
         std::mem::take(&mut self.entries)
     }
 
+    /// Undoes a [`Self::drain_sorted`] whose rows never actually made it
+    /// durable (an SSTable write or manifest append failed after the
+    /// drain) -- only ever called on a memtable still empty from that same
+    /// drain, so this is a straight restore, never a merge with anything
+    /// concurrent.
+    pub fn restore(&mut self, entries: BTreeMap<LsmKey, MemValue>) {
+        debug_assert!(self.entries.is_empty(), "restore undoes a drain, never merges into live entries");
+        self.approx_bytes = entries.iter().map(|(k, v)| k.len() + v.approx_bytes()).sum();
+        self.entries = entries;
+    }
+
     /// Every entry with `start <= key < end` (either bound `None` for
     /// unbounded), ascending -- the memtable's own contribution to
     /// [`super::Table::scan`], always the freshest since anything in here
