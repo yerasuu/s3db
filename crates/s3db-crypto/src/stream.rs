@@ -225,6 +225,14 @@ pub(crate) async fn open_stream(cipher: &Cipher, aad: &str, sealed_path: &Path, 
             .await
             .with_context(|| format!("truncated ciphertext (chunk {idx} of {num_chunks})"))?;
         let ciphertext_len = u32::from_le_bytes(len_bytes) as usize;
+        // The declared per-chunk length is storage-controlled, read before
+        // any AEAD check runs — bound it against the max this chunk could
+        // legitimately be (plaintext chunk size + tag) so a malicious
+        // storage provider can't force a multi-GiB allocation per chunk.
+        let expected_ciphertext_len = remaining.min(STREAM_CHUNK_LEN as u64) as usize + sealer.tag_len();
+        if ciphertext_len > expected_ciphertext_len {
+            bail!("invalid ciphertext (chunk {idx} of {num_chunks} declares an oversized length)");
+        }
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         input
