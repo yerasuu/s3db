@@ -17,6 +17,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const ENCRYPTION_META_KEY: &str = ".conf/encryption.json";
 /// Known plaintext sealed with the derived key, to validate it right at
@@ -68,7 +69,7 @@ pub async fn get_or_create_cipher_for(backend: &dyn Backend, mode: EncryptionMod
         }
     };
 
-    for _ in 0..MAX_BOOTSTRAP_RETRIES {
+    for attempt in 0..MAX_BOOTSTRAP_RETRIES {
         let (meta, etag) = get_json_plain::<EncryptionMeta>(backend, ENCRYPTION_META_KEY).await?;
 
         if etag.is_none() {
@@ -83,7 +84,14 @@ pub async fn get_or_create_cipher_for(backend: &dyn Backend, mode: EncryptionMod
                 Cas::Ok => return Ok(cipher),
                 // Another instance started at the same time and created the
                 // bucket first: we discard ours and use the one that won.
-                Cas::Conflict => continue,
+                // A brief backoff (not a busy-loop retry) before trying
+                // again gives whichever instance actually won a moment to
+                // finish, instead of every contender immediately re-reading
+                // and re-racing the same CAS.
+                Cas::Conflict => {
+                    tokio::time::sleep(Duration::from_millis(20 * (attempt as u64 + 1))).await;
+                    continue;
+                }
             }
         }
 

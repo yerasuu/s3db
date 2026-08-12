@@ -227,9 +227,8 @@ impl<T> TypedCache<T> {
     }
 
     /// A fresh cache hit for `name`, or `None` on a miss/expired entry --
-    /// the caller (`Collection::get_cached`) still has to fall back to a
-    /// real `get` + insert on `None`, this never talks to a `Backend`
-    /// itself.
+    /// the caller still has to fall back to a real `get` + [`Self::insert`]
+    /// on `None`, this never talks to a `Backend` itself.
     pub fn get(&self, name: &str) -> Option<(Arc<T>, Option<String>)> {
         let mut entries = self.entries.lock().unwrap();
         let hit = entries.get(name)?;
