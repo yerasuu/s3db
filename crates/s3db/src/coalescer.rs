@@ -16,6 +16,8 @@
 use crate::backend::{Backend, Cas};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -71,21 +73,42 @@ impl WriteCoalescer {
     /// prior call, or `key` was never written through this coalescer).
     /// CAS-with-reread, up to 3 attempts: see this module's own doc
     /// comment for why a blind CAS here would be wrong.
-    pub async fn flush(&self, key: &str) -> Result<Cas> {
-        let Some(value) = self.pending.lock().unwrap().remove(key) else {
-            return Ok(Cas::Ok);
-        };
-        let (_, mut expected_etag) = self.inner.get(key).await?;
-        for _ in 0..3 {
-            match self.inner.put_cas(key, value.clone(), expected_etag.as_deref()).await? {
-                Cas::Ok => return Ok(Cas::Ok),
-                Cas::Conflict => {
-                    let (_, etag) = self.inner.get(key).await?;
-                    expected_etag = etag;
+    ///
+    /// Exhausting those 3 attempts means sustained contention on `key`,
+    /// which is exactly the situation coalescing exists for -- so this
+    /// doesn't drop `value` on the floor. It's put back as the pending
+    /// write (unless a write that landed during these retries already
+    /// replaced it) and a fresh flush is scheduled after another debounce
+    /// window, same as [`Self::write`] would for a brand-new pending value.
+    ///
+    /// An explicit boxed-future return (rather than plain `async fn`) is
+    /// what lets the retry path below call `flush` again -- an `async fn`
+    /// can't recurse into its own opaque future type, only into a boxed,
+    /// type-erased one.
+    pub fn flush<'a>(self: &'a Arc<Self>, key: &'a str) -> Pin<Box<dyn Future<Output = Result<Cas>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(value) = self.pending.lock().unwrap().remove(key) else {
+                return Ok(Cas::Ok);
+            };
+            let (_, mut expected_etag) = self.inner.get(key).await?;
+            for _ in 0..3 {
+                match self.inner.put_cas(key, value.clone(), expected_etag.as_deref()).await? {
+                    Cas::Ok => return Ok(Cas::Ok),
+                    Cas::Conflict => {
+                        let (_, etag) = self.inner.get(key).await?;
+                        expected_etag = etag;
+                    }
                 }
             }
-        }
-        bail!("coalescer: too many CAS conflicts flushing {key} (giving up after 3 attempts)")
+            self.pending.lock().unwrap().entry(key.to_string()).or_insert(value);
+            let this = Arc::clone(self);
+            let retry_key = key.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(this.flush_interval).await;
+                let _ = this.flush(&retry_key).await;
+            });
+            bail!("coalescer: too many CAS conflicts flushing {key} (giving up after 3 attempts, retry scheduled)")
+        })
     }
 }
 
