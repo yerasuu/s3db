@@ -86,7 +86,10 @@ impl Memtable {
     /// drain, so this is a straight restore, never a merge with anything
     /// concurrent.
     pub fn restore(&mut self, entries: BTreeMap<LsmKey, MemValue>) {
-        debug_assert!(self.entries.is_empty(), "restore undoes a drain, never merges into live entries");
+        debug_assert!(
+            self.entries.is_empty(),
+            "restore undoes a drain, never merges into live entries"
+        );
         self.approx_bytes = entries.iter().map(|(k, v)| k.len() + v.approx_bytes()).sum();
         self.entries = entries;
     }

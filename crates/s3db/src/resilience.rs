@@ -243,10 +243,10 @@ impl RetryBackend {
         loop {
             match self.inner.put_cas(key, body.clone(), expected_etag).await {
                 Ok(Cas::Conflict) if retried_after_failure => {
-                    if let Ok((current_body, _etag)) = self.inner.get(key).await {
-                        if current_body == body {
-                            return Ok(Cas::Ok);
-                        }
+                    if let Ok((current_body, _etag)) = self.inner.get(key).await
+                        && current_body == body
+                    {
+                        return Ok(Cas::Ok);
                     }
                     return Ok(Cas::Conflict);
                 }

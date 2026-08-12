@@ -432,14 +432,14 @@ impl Table {
         // into their own AAD (see `sstable`'s module doc), so `build` needs
         // to know it up front, not after sealing.
         let (key, flushed_at_ms) = sstable::new_object_key(&self.root)?;
-        let (object, meta) = match sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block)
-        {
-            Ok(v) => v,
-            Err(err) => {
-                state.memtable.restore(drained);
-                return Err(err);
-            }
-        };
+        let (object, meta) =
+            match sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block) {
+                Ok(v) => v,
+                Err(err) => {
+                    state.memtable.restore(drained);
+                    return Err(err);
+                }
+            };
 
         match self.backend.put_cas(&key, object, None).await {
             Ok(Cas::Ok) => {}

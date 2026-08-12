@@ -346,7 +346,10 @@ impl Collection {
                     break;
                 }
                 Ok(Cas::Conflict) => {
-                    tomb_etag = get_json::<Tombstone>(backend, &tombstone_key, cipher).await.unwrap_or_default().1;
+                    tomb_etag = get_json::<Tombstone>(backend, &tombstone_key, cipher)
+                        .await
+                        .unwrap_or_default()
+                        .1;
                 }
                 Err(_) => break,
             }

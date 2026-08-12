@@ -91,7 +91,9 @@ async fn read_rev(path: &Path) -> Result<Option<u64>> {
 /// still lose the rename on some filesystems even though the file's own
 /// bytes were fsynced first.
 async fn fsync_dir(dir: &Path) -> Result<()> {
-    let dir_file = File::open(dir).await.with_context(|| format!("opening {}", dir.display()))?;
+    let dir_file = File::open(dir)
+        .await
+        .with_context(|| format!("opening {}", dir.display()))?;
     dir_file
         .sync_all()
         .await
