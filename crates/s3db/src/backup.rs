@@ -16,11 +16,11 @@
 //! same manifest, so a caller restoring from a backup sees the identical
 //! caveat rather than assuming more precision than the mechanism gives.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::collection::{Collection, Tombstone};
 use crate::payload::{get_json, put_json};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,6 +60,16 @@ pub struct BackupManifest {
     pub includes_tombstones: bool,
     pub entity_count: usize,
     pub tombstone_count: usize,
+    /// Entities that already existed at this `backup_id`'s destination key
+    /// (a `Cas::Conflict` on the create-only write, most likely a re-run of
+    /// a `backup_id` that was already used) and so were *not* written by
+    /// this call -- kept separate from `entity_count` so a caller can tell
+    /// "already backed up" apart from "freshly backed up" instead of the
+    /// manifest silently claiming every entity landed.
+    #[serde(default)]
+    pub entity_conflicts: usize,
+    #[serde(default)]
+    pub tombstone_conflicts: usize,
 }
 
 fn backup_prefix(backup_id: &str, collection_prefix: &str) -> String {
@@ -96,6 +106,7 @@ pub async fn backup_collection(
     let prefix = backup_prefix(backup_id, &collection.prefix);
 
     let mut entity_count = 0;
+    let mut entity_conflicts = 0;
     for name in collection.list_names(src_backend).await? {
         let key = collection.key(&name);
         let (sealed, etag) = src_backend.get(&key).await?;
@@ -105,16 +116,21 @@ pub async fn backup_collection(
         let plain = src_cipher.open(&key, &sealed)?;
         let dest_key = format!("{prefix}/{name}.json");
         let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None);
-        dest_backend.put_cas(&dest_key, resealed, None).await?;
-        entity_count += 1;
+        match dest_backend.put_cas(&dest_key, resealed, None).await? {
+            Cas::Ok => entity_count += 1,
+            Cas::Conflict => entity_conflicts += 1,
+        }
     }
 
     let mut tombstone_count = 0;
+    let mut tombstone_conflicts = 0;
     if include_tombstones {
         for (name, tombstone) in collection.list_tombstones(src_backend, src_cipher).await? {
             let dest_key = format!("{prefix}/.deleted/{name}.json");
-            put_json(dest_backend, &dest_key, &tombstone, None, dest_cipher).await?;
-            tombstone_count += 1;
+            match put_json(dest_backend, &dest_key, &tombstone, None, dest_cipher).await? {
+                Cas::Ok => tombstone_count += 1,
+                Cas::Conflict => tombstone_conflicts += 1,
+            }
         }
     }
 
@@ -127,6 +143,8 @@ pub async fn backup_collection(
         includes_tombstones: include_tombstones,
         entity_count,
         tombstone_count,
+        entity_conflicts,
+        tombstone_conflicts,
     };
     put_json(
         dest_backend,
@@ -184,10 +202,29 @@ pub async fn restore_collection(
         let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None);
         // Overwrites whatever's currently at `dest_key` -- restore is a
         // deliberate, caller-initiated overwrite, not a CAS-protected merge.
-        let (_, current_etag) = dest_backend.get(&dest_key).await?;
-        dest_backend
-            .put_cas(&dest_key, resealed, current_etag.as_deref())
-            .await?;
+        // CAS-with-reread, not a single blind attempt: the etag read above
+        // isn't atomic with the write below, so a write landing on
+        // `dest_key` in between must not silently leave this entity
+        // unrestored.
+        let (_, mut current_etag) = dest_backend.get(&dest_key).await?;
+        let mut restored = false;
+        for _ in 0..3 {
+            match dest_backend
+                .put_cas(&dest_key, resealed.clone(), current_etag.as_deref())
+                .await?
+            {
+                Cas::Ok => {
+                    restored = true;
+                    break;
+                }
+                Cas::Conflict => {
+                    current_etag = dest_backend.get(&dest_key).await?.1;
+                }
+            }
+        }
+        if !restored {
+            bail!("{dest_key}: too many CAS conflicts restoring it (giving up after 3 attempts)");
+        }
     }
 
     if manifest.includes_tombstones {
@@ -204,15 +241,30 @@ pub async fn restore_collection(
                 continue;
             }
             let dest_tombstone_key = format!("{}/.deleted/{name}.json", collection.prefix);
-            let (_, current_etag) = dest_backend.get(&dest_tombstone_key).await?;
-            put_json(
-                dest_backend,
-                &dest_tombstone_key,
-                &tombstone,
-                current_etag.as_deref(),
-                dest_cipher,
-            )
-            .await?;
+            let (_, mut current_etag) = dest_backend.get(&dest_tombstone_key).await?;
+            let mut restored = false;
+            for _ in 0..3 {
+                match put_json(
+                    dest_backend,
+                    &dest_tombstone_key,
+                    &tombstone,
+                    current_etag.as_deref(),
+                    dest_cipher,
+                )
+                .await?
+                {
+                    Cas::Ok => {
+                        restored = true;
+                        break;
+                    }
+                    Cas::Conflict => {
+                        current_etag = dest_backend.get(&dest_tombstone_key).await?.1;
+                    }
+                }
+            }
+            if !restored {
+                bail!("{dest_tombstone_key}: too many CAS conflicts restoring it (giving up after 3 attempts)");
+            }
         }
     }
 
