@@ -139,7 +139,13 @@ impl Backend for S3Backend {
                 Ok((bytes.to_vec(), etag))
             }
             Err(err) if is_not_found(&err) => Ok((Vec::new(), None)),
-            Err(err) => Err(err).with_context(|| format!("couldn't read {key} from S3")),
+            Err(err) => {
+                let permanent = status_is_permanent(&err);
+                tag_if(
+                    permanent,
+                    Err(err).with_context(|| format!("couldn't read {key} from S3")),
+                )
+            }
         }
     }
 
@@ -152,7 +158,7 @@ impl Backend for S3Backend {
             .and_then(|end| end.checked_sub(1))
             .with_context(|| format!("get_range: offset {offset} + len {len} overflows"))?;
         let range = format!("bytes={offset}-{end}");
-        let out = self
+        let out = match self
             .client
             .get_object()
             .bucket(&self.bucket)
@@ -160,7 +166,16 @@ impl Backend for S3Backend {
             .range(range)
             .send()
             .await
-            .with_context(|| format!("couldn't read range of {key} from S3"))?;
+        {
+            Ok(out) => out,
+            Err(err) => {
+                let permanent = status_is_permanent(&err);
+                return tag_if(
+                    permanent,
+                    Err(err).with_context(|| format!("couldn't read range of {key} from S3")),
+                );
+            }
+        };
         let bytes = out
             .body
             .collect()
@@ -184,7 +199,13 @@ impl Backend for S3Backend {
         match req.send().await {
             Ok(_) => Ok(Cas::Ok),
             Err(err) if is_precondition_failed(&err) => Ok(Cas::Conflict),
-            Err(err) => Err(err).with_context(|| format!("couldn't write {key} to S3")),
+            Err(err) => {
+                let permanent = status_is_permanent(&err);
+                tag_if(
+                    permanent,
+                    Err(err).with_context(|| format!("couldn't write {key} to S3")),
+                )
+            }
         }
     }
 
@@ -225,14 +246,20 @@ impl Backend for S3Backend {
                 .set_objects(Some(objects))
                 .build()
                 .context("building the delete request")?;
-            let out = self
+            let out = match self
                 .client
                 .delete_objects()
                 .bucket(&self.bucket)
                 .delete(delete)
                 .send()
                 .await
-                .context("deleting objects from S3")?;
+            {
+                Ok(out) => out,
+                Err(err) => {
+                    let permanent = status_is_permanent(&err);
+                    return tag_if(permanent, Err(err).context("deleting objects from S3"));
+                }
+            };
             outcome.confirmed += out.deleted().len();
             for err in out.errors() {
                 eprintln!(
@@ -253,10 +280,16 @@ impl Backend for S3Backend {
             if let Some(tok) = &continuation {
                 req = req.continuation_token(tok);
             }
-            let out = req
-                .send()
-                .await
-                .with_context(|| format!("listing {prefix} in {}", self.bucket))?;
+            let out = match req.send().await {
+                Ok(out) => out,
+                Err(err) => {
+                    let permanent = status_is_permanent(&err);
+                    return tag_if(
+                        permanent,
+                        Err(err).with_context(|| format!("listing {prefix} in {}", self.bucket)),
+                    );
+                }
+            };
             objects.extend(out.contents().iter().filter_map(|o| {
                 let key = o.key()?.to_string();
                 let size = o.size().unwrap_or(0).max(0) as u64;
@@ -376,6 +409,24 @@ pub fn is_not_found<E: std::error::Error + 'static>(err: &SdkError<E, HttpRespon
 /// the CAS would look like a hard error instead of a retry.
 pub fn is_precondition_failed<E: std::error::Error + 'static>(err: &SdkError<E, HttpResponse>) -> bool {
     matches!(raw_status(err), Some(412 | 409))
+}
+
+/// `true` for an SdkError whose status code `crate::backend::is_permanent_status`
+/// says will never be fixed by retrying -- computed here, before the error
+/// is consumed into an `anyhow::Error` by `.with_context`/`.context`, since
+/// the status code only exists on the original `SdkError`.
+fn status_is_permanent<E: std::error::Error + 'static>(err: &SdkError<E, HttpResponse>) -> bool {
+    raw_status(err).is_some_and(crate::backend::is_permanent_status)
+}
+
+/// Tags `result`'s error as [`crate::backend::permanent`] when `permanent`
+/// is `true` -- a no-op passthrough otherwise (including on `Ok`).
+fn tag_if<T>(permanent: bool, result: Result<T>) -> Result<T> {
+    if permanent {
+        result.map_err(crate::backend::permanent)
+    } else {
+        result
+    }
 }
 
 fn raw_status<E>(err: &SdkError<E, HttpResponse>) -> Option<u16> {

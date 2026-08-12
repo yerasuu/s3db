@@ -5,6 +5,52 @@ use anyhow::bail;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Wraps an error a driver already knows, from its own HTTP status code,
+/// will never succeed no matter how many times it's retried (bad request,
+/// auth failure, not found, ...) -- as opposed to a transient one (a
+/// dropped connection, a 429, a 5xx) that a retry might actually fix. See
+/// [`is_permanent`]/[`is_permanent_status`].
+///
+/// `Display`/`Debug` delegate straight through to the wrapped error, so
+/// tagging one this way never changes what a caller further up sees when
+/// it prints or logs it -- only [`is_permanent`] can tell the difference.
+#[derive(Debug)]
+struct Permanent(anyhow::Error);
+
+impl std::fmt::Display for Permanent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for Permanent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+/// Tags `err` as [`is_permanent`] -- a driver calls this at the point it
+/// already knows (from a status code it just checked) that retrying is
+/// pointless, right before handing the error back up to
+/// `crate::resilience::RetryBackend`.
+pub(crate) fn permanent(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(Permanent(err))
+}
+
+/// `true` if `err` was tagged via [`permanent`].
+pub(crate) fn is_permanent(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Permanent>().is_some()
+}
+
+/// `true` for an HTTP status a driver already checked that retrying will
+/// never fix: a malformed request, an auth failure, or a resource that
+/// genuinely doesn't exist -- as opposed to rate-limiting (429) or a
+/// server-side problem (5xx), both worth retrying, or no status at all (a
+/// network-level failure below the HTTP layer, also worth retrying).
+pub(crate) fn is_permanent_status(status: u16) -> bool {
+    matches!(status, 400 | 401 | 403 | 404 | 405 | 501)
+}
+
 /// Result of a compare-and-swap write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cas {

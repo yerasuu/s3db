@@ -111,6 +111,21 @@ fn is_precondition_failed(err: &AzureError) -> bool {
     err.http_status() == Some(StatusCode::PreconditionFailed)
 }
 
+/// See `crate::s3::status_is_permanent`'s doc comment -- same reasoning,
+/// just against this driver's own error type.
+fn status_is_permanent(err: &AzureError) -> bool {
+    err.http_status()
+        .is_some_and(|status| crate::backend::is_permanent_status(status.into()))
+}
+
+fn tag_if<T>(permanent: bool, result: Result<T>) -> Result<T> {
+    if permanent {
+        result.map_err(crate::backend::permanent)
+    } else {
+        result
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for AzureBackend {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -129,7 +144,13 @@ impl Backend for AzureBackend {
                 Ok((bytes.to_vec(), etag))
             }
             Err(e) if is_not_found(&e) => Ok((Vec::new(), None)),
-            Err(e) => Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't read {key} from Azure Blob Storage")),
+                )
+            }
         }
     }
 
@@ -142,12 +163,16 @@ impl Backend for AzureBackend {
             range: Some((offset..end).into()),
             ..Default::default()
         };
-        let result = self
-            .blob(key)
-            .await?
-            .download(Some(options))
-            .await
-            .with_context(|| format!("couldn't read range of {key} from Azure Blob Storage"))?;
+        let result = match self.blob(key).await?.download(Some(options)).await {
+            Ok(result) => result,
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                return tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't read range of {key} from Azure Blob Storage")),
+                );
+            }
+        };
         let bytes = result
             .body
             .collect()
@@ -175,7 +200,13 @@ impl Backend for AzureBackend {
         {
             Ok(_) => Ok(Cas::Ok),
             Err(e) if is_precondition_failed(&e) => Ok(Cas::Conflict),
-            Err(e) => Err(e).with_context(|| format!("couldn't write {key} to Azure Blob Storage")),
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't write {key} to Azure Blob Storage")),
+                )
+            }
         }
     }
 
@@ -246,14 +277,26 @@ impl Backend for AzureBackend {
         };
         let mut pages = container.list_blobs(Some(options))?.into_pages();
         let mut out = Vec::new();
-        while let Some(page) = pages
-            .try_next()
-            .await
-            .with_context(|| format!("listing {prefix} in Azure Blob Storage"))?
-        {
-            let page = page
-                .into_model()
-                .with_context(|| format!("listing {prefix} in Azure Blob Storage"))?;
+        while let Some(page) = match pages.try_next().await {
+            Ok(page) => page,
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                return tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("listing {prefix} in Azure Blob Storage")),
+                );
+            }
+        } {
+            let page = match page.into_model() {
+                Ok(page) => page,
+                Err(e) => {
+                    let permanent = status_is_permanent(&e);
+                    return tag_if(
+                        permanent,
+                        Err(e).with_context(|| format!("listing {prefix} in Azure Blob Storage")),
+                    );
+                }
+            };
             for item in page.blob_items {
                 let Some(name) = item.name else { continue };
                 let content_length = item.properties.as_ref().and_then(|p| p.content_length).unwrap_or(0);

@@ -220,6 +220,12 @@ impl RetryBackend {
         loop {
             match f().await {
                 Ok(value) => return Ok(value),
+                // A driver already checked this error's status code and
+                // knows no amount of retrying will fix it (bad request,
+                // auth failure, not found, ...) -- fail fast instead of
+                // burning `max_retries` round trips against a request
+                // that's never going to succeed.
+                Err(err) if crate::backend::is_permanent(&err) => return Err(err),
                 Err(err) if attempt >= self.max_retries => return Err(err),
                 Err(_) => {
                     tokio::time::sleep(self.backoff_for(attempt)).await;
@@ -251,6 +257,7 @@ impl RetryBackend {
                     return Ok(Cas::Conflict);
                 }
                 Ok(value) => return Ok(value),
+                Err(err) if crate::backend::is_permanent(&err) => return Err(err),
                 Err(err) if attempt >= self.max_retries => return Err(err),
                 Err(_) => {
                     retried_after_failure = true;

@@ -90,6 +90,20 @@ fn status_code(err: &google_cloud_gax::error::Error) -> Option<u16> {
     err.http_status_code()
 }
 
+/// See `crate::s3::status_is_permanent`'s doc comment -- same reasoning,
+/// just against this driver's own error type.
+fn status_is_permanent(err: &google_cloud_gax::error::Error) -> bool {
+    status_code(err).is_some_and(crate::backend::is_permanent_status)
+}
+
+fn tag_if<T>(permanent: bool, result: Result<T>) -> Result<T> {
+    if permanent {
+        result.map_err(crate::backend::permanent)
+    } else {
+        result
+    }
+}
+
 #[async_trait::async_trait]
 impl Backend for GcsBackend {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -101,7 +115,13 @@ impl Backend for GcsBackend {
         let mut resp = match storage.read_object(self.bucket_resource(), key).send().await {
             Ok(r) => r,
             Err(e) if status_code(&e) == Some(404) => return Ok((Vec::new(), None)),
-            Err(e) => return Err(e).with_context(|| format!("couldn't read {key} from Google Cloud Storage")),
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                return tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't read {key} from Google Cloud Storage")),
+                );
+            }
         };
         let etag = resp.object().generation.to_string();
         let mut bytes = Vec::new();
@@ -118,12 +138,21 @@ impl Backend for GcsBackend {
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         let (storage, _) = self.client_pair().await?;
-        let mut resp = storage
+        let mut resp = match storage
             .read_object(self.bucket_resource(), key)
             .set_read_range(ReadRange::segment(offset, len))
             .send()
             .await
-            .with_context(|| format!("couldn't read range of {key} from Google Cloud Storage"))?;
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                return tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't read range of {key} from Google Cloud Storage")),
+                );
+            }
+        };
         let mut bytes = Vec::new();
         while let Some(chunk) = resp
             .next()
@@ -153,7 +182,13 @@ impl Backend for GcsBackend {
         match builder.send_unbuffered().await {
             Ok(_) => Ok(Cas::Ok),
             Err(e) if status_code(&e) == Some(412) => Ok(Cas::Conflict),
-            Err(e) => Err(e).with_context(|| format!("couldn't write {key} to Google Cloud Storage")),
+            Err(e) => {
+                let permanent = status_is_permanent(&e);
+                tag_if(
+                    permanent,
+                    Err(e).with_context(|| format!("couldn't write {key} to Google Cloud Storage")),
+                )
+            }
         }
     }
 
@@ -238,7 +273,16 @@ impl Backend for GcsBackend {
         // feature; a plain `next()` loop needs nothing extra and paginates
         // the same way underneath.
         while let Some(item) = pager.next().await {
-            let obj = item.with_context(|| format!("listing {prefix} in Google Cloud Storage"))?;
+            let obj = match item {
+                Ok(obj) => obj,
+                Err(e) => {
+                    let permanent = status_is_permanent(&e);
+                    return tag_if(
+                        permanent,
+                        Err(e).with_context(|| format!("listing {prefix} in Google Cloud Storage")),
+                    );
+                }
+            };
             out.push((obj.name, obj.size.max(0) as u64));
         }
         Ok(out)

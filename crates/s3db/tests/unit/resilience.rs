@@ -83,6 +83,69 @@ async fn retry_backend_gives_up_after_max_retries() {
     assert!(retry.get("k").await.is_err());
 }
 
+#[derive(Debug, Default)]
+struct AlwaysPermanentFailure {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Backend for AlwaysPermanentFailure {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, _key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(crate::backend::permanent(anyhow::anyhow!(
+            "simulated permanent failure"
+        )))
+    }
+    async fn put_cas(&self, _key: &str, _body: Vec<u8>, _expected_etag: Option<&str>) -> Result<Cas> {
+        unimplemented!("not exercised by this test")
+    }
+    async fn delete(&self, _key: &str) -> Result<DeleteOutcome> {
+        unimplemented!("not exercised by this test")
+    }
+    async fn delete_many(&self, _keys: &[String]) -> Result<DeleteOutcome> {
+        unimplemented!("not exercised by this test")
+    }
+    async fn list_prefix(&self, _prefix: &str) -> Result<Vec<(String, u64)>> {
+        unimplemented!("not exercised by this test")
+    }
+    async fn get_range(&self, _key: &str, _offset: u64, _len: u64) -> Result<Vec<u8>> {
+        unimplemented!("not exercised by this test")
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, _key: &str, _source: &Path) -> Result<()> {
+        unimplemented!("not exercised by this test")
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, _key: &str, _dest: &Path) -> Result<()> {
+        unimplemented!("not exercised by this test")
+    }
+}
+
+/// A driver-tagged permanent failure must fail fast -- no sleep, no retry
+/// -- rather than burning `max_retries` attempts against a request that
+/// will never succeed. A huge `max_retries` with a real backoff would make
+/// this test hang if `RetryBackend` retried it even once; asserting the
+/// inner backend saw exactly one call proves it didn't.
+#[tokio::test]
+async fn retry_backend_fails_fast_on_a_permanent_error() {
+    let backend = Arc::new(AlwaysPermanentFailure::default());
+    let retry = RetryBackend::new(backend.clone(), 1000, Duration::from_secs(30));
+
+    let result = tokio::time::timeout(Duration::from_secs(2), retry.get("k")).await;
+    let err = result
+        .expect("must fail fast, not hang retrying")
+        .expect_err("a permanent failure must still surface as an error");
+    assert!(format!("{err:#}").contains("simulated permanent failure"));
+    assert_eq!(
+        backend.calls.load(Ordering::SeqCst),
+        1,
+        "a permanent failure must not be retried at all"
+    );
+}
+
 #[tokio::test]
 async fn throttled_backend_limits_concurrency() {
     let dir = tempfile::tempdir().unwrap();
