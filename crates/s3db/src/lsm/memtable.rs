@@ -82,16 +82,27 @@ impl Memtable {
 
     /// Undoes a [`Self::drain_sorted`] whose rows never actually made it
     /// durable (an SSTable write or manifest append failed after the
-    /// drain) -- only ever called on a memtable still empty from that same
-    /// drain, so this is a straight restore, never a merge with anything
-    /// concurrent.
-    pub fn restore(&mut self, entries: BTreeMap<LsmKey, MemValue>) {
-        debug_assert!(
-            self.entries.is_empty(),
-            "restore undoes a drain, never merges into live entries"
-        );
-        self.approx_bytes = entries.iter().map(|(k, v)| k.len() + v.approx_bytes()).sum();
-        self.entries = entries;
+    /// drain). Unlike a plain restore, this has to account for writes that
+    /// landed here in the meantime -- `older`'s drain happened, then this
+    /// memtable's own lock was released for the failed attempt's network
+    /// I/O (see `Table::flush`), so a key `older` shares with something
+    /// already back in `self.entries` keeps that newer value; `older`'s
+    /// copy of it is simply stale and gets dropped. Returns exactly the
+    /// entries that *were* restored, so the caller can re-append just
+    /// those to the WAL -- one already covered by a newer write is already
+    /// durable there, and re-appending it too would place a stale record
+    /// after the fresh one in file order, resurrecting it on replay.
+    pub fn merge_older(&mut self, older: BTreeMap<LsmKey, MemValue>) -> BTreeMap<LsmKey, MemValue> {
+        let mut restored = BTreeMap::new();
+        for (key, value) in older {
+            if self.entries.contains_key(&key) {
+                continue; // superseded by a write that landed after the drain
+            }
+            self.approx_bytes += key.len() + value.approx_bytes();
+            self.entries.insert(key.clone(), value.clone());
+            restored.insert(key, value);
+        }
+        restored
     }
 
     /// Every entry with `start <= key < end` (either bound `None` for

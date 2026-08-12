@@ -1,7 +1,9 @@
 use super::*;
+use crate::backend::DeleteOutcome;
 use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
 use crate::lsm::value::{ColumnDef, ValueKind};
+use std::time::Duration;
 
 fn test_backend(root: &std::path::Path) -> Arc<dyn Backend> {
     Arc::new(LocalBackend::new(&LocalParams {
@@ -18,6 +20,54 @@ async fn open_table(dir: &std::path::Path) -> Table {
     let backend = test_backend(dir);
     let config = TableConfig::new(backend, test_cipher(), "audit_log", dir.join("table.wal"));
     Table::open(config).await.unwrap()
+}
+
+/// Wraps a real backend so `put_cas` can be made to sleep and/or fail on
+/// demand -- lets a test observe what happens *during* `Table::flush`'s
+/// network I/O (a concurrent `put`'s own latency, what a failure restores)
+/// instead of only ever seeing the before/after.
+#[derive(Debug)]
+struct FaultyPutCas {
+    inner: Arc<dyn Backend>,
+    delay: Duration,
+    fail: bool,
+}
+
+#[async_trait::async_trait]
+impl Backend for FaultyPutCas {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        tokio::time::sleep(self.delay).await;
+        if self.fail {
+            anyhow::bail!("simulated put_cas failure");
+        }
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
 }
 
 #[tokio::test]
@@ -740,5 +790,90 @@ async fn scan_typed_decodes_rows_across_memtable_and_a_flushed_sstable() {
             (b"a".to_vec(), vec![Value::Int64(30), Value::Text("alice".into())]),
             (b"b".to_vec(), vec![Value::Int64(25), Value::Text("bob".into())]),
         ]
+    );
+}
+
+#[tokio::test]
+async fn flush_does_not_block_a_concurrent_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(FaultyPutCas {
+        inner: test_backend(dir.path()),
+        delay: Duration::from_millis(300),
+        fail: false,
+    });
+    let config = TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("table.wal"));
+    let table = Arc::new(Table::open(config).await.unwrap());
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+
+    let flush_table = Arc::clone(&table);
+    let flush_task = tokio::spawn(async move { flush_table.flush().await });
+    // Give the flush a moment to be sitting inside its (delayed) put_cas,
+    // not still holding the table's state lock.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let started = std::time::Instant::now();
+    table.put(b"b".to_vec(), b"2".to_vec()).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "a concurrent put must not wait for the in-flight flush's network I/O, took {:?}",
+        started.elapsed()
+    );
+
+    flush_task.await.unwrap().unwrap();
+    assert_eq!(table.get_unflushed(b"b").await, Some(MemValue::Put(b"2".to_vec())));
+}
+
+#[tokio::test]
+async fn flush_failure_restores_the_row_into_the_live_memtable() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(FaultyPutCas {
+        inner: test_backend(dir.path()),
+        delay: Duration::ZERO,
+        fail: true,
+    });
+    let config = TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("table.wal"));
+    let table = Table::open(config).await.unwrap();
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+
+    assert!(
+        table.flush().await.is_err(),
+        "the simulated put_cas failure must surface"
+    );
+    assert_eq!(
+        table.get_unflushed(b"a").await,
+        Some(MemValue::Put(b"1".to_vec())),
+        "a failed flush must restore the drained row instead of losing it"
+    );
+
+    // The table is still fully usable afterward -- the post-rotation WAL
+    // generation this restore wrote into isn't left in a broken state.
+    table.put(b"b".to_vec(), b"2".to_vec()).await.unwrap();
+    assert_eq!(table.get_unflushed(b"b").await, Some(MemValue::Put(b"2".to_vec())));
+}
+
+#[tokio::test]
+async fn flush_failure_does_not_clobber_a_write_that_landed_during_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(FaultyPutCas {
+        inner: test_backend(dir.path()),
+        delay: Duration::from_millis(150),
+        fail: true,
+    });
+    let config = TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("table.wal"));
+    let table = Arc::new(Table::open(config).await.unwrap());
+    table.put(b"a".to_vec(), b"old".to_vec()).await.unwrap();
+
+    let flush_table = Arc::clone(&table);
+    let flush_task = tokio::spawn(async move { flush_table.flush().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Lands on the fresh post-rotation memtable/WAL while the doomed flush
+    // is still sleeping inside its own put_cas.
+    table.put(b"a".to_vec(), b"new".to_vec()).await.unwrap();
+
+    assert!(flush_task.await.unwrap().is_err());
+    assert_eq!(
+        table.get_unflushed(b"a").await,
+        Some(MemValue::Put(b"new".to_vec())),
+        "the write that landed during the failed flush must win over the value it restores"
     );
 }

@@ -14,10 +14,11 @@ use super::value::{Schema, Value};
 use super::{LsmKey, Memtable, Wal, query, sstable};
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::fs;
 use tokio::sync::Mutex;
 
 /// 4 MiB — big enough that flushing doesn't dominate write cost, small
@@ -120,8 +121,11 @@ impl Table {
     /// Opens (or creates) this table's WAL and replays it into a fresh
     /// memtable — crash recovery, so a process that died between writes and
     /// its last flush comes back up with exactly the state it acked before
-    /// dying.
+    /// dying. Also heals a leftover rotated WAL from a flush that was
+    /// interrupted mid-checkpoint (see [`super::wal`]'s module doc) before
+    /// replaying, so that gets recovered too, not just plain writes.
     pub async fn open(config: TableConfig) -> Result<Self> {
+        super::wal::heal_rotating_wal(&config.wal_path).await?;
         let recovered = Wal::replay(&config.wal_path).await?;
         let wal = Wal::open(config.wal_path).await?;
         let mut memtable = Memtable::default();
@@ -393,52 +397,63 @@ impl Table {
     /// row count (see the module doc). `Ok(None)` if there was nothing to
     /// flush.
     ///
-    /// Ordered `put_cas` -> manifest append -> WAL reset specifically so
-    /// each failure mode is at worst wasteful, never silently lossy across
-    /// a restart:
+    /// The drain and the WAL rotation happen under `state`'s lock, but the
+    /// SSTable build and the two network calls (`put_cas`, then
+    /// `manifest::append`) run *after* releasing it: rotation (see
+    /// [`super::wal`]'s module doc) hands the WAL's current file off to a
+    /// `.rotating` sibling and puts a fresh, empty one in its place before
+    /// the lock is released, so [`Self::put`]/[`Self::delete`] calls landing
+    /// during this flush's I/O go to that fresh WAL and the now-empty
+    /// memtable, never blocking on (or racing) this flush's own network
+    /// round trips.
+    ///
+    /// Ordered `put_cas` -> manifest append -> rotated-file cleanup
+    /// specifically so each failure mode is at worst wasteful, never
+    /// silently lossy across a restart:
     /// - If the object write succeeds but the manifest append fails, the
     ///   object sits in the bucket unreferenced by anything (a leak a
-    ///   future GC sweep could reclaim) -- but the WAL hasn't been reset, so
-    ///   a crash or retry still replays these exact rows and flushes them
-    ///   again properly. Within *this* process, before that next flush,
-    ///   [`Self::get`] can't see these rows either (they're gone from the
-    ///   drained memtable, and the manifest never learned about the
-    ///   SSTable that has them) -- a narrow, transient availability gap on
-    ///   an error path, not a normal case.
-    /// - If the manifest append succeeds but resetting the WAL afterward
-    ///   fails, the WAL still holds records for rows now also durable and
-    ///   already visible via the new manifest entry. Replaying it again
-    ///   later just flushes the same rows into a second, redundant SSTable
-    ///   -- wasteful, not incorrect: [`Self::get`] already prefers the
-    ///   newest manifest entry for any key, and overlapping SSTables are a
-    ///   normal LSM state regardless of how they arose.
+    ///   future GC sweep could reclaim) -- but [`Self::abort_flush`] has put
+    ///   these rows (and, transitively, the rotated file's records) back
+    ///   somewhere replayable, so a crash or retry still recovers and
+    ///   flushes them again properly.
+    /// - If the manifest append succeeds but deleting the rotated file
+    ///   afterward fails, `Table::open`'s startup healing step folds it
+    ///   back into the live WAL next time -- replaying it again just
+    ///   flushes the same rows into a second, redundant SSTable -- wasteful,
+    ///   not incorrect: [`Self::get`] already prefers the newest manifest
+    ///   entry for any key, and overlapping SSTables are a normal LSM state
+    ///   regardless of how they arose.
     ///
-    /// Every failure path between the drain and the manifest append
-    /// restores the drained rows back into the memtable before returning:
-    /// without that, they'd only still exist in the (unreset) WAL, which
-    /// nothing re-replays into this already-open `Table` -- so within this
-    /// same process, `get`/`scan` would silently stop seeing them for as
-    /// long as the process keeps running, not just until the next
-    /// successful flush. Restoring them means a retried `flush()` (or a
-    /// plain read in the meantime) sees exactly the rows this attempt
-    /// failed to durably write.
+    /// Every failure path between the drain and the manifest append goes
+    /// through [`Self::abort_flush`], which restores the drained rows into
+    /// the (possibly, by then, no-longer-empty) live memtable and
+    /// re-persists exactly the ones a newer write hasn't already superseded
+    /// -- without that, they'd only still exist in the rotated file, which
+    /// nothing re-replays into this already-open `Table` until its next
+    /// restart, so `get`/`scan` would silently stop seeing them for as long
+    /// as the process keeps running.
     pub async fn flush(&self) -> Result<Option<FlushedSSTable>> {
-        let mut state = self.state.lock().await;
-        if state.memtable.is_empty() {
-            return Ok(None);
-        }
-        let drained = state.memtable.drain_sorted();
+        let (drained, rotating_path) = {
+            let mut state = self.state.lock().await;
+            if state.memtable.is_empty() {
+                return Ok(None);
+            }
+            let drained = state.memtable.drain_sorted();
+            let rotating_path = state.wal.rotate().await?;
+            (drained, rotating_path)
+        };
+
         // Decided before building: every block and the footer bind this key
         // into their own AAD (see `sstable`'s module doc), so `build` needs
         // to know it up front, not after sealing.
-        let (key, flushed_at_ms) = sstable::new_object_key(&self.root)?;
+        let (key, flushed_at_ms) = match sstable::new_object_key(&self.root) {
+            Ok(v) => v,
+            Err(err) => return self.abort_flush(drained, &rotating_path, err).await,
+        };
         let (object, meta) =
             match sstable::build(&self.cipher, &key, self.schema.as_ref(), &drained, self.rows_per_block) {
                 Ok(v) => v,
-                Err(err) => {
-                    state.memtable.restore(drained);
-                    return Err(err);
-                }
+                Err(err) => return self.abort_flush(drained, &rotating_path, err).await,
             };
 
         match self.backend.put_cas(&key, object, None).await {
@@ -449,13 +464,10 @@ impl Table {
             // `crate::txn::run_with_publisher` already applies to its own
             // random transaction id).
             Ok(Cas::Conflict) => {
-                state.memtable.restore(drained);
-                bail!("SSTable key collision at {key} (should never happen)");
+                let err = anyhow::anyhow!("SSTable key collision at {key} (should never happen)");
+                return self.abort_flush(drained, &rotating_path, err).await;
             }
-            Err(err) => {
-                state.memtable.restore(drained);
-                return Err(err);
-            }
+            Err(err) => return self.abort_flush(drained, &rotating_path, err).await,
         }
 
         if let Err(err) = manifest::append(
@@ -475,15 +487,19 @@ impl Table {
         .await
         {
             // The SSTable object itself is already durable in the bucket at
-            // this point, just not yet referenced by the manifest -- restoring
-            // the rows here means a retried flush writes a second object and
-            // this one leaks, exactly the "future GC sweep can reclaim it"
-            // trade-off this method's own doc comment already accepts.
-            state.memtable.restore(drained);
-            return Err(err);
+            // this point, just not yet referenced by the manifest -- same
+            // "future GC sweep can reclaim the leaked object" trade-off this
+            // method's own doc comment already accepts.
+            return self.abort_flush(drained, &rotating_path, err).await;
         }
 
-        state.wal.reset().await?;
+        // Durable: this rotated file's records are now redundant with the
+        // new manifest entry -- best-effort cleanup, same tolerance as
+        // every other "leaked file, not a correctness problem" path in this
+        // crate (if this fails, `Table::open`'s healing step still cleans
+        // it up correctly on the next restart).
+        let _ = fs::remove_file(&rotating_path).await;
+
         Ok(Some(FlushedSSTable {
             key,
             min_key: meta.min_key,
@@ -492,6 +508,37 @@ impl Table {
             byte_len: meta.byte_len,
             footer_len: meta.footer_len,
         }))
+    }
+
+    /// Undoes a failed [`Self::flush`] attempt: merges `drained` back into
+    /// the live memtable (a key a write already landed on since the drain
+    /// keeps that newer value -- see [`Memtable::merge_older`]) and
+    /// re-persists exactly the restored entries into the current WAL
+    /// generation, then returns `err` as this call's own result.
+    async fn abort_flush(
+        &self,
+        drained: BTreeMap<LsmKey, MemValue>,
+        rotating_path: &std::path::Path,
+        err: anyhow::Error,
+    ) -> Result<Option<FlushedSSTable>> {
+        let mut state = self.state.lock().await;
+        let restored = state.memtable.merge_older(drained);
+        for (key, value) in &restored {
+            let appended = match value {
+                MemValue::Put(bytes) => state.wal.append_put(key, bytes).await,
+                MemValue::Tombstone => state.wal.append_delete(key).await,
+            };
+            if appended.is_err() {
+                // Couldn't re-persist to the new WAL generation -- leave
+                // `rotating_path` alone rather than deleting it, so
+                // `Table::open`'s healing step can still recover these
+                // records from it if the process goes down before a later
+                // flush attempt succeeds.
+                return Err(err);
+            }
+        }
+        let _ = fs::remove_file(rotating_path).await;
+        Err(err)
     }
 
     /// `true` once this table's manifest has accumulated enough SSTables

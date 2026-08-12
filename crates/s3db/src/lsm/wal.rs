@@ -20,6 +20,16 @@
 //! truncated write in progress at the moment of the crash, always at the
 //! very end, and stopping there recovers everything before it instead of
 //! losing the whole log over its last, incomplete record.
+//!
+//! [`Wal::rotate`] lets [`super::Table::flush`] hand off the current file to
+//! a sibling `<path>.rotating` name and keep appending new writes to a
+//! fresh one at `path`, so a flush's SSTable build + bucket write can run
+//! without blocking those new writes on the same lock. If the process dies
+//! before the flush finishes cleaning that rotated file up,
+//! [`heal_rotating_wal`] (called from [`super::Table::open`]) folds it back
+//! into `path`, oldest-first, before anything replays it -- from then on
+//! it's exactly as if the crash had happened before the flush ever started
+//! rotating.
 
 use super::LsmKey;
 use super::memtable::MemValue;
@@ -32,6 +42,66 @@ use tokio::io::AsyncWriteExt;
 
 const TAG_PUT: u8 = 0;
 const TAG_DELETE: u8 = 1;
+
+/// The one fixed sibling name [`Wal::rotate`] hands the current file off
+/// to. A single fixed name (not a generation counter) is enough because
+/// [`super::Table`] never has more than one flush in flight at a time --
+/// its own `state` lock only ever gets rotated out from under one flush
+/// attempt before that attempt either finishes or aborts.
+fn rotating_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".rotating");
+    PathBuf::from(p)
+}
+
+/// Folds a leftover `<path>.rotating` file (left behind by a process that
+/// died between [`Wal::rotate`] and the flush that triggered it either
+/// finishing or cleaning the rotated file back up) into `path`, in the
+/// correct oldest-first order, before anything opens or replays `path` --
+/// see this module's own doc comment. A no-op if there's no such file,
+/// which is by far the common case (most flushes complete normally).
+pub async fn heal_rotating_wal(path: &Path) -> Result<()> {
+    let rotating = rotating_path(path);
+    let old_bytes = match fs::read(&rotating).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", rotating.display())),
+    };
+    let current_bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut combined = old_bytes;
+    combined.extend_from_slice(&current_bytes);
+
+    let dir = path.parent().context("WAL path has no parent directory")?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".s3db-wal-heal-")
+        .tempfile_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    let tmp_path = tmp.into_temp_path();
+    fs::write(&tmp_path, &combined)
+        .await
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    let file = fs::File::open(&tmp_path)
+        .await
+        .with_context(|| format!("reopening {}", tmp_path.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("syncing {}", tmp_path.display()))?;
+    drop(file);
+    tmp_path
+        .persist(path)
+        .with_context(|| format!("healing WAL -> {}", path.display()))?;
+
+    // The rotated file's content is now folded into `path` -- best-effort
+    // cleanup, same tolerance as every other post-recovery tidy-up in this
+    // crate; a leftover `.rotating` file next to an already-healed `path`
+    // is harmless (nothing reads it unless it's about to be healed again).
+    let _ = fs::remove_file(&rotating).await;
+    Ok(())
+}
 
 pub struct Wal {
     path: PathBuf,
@@ -99,6 +169,25 @@ impl Wal {
             .set_len(0)
             .await
             .with_context(|| format!("truncating WAL {}", self.path.display()))
+    }
+
+    /// Hands the current file off to its `.rotating` sibling and reopens a
+    /// fresh, empty file at this `Wal`'s own path for it to keep appending
+    /// to -- see this module's doc comment. Returns the rotated-away
+    /// file's path; the caller owns cleaning it up (or, on failure, folding
+    /// still-undurable records back into the WAL this `Wal` now represents).
+    pub async fn rotate(&mut self) -> Result<PathBuf> {
+        let rotating = rotating_path(&self.path);
+        fs::rename(&self.path, &rotating)
+            .await
+            .with_context(|| format!("rotating WAL {} -> {}", self.path.display(), rotating.display()))?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .with_context(|| format!("reopening WAL {}", self.path.display()))?;
+        Ok(rotating)
     }
 
     /// Replays `path` into an ordered map of the state it describes — a
