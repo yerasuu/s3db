@@ -26,6 +26,13 @@ pub struct S3Params {
     pub secret_access_key: String,
     #[serde(default)]
     pub path_style: bool,
+    /// A plain `http://` `endpoint_url` is refused by default -- credentials
+    /// and every object's body would ride cleartext on the wire. Set this to
+    /// opt in explicitly (a local MinIO/dev endpoint with no TLS in front of
+    /// it, say); real S3/R2 and any `https://` endpoint are unaffected
+    /// either way.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 impl std::fmt::Debug for S3Params {
@@ -37,6 +44,7 @@ impl std::fmt::Debug for S3Params {
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"REDACTED")
             .field("path_style", &self.path_style)
+            .field("allow_insecure_http", &self.allow_insecure_http)
             .finish()
     }
 }

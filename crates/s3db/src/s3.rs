@@ -42,7 +42,7 @@ pub struct S3Backend {
 }
 
 impl S3Backend {
-    pub fn new(cfg: &S3Params) -> Self {
+    pub fn new(cfg: &S3Params) -> Result<Self> {
         let region = cfg.region.clone().unwrap_or_else(|| DEFAULT_REGION.to_string());
         Self::from_parts(
             &cfg.bucket,
@@ -51,6 +51,7 @@ impl S3Backend {
             &region,
             cfg.endpoint_url.as_deref(),
             cfg.path_style,
+            cfg.allow_insecure_http,
         )
     }
 
@@ -59,7 +60,7 @@ impl S3Backend {
     /// region but the SDK still requires one — Cloudflare's own docs use
     /// `"auto"`. No path-style knob: R2 only supports path-style addressing,
     /// so there's nothing for a config field to toggle.
-    pub fn new_r2(cfg: &R2Params) -> Self {
+    pub fn new_r2(cfg: &R2Params) -> Result<Self> {
         let endpoint = format!("https://{}.r2.cloudflarestorage.com", cfg.account_id);
         Self::from_parts(
             &cfg.bucket,
@@ -68,6 +69,7 @@ impl S3Backend {
             "auto",
             Some(&endpoint),
             true,
+            false,
         )
     }
 
@@ -78,7 +80,17 @@ impl S3Backend {
         region: &str,
         endpoint_url: Option<&str>,
         path_style: bool,
-    ) -> Self {
+        allow_insecure_http: bool,
+    ) -> Result<Self> {
+        if let Some(endpoint) = endpoint_url {
+            anyhow::ensure!(
+                allow_insecure_http || !endpoint.starts_with("http://"),
+                "S3 endpoint_url {endpoint:?} is plain http:// -- credentials and object bodies \
+                 would ride cleartext. Use https://, or set allow_insecure_http = true to opt in \
+                 (e.g. a local MinIO/dev endpoint with no TLS in front of it)."
+            );
+        }
+
         let creds = Credentials::new(access_key_id, secret_access_key, None, None, "s3db");
 
         let mut builder = aws_sdk_s3::Config::builder()
@@ -100,10 +112,10 @@ impl S3Backend {
             builder = builder.endpoint_url(endpoint);
         }
 
-        S3Backend {
+        Ok(S3Backend {
             client: Client::from_conf(builder.build()),
             bucket: bucket.to_string(),
-        }
+        })
     }
 }
 

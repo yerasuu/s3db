@@ -139,12 +139,12 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
 
 /// Builds the right [`Backend`] for `cfg` — the single place that turns
 /// config into a live storage connection.
-pub fn build_backend(cfg: &BackendConfig) -> Arc<dyn Backend> {
-    match cfg {
-        BackendConfig::S3(params) => Arc::new(crate::s3::S3Backend::new(params)),
-        BackendConfig::R2(params) => Arc::new(crate::s3::S3Backend::new_r2(params)),
+pub fn build_backend(cfg: &BackendConfig) -> Result<Arc<dyn Backend>> {
+    Ok(match cfg {
+        BackendConfig::S3(params) => Arc::new(crate::s3::S3Backend::new(params)?),
+        BackendConfig::R2(params) => Arc::new(crate::s3::S3Backend::new_r2(params)?),
         BackendConfig::Azure(params) => Arc::new(crate::azure::AzureBackend::new(params)),
         BackendConfig::Gcs(params) => Arc::new(crate::gcs::GcsBackend::new(params)),
         BackendConfig::Local(params) => Arc::new(crate::local::LocalBackend::new(params)),
-    }
+    })
 }
