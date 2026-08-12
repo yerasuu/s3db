@@ -19,11 +19,9 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
-#[cfg(feature = "streaming")]
-use anyhow::bail;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use fs4::tokio::AsyncFileExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 
 const REV_SUFFIX: &str = ".s3dbrev";
@@ -61,6 +59,17 @@ impl FilesBackend {
         p.push(LOCK_SUFFIX);
         PathBuf::from(p)
     }
+}
+
+/// Rejects a key/prefix that could escape `root` once joined onto it — an
+/// absolute path or any `..` component would otherwise let a caller-
+/// controlled key read/write/delete/list arbitrary paths on disk.
+fn validate_key(key: &str) -> Result<()> {
+    let path = Path::new(key);
+    if path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
+        bail!("invalid key {key:?}: must be a relative path with no \"..\" segments");
+    }
+    Ok(())
 }
 
 /// Reads the decimal counter in `path`, or `None` if it doesn't exist yet.
@@ -175,6 +184,7 @@ impl Backend for FilesBackend {
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        validate_key(key)?;
         let data_path = self.data_path(key);
         let bytes = match fs::read(&data_path).await {
             Ok(b) => b,
@@ -187,6 +197,7 @@ impl Backend for FilesBackend {
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        validate_key(key)?;
         let data_path = self.data_path(key);
         let mut file = File::open(&data_path)
             .await
@@ -202,6 +213,7 @@ impl Backend for FilesBackend {
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        validate_key(key)?;
         let lock_file = lock_key(&self.lock_path(key)).await?;
         let rev_path = self.rev_path(key);
         let current = read_rev(&rev_path).await?;
@@ -217,6 +229,7 @@ impl Backend for FilesBackend {
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        validate_key(key)?;
         let lock_file = match lock_key(&self.lock_path(key)).await {
             Ok(f) => f,
             Err(e) => {
@@ -247,6 +260,7 @@ impl Backend for FilesBackend {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        validate_key(prefix)?;
         // Every prefix this crate actually scans with ends in '/' (a real
         // directory boundary — `.conf/txn/`, a collection's own prefix,
         // ...), so walking root.join(prefix) as a directory covers every
@@ -267,6 +281,7 @@ impl Backend for FilesBackend {
 
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
+        validate_key(key)?;
         let lock_file = lock_key(&self.lock_path(key)).await?;
         let rev_path = self.rev_path(key);
         let next = read_rev(&rev_path).await?.unwrap_or(0) + 1;
@@ -278,6 +293,7 @@ impl Backend for FilesBackend {
 
     #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
+        validate_key(key)?;
         let data_path = self.data_path(key);
         match fs::copy(&data_path, dest).await {
             Ok(_) => Ok(()),
