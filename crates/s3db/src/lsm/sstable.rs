@@ -164,6 +164,11 @@ pub fn build(
     write_block(cipher, sstable_key, schema, &mut object, &mut block_index, chunk)?; // trailing partial block, if any
 
     let bloom_bytes = bloom.to_bytes();
+    anyhow::ensure!(
+        bloom_bytes.len() <= u32::MAX as usize,
+        "bloom filter is {} bytes, over the u32 length prefix's limit",
+        bloom_bytes.len()
+    );
     let block_index_bytes = rmp_serde::to_vec_named(&block_index).expect("serializing a block index never fails");
     let mut footer_plain = Vec::with_capacity(4 + bloom_bytes.len() + block_index_bytes.len());
     footer_plain.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
@@ -214,6 +219,11 @@ fn write_block(
         &block_aad(sstable_key, block_idx),
         &plain,
         CompressionStrategy::Auto { threshold_bytes: 4096 },
+    );
+    anyhow::ensure!(
+        sealed.len() <= u32::MAX as usize,
+        "sealed block is {} bytes, over the u32 length prefix's limit -- reduce rows_per_block",
+        sealed.len()
     );
     let offset = object.len() as u64 + 4; // past this block's own length prefix
     object.extend_from_slice(&(sealed.len() as u32).to_le_bytes());

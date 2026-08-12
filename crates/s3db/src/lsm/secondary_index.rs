@@ -23,9 +23,21 @@
 
 use super::LsmKey;
 use super::table::{Table, TableConfig};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 
 const SEPARATOR: u8 = 0x00;
+
+/// Enforces this module's own documented invariant: `secondary` must never
+/// contain a `0x00` byte, or [`split_key`] would find *that* embedded byte
+/// instead of the real separator and silently hand back the wrong
+/// primary/secondary split for this entry.
+fn ensure_no_separator(secondary: &[u8]) -> Result<()> {
+    ensure!(
+        !secondary.contains(&SEPARATOR),
+        "{secondary:?}: secondary key contains a 0x00 byte, which this index reserves as its separator"
+    );
+    Ok(())
+}
 
 /// `secondary || 0x00 || primary` -- the actual key stored in the index
 /// table. Kept as a free function (not a method) since [`prefix_successor`]
@@ -87,10 +99,12 @@ impl SecondaryLsmIndex {
     }
 
     pub async fn put(&self, secondary: &[u8], primary: &[u8]) -> Result<()> {
+        ensure_no_separator(secondary)?;
         self.table.put(compose_key(secondary, primary), Vec::new()).await
     }
 
     pub async fn delete(&self, secondary: &[u8], primary: &[u8]) -> Result<()> {
+        ensure_no_separator(secondary)?;
         self.table.delete(compose_key(secondary, primary)).await
     }
 
@@ -108,6 +122,7 @@ impl SecondaryLsmIndex {
     /// `prefix_successor("ab\0")` because its third byte (`c`) is greater
     /// than the `0x00` the bound was built from.
     pub async fn lookup(&self, secondary: &[u8]) -> Result<Vec<LsmKey>> {
+        ensure_no_separator(secondary)?;
         let mut prefix = secondary.to_vec();
         prefix.push(SEPARATOR);
         let upper = prefix_successor(&prefix);
