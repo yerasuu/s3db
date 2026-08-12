@@ -169,7 +169,10 @@ impl Backend for RedbBackend {
                 .context("reading from redb")?
                 .with_context(|| format!("{key} doesn't exist"))?;
             let (_, body) = guard.value();
-            let (start, end) = (offset as usize, (offset + len) as usize);
+            let end = offset
+                .checked_add(len)
+                .with_context(|| format!("get_range: offset {offset} + len {len} overflows"))?;
+            let (start, end) = (offset as usize, end as usize);
             anyhow::ensure!(
                 end <= body.len(),
                 "requested range {start}..{end} of {key} exceeds its {} stored bytes",

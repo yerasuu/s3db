@@ -132,9 +132,14 @@ impl Backend for S3Backend {
     }
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        anyhow::ensure!(len > 0, "get_range: len must be > 0 (got 0 at offset {offset})");
         // `Range` is an inclusive-end HTTP byte range: `len` bytes starting
         // at `offset` ends at `offset + len - 1`.
-        let range = format!("bytes={offset}-{}", offset + len - 1);
+        let end = offset
+            .checked_add(len)
+            .and_then(|end| end.checked_sub(1))
+            .with_context(|| format!("get_range: offset {offset} + len {len} overflows"))?;
+        let range = format!("bytes={offset}-{end}");
         let out = self
             .client
             .get_object()

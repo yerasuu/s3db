@@ -134,8 +134,12 @@ impl Backend for AzureBackend {
     }
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        anyhow::ensure!(len > 0, "get_range: len must be > 0 (got 0 at offset {offset})");
+        let end = offset
+            .checked_add(len)
+            .with_context(|| format!("get_range: offset {offset} + len {len} overflows"))?;
         let options = BlobClientDownloadOptions {
-            range: Some((offset..offset + len).into()),
+            range: Some((offset..end).into()),
             ..Default::default()
         };
         let result = self
