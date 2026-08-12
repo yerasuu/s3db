@@ -200,9 +200,15 @@ impl RetryBackend {
     fn backoff_for(&self, attempt: u32) -> Duration {
         let max = self.base_backoff.saturating_mul(1u32 << attempt.min(10));
         let mut jitter = [0u8; 8];
-        getrandom::fill(&mut jitter).expect("system RNG unavailable");
-        let fraction = u64::from_le_bytes(jitter) as f64 / u64::MAX as f64;
-        max.mul_f64(fraction)
+        match getrandom::fill(&mut jitter) {
+            // RNG unavailable: fall back to the unjittered max delay rather
+            // than panicking mid-retry-loop over a missing jitter source.
+            Err(_) => max,
+            Ok(()) => {
+                let fraction = u64::from_le_bytes(jitter) as f64 / u64::MAX as f64;
+                max.mul_f64(fraction)
+            }
+        }
     }
 
     async fn run<T, F, Fut>(&self, f: F) -> Result<T>
@@ -222,6 +228,38 @@ impl RetryBackend {
             }
         }
     }
+
+    /// Same retry loop as [`Self::run`], but aware that a `Conflict` seen
+    /// only *after* we've already retried a transport failure might be our
+    /// own previous attempt landing server-side, not a real competing
+    /// writer -- the client saw `Err` (e.g. a dropped connection after the
+    /// write actually committed), retried the same conditional write, and
+    /// that retry now fails its own precondition against the object it
+    /// just wrote. Re-reading and comparing the stored body before
+    /// reporting `Conflict` tells the two cases apart.
+    async fn run_put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        let mut attempt = 0;
+        let mut retried_after_failure = false;
+        loop {
+            match self.inner.put_cas(key, body.clone(), expected_etag).await {
+                Ok(Cas::Conflict) if retried_after_failure => {
+                    if let Ok((current_body, _etag)) = self.inner.get(key).await {
+                        if current_body == body {
+                            return Ok(Cas::Ok);
+                        }
+                    }
+                    return Ok(Cas::Conflict);
+                }
+                Ok(value) => return Ok(value),
+                Err(err) if attempt >= self.max_retries => return Err(err),
+                Err(_) => {
+                    retried_after_failure = true;
+                    tokio::time::sleep(self.backoff_for(attempt)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -235,7 +273,7 @@ impl Backend for RetryBackend {
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
-        self.run(|| self.inner.put_cas(key, body.clone(), expected_etag)).await
+        self.run_put_cas(key, body, expected_etag).await
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
@@ -314,12 +352,16 @@ impl CircuitBreaker {
 
     /// `true` if a call should even be attempted right now.
     fn allow(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         match state.0 {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => false, // a trial is already in flight
             CircuitState::Open => {
-                let opened_at = state.1.expect("Open always has an opened_at");
+                // Missing `opened_at` shouldn't happen (`Open` is always set
+                // together with `Some(Instant::now())`), but treating it as
+                // "just opened" is a safe fallback -- fail closed rather
+                // than panic and poison this lock for every future call.
+                let opened_at = state.1.unwrap_or_else(Instant::now);
                 if opened_at.elapsed() >= self.config.open_duration {
                     state.0 = CircuitState::HalfOpen;
                     true
@@ -332,15 +374,22 @@ impl CircuitBreaker {
 
     fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::SeqCst);
-        *self.state.lock().unwrap() = (CircuitState::Closed, None);
+        *self.lock_state() = (CircuitState::Closed, None);
     }
 
     fn record_failure(&self) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         if state.0 == CircuitState::HalfOpen || failures >= self.config.failure_threshold {
             *state = (CircuitState::Open, Some(Instant::now()));
         }
+    }
+
+    /// A panic while holding this lock elsewhere must not wedge the breaker
+    /// shut forever -- recover the (possibly stale but still usable) state
+    /// instead of propagating the poison.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, (CircuitState, Option<Instant>)> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
