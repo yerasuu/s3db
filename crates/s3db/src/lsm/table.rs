@@ -214,6 +214,21 @@ impl Table {
         if let Some(value) = self.state.lock().await.memtable.get(key).cloned() {
             return Ok(mem_value_to_get_result(value));
         }
+        // One retry on any error: a concurrent `compact()` can swap the
+        // manifest over to a merged SSTable and delete the old ones right
+        // after this call loaded the *old* manifest but before it finished
+        // reading one of them, turning a perfectly normal compaction into a
+        // spurious "missing object" failure here. Reloading the manifest
+        // (which `get_from_sstables` does fresh each call) and trying again
+        // once resolves that -- a real, persistent failure still surfaces
+        // from the second attempt.
+        match self.get_from_sstables(key).await {
+            Ok(result) => Ok(result),
+            Err(_) => self.get_from_sstables(key).await,
+        }
+    }
+
+    async fn get_from_sstables(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
         for entry in manifest.sstables.iter().rev() {
             if key < entry.min_key.as_slice() || key > entry.max_key.as_slice() {
@@ -313,6 +328,31 @@ impl Table {
         end: Option<&[u8]>,
         predicates: &[query::Predicate],
     ) -> Result<BTreeMap<LsmKey, MemValue>> {
+        // Same one-retry reasoning as `Self::get_from_sstables`: a
+        // concurrent `compact()` can delete an SSTable this scan just
+        // started reading, right after this call's own manifest load --
+        // reload (each attempt calls `scan_sstables_merged` fresh) and try
+        // once more before treating it as a real failure.
+        let mut merged = match self.scan_sstables_merged(start, end, predicates).await {
+            Ok(merged) => merged,
+            Err(_) => self.scan_sstables_merged(start, end, predicates).await?,
+        };
+
+        // The memtable is always freshest -- applied last so it overrides
+        // whatever any SSTable had for the same key, tombstones included.
+        for (key, value) in self.state.lock().await.memtable.range(start, end) {
+            merged.insert(key, value);
+        }
+
+        Ok(merged)
+    }
+
+    async fn scan_sstables_merged(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        predicates: &[query::Predicate],
+    ) -> Result<BTreeMap<LsmKey, MemValue>> {
         let mut merged: BTreeMap<LsmKey, MemValue> = BTreeMap::new();
 
         let (manifest, _) = manifest::load(self.backend.as_ref(), &self.cipher, &self.root).await?;
@@ -338,12 +378,6 @@ impl Table {
             )
             .await?;
             merged.extend(rows);
-        }
-
-        // The memtable is always freshest -- applied last so it overrides
-        // whatever any SSTable had for the same key, tombstones included.
-        for (key, value) in self.state.lock().await.memtable.range(start, end) {
-            merged.insert(key, value);
         }
 
         Ok(merged)
