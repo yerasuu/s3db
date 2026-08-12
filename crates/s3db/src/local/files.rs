@@ -85,6 +85,19 @@ async fn read_rev(path: &Path) -> Result<Option<u64>> {
     }
 }
 
+/// fsyncs a directory itself -- the rename that lands a new name in it is
+/// only as durable as the directory entry that points at it; without this,
+/// power loss right after a successful [`write_atomic`]/[`put_cas`] can
+/// still lose the rename on some filesystems even though the file's own
+/// bytes were fsynced first.
+async fn fsync_dir(dir: &Path) -> Result<()> {
+    let dir_file = File::open(dir).await.with_context(|| format!("opening {}", dir.display()))?;
+    dir_file
+        .sync_all()
+        .await
+        .with_context(|| format!("syncing {}", dir.display()))
+}
+
 /// Writes `bytes` to `path` via a temp-file-then-rename so a reader never
 /// sees a half-written file.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -112,7 +125,7 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp_path
         .persist(path)
         .with_context(|| format!("moving temp file -> {}", path.display()))?;
-    Ok(())
+    fsync_dir(dir).await
 }
 
 /// Same discipline as [`write_atomic`], but streams `source`'s bytes into
@@ -147,7 +160,7 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     tmp_path
         .persist(path)
         .with_context(|| format!("moving temp file -> {}", path.display()))?;
-    Ok(())
+    fsync_dir(dir).await
 }
 
 /// Opens (creating if missing) and exclusively locks `<key>.s3dblock`,
