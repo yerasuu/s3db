@@ -41,6 +41,15 @@ use serde::de::DeserializeOwned;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// Ceiling on [`ShardEpoch::prefix_bits`] -- `2^20` (~1M) shards is far more
+/// than any real deployment's occupancy threshold should ever require, and
+/// [`ShardedIndex::occupancy`]'s per-shard `list_prefix` scan (plus
+/// [`ShardedIndex::complete_rebalance`]'s own per-shard copy pass) both cost
+/// more the more shards there are -- an unbounded doubling driven by noisy
+/// occupancy counts would eventually make routine maintenance itself the
+/// expensive operation.
+const MAX_PREFIX_BITS: u8 = 20;
+
 /// Durable rebalance state at `{root}/{kind}/.shard-epoch.json` -- see this
 /// module's doc comment for the two-phase protocol it drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -183,8 +192,16 @@ impl ShardedIndex {
         if epoch.prev_prefix_bits.is_some() {
             bail!("a rebalance is already in progress for {}/{}", self.root, self.kind);
         }
+        if epoch.prefix_bits >= MAX_PREFIX_BITS {
+            bail!(
+                "{}/{} is already at the {MAX_PREFIX_BITS}-bit shard ceiling ({} shards), refusing to grow further",
+                self.root,
+                self.kind,
+                1u32 << MAX_PREFIX_BITS
+            );
+        }
         epoch.prev_prefix_bits = Some(epoch.prefix_bits);
-        epoch.prefix_bits = epoch.prefix_bits.saturating_add(1).min(31);
+        epoch.prefix_bits = epoch.prefix_bits.saturating_add(1).min(MAX_PREFIX_BITS);
         epoch.epoch = epoch.epoch.wrapping_add(1);
         match put_json(backend, &self.epoch_key(), &epoch, etag.as_deref(), cipher).await? {
             crate::backend::Cas::Ok => {
@@ -323,6 +340,9 @@ impl ShardedIndex {
         let epoch = self.current_epoch(backend, cipher).await?;
         if epoch.prev_prefix_bits.is_some() {
             return Ok(false); // already migrating, don't stack another
+        }
+        if epoch.prefix_bits >= MAX_PREFIX_BITS {
+            return Ok(false); // already at the shard ceiling, nothing more to do
         }
         let counts = self.occupancy(backend, cipher, metrics).await?;
         if counts.into_iter().any(|c| c > threshold) {
