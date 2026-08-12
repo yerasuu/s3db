@@ -300,6 +300,60 @@ async fn put_versioned_fresh_create_archives_nothing() {
 }
 
 #[tokio::test]
+async fn created_at_bookkeeping_never_leaks_into_list_names_or_list_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let backend: Arc<dyn Backend> = Arc::new(backend);
+    let cipher = Arc::new(cipher);
+    let coll = Collection::new("widgets");
+    coll.put_versioned(backend.as_ref(), cipher.as_ref(), "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+
+    assert_eq!(coll.list_names(backend.as_ref()).await.unwrap(), vec!["a"]);
+    let all: Vec<Widget> = coll.list_all(&backend, &cipher).await.unwrap();
+    assert_eq!(all, vec![Widget { count: 1 }]);
+}
+
+#[tokio::test]
+async fn put_versioned_records_the_creation_time_only_on_the_first_fresh_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    assert_eq!(coll.created_at(&backend, &cipher, "a").await.unwrap(), None);
+
+    coll.put_versioned(&backend, &cipher, "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+    let created_at = coll
+        .created_at(&backend, &cipher, "a")
+        .await
+        .unwrap()
+        .expect("a fresh create must record its creation time");
+
+    let (_value, etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
+    coll.put_versioned(&backend, &cipher, "a", &Widget { count: 2 }, etag.as_deref())
+        .await
+        .unwrap();
+    assert_eq!(
+        coll.created_at(&backend, &cipher, "a").await.unwrap(),
+        Some(created_at),
+        "an update must never move the original creation time"
+    );
+}
+
+#[tokio::test]
+async fn plain_put_never_records_a_creation_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+    assert_eq!(coll.created_at(&backend, &cipher, "a").await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn put_versioned_update_archives_the_previous_value() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());

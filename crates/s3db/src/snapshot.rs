@@ -105,14 +105,13 @@ impl ReadSnapshot {
     /// (it was overwritten sometime after our snapshot point, so it must
     /// have still been live at that point). If no version was retired
     /// after `as_of_ms`, nothing has changed since the snapshot was taken,
-    /// so the current live value already is the answer.
-    ///
-    /// Known limitation (consistent with this module's "best-effort, not
-    /// real MVCC" framing): if `name` was created *after* `as_of_ms` and
-    /// has never been modified since, there's no history entry to rule
-    /// that out, and this will incorrectly report it as existing at
-    /// `as_of_ms` — this crate doesn't record a creation timestamp
-    /// separately from history.
+    /// so the current live value already is the answer -- *unless* `name`
+    /// didn't exist yet at `as_of_ms` either: [`Collection::created_at`]
+    /// (recorded by [`Collection::put_versioned`] at first create) rules
+    /// that phantom-read case out before falling back to the live value.
+    /// `None` from `created_at` (written only via plain [`Collection::put`],
+    /// or created before this tracking existed) can't rule it out either
+    /// way, so it falls back to the live value same as before.
     ///
     /// O(versions of `name`) -- this walks every archived version, since
     /// they aren't necessarily contiguous or bisectable (a version with no
@@ -144,10 +143,16 @@ impl ReadSnapshot {
             return collection.get_version(backend, cipher, name, &version).await;
         }
 
-        // No version was retired after `as_of_ms`: nothing has changed
-        // since, so the live value already is the answer (see this
-        // method's known-limitation note for the one case that isn't
-        // quite right).
+        if let Some(created_at_ms) = collection.created_at(backend, cipher, name).await?
+            && created_at_ms > self.as_of_ms
+        {
+            return Ok(None); // didn't exist yet at as_of_ms
+        }
+
+        // No version was retired after `as_of_ms`, and `name` either
+        // already existed by then or its creation time isn't known:
+        // nothing has changed since, so the live value already is the
+        // answer.
         let (value, etag) = collection.get::<T>(backend, cipher, name).await?;
         if etag.is_none() {
             return Ok(None);

@@ -67,6 +67,13 @@ struct HistoryTimestamp {
     archived_at_ms: u64,
 }
 
+/// Companion record at `{prefix}/.created/{name}.json` -- see
+/// [`Collection::record_created_at`]/[`Collection::created_at`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+struct CreatedAt {
+    created_at_ms: u64,
+}
+
 /// `Cow` rather than a plain `&'static str`: most collections (users,
 /// groups, ...) have a fixed prefix known at compile time, but a few are
 /// scoped per-call to some runtime value (e.g. "every permission grant
@@ -260,7 +267,44 @@ impl Collection {
                 self.archive_history_timestamp(backend, cipher, name, etag).await;
             }
         }
-        self.put(backend, cipher, name, value, expected_etag).await
+        let cas = self.put(backend, cipher, name, value, expected_etag).await?;
+        if expected_etag.is_none() && cas == Cas::Ok {
+            // A fresh create that actually landed -- see
+            // `Self::record_created_at`'s own doc comment for why this
+            // matters to `crate::snapshot::ReadSnapshot`.
+            self.record_created_at(backend, cipher, name).await;
+        }
+        Ok(cas)
+    }
+
+    fn created_at_key(&self, name: &str) -> String {
+        format!("{}/.created/{name}.json", self.prefix)
+    }
+
+    /// Records when `name` was first created via [`Self::put_versioned`] --
+    /// closes [`crate::snapshot::ReadSnapshot::get`]'s one documented
+    /// phantom-read gap: without this, an entity created after a
+    /// snapshot's `as_of_ms` and never modified since has no `.history/`
+    /// entry to rule that out, and would incorrectly appear to have
+    /// already existed at that moment. Best-effort and create-only, same
+    /// reasoning as [`Self::archive_history_timestamp`]: a lost race here
+    /// just means [`Self::created_at`] returns `None`, which
+    /// `ReadSnapshot::get` already treats as "can't place it in time,"
+    /// same tolerance as an unplaceable history version.
+    async fn record_created_at(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) {
+        let record = CreatedAt {
+            created_at_ms: now_ms(),
+        };
+        let _ = put_json(backend, &self.created_at_key(name), &record, None, cipher).await;
+    }
+
+    /// When `name` was first created via [`Self::put_versioned`], if known
+    /// -- `None` if it was never recorded (written only via plain
+    /// [`Self::put`], created before this tracking existed, or a lost race
+    /// on [`Self::record_created_at`]).
+    pub async fn created_at(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<Option<u64>> {
+        let (record, etag) = get_json::<CreatedAt>(backend, &self.created_at_key(name), cipher).await?;
+        Ok(etag.map(|_| record.created_at_ms))
     }
 
     fn history_timestamp_key(&self, name: &str, etag: &str) -> String {
@@ -559,13 +603,14 @@ impl Collection {
             .into_iter()
             .filter_map(|key| {
                 let rest = key.strip_prefix(&scan_prefix)?;
-                // `.history/`/`.deleted/` are this collection's own internal
-                // bookkeeping (archived versions, tombstones — see
-                // `Self::history_prefix`/`Self::tombstone_key`), not real
+                // `.history/`/`.deleted/`/`.created/` are this collection's
+                // own internal bookkeeping (archived versions, tombstones,
+                // creation timestamps — see `Self::history_prefix`/
+                // `Self::tombstone_key`/`Self::created_at_key`), not real
                 // entries; a real `name` never starts with `.` in practice
-                // (usernames, uids, ...), but this checks the exact two
+                // (usernames, uids, ...), but this checks the exact
                 // reserved prefixes rather than relying on that.
-                if rest.starts_with(".history/") || rest.starts_with(".deleted/") {
+                if rest.starts_with(".history/") || rest.starts_with(".deleted/") || rest.starts_with(".created/") {
                     return None;
                 }
                 match self.entropy {
