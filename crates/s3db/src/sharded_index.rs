@@ -99,9 +99,23 @@ impl ShardedIndex {
     /// steady stream of `claim_once`/`resolve` calls doesn't turn into a
     /// steady stream of extra reads just to check whether a rebalance
     /// happens to be running.
+    ///
+    /// The cache is only trusted while it shows *no* rebalance in flight:
+    /// once it does, staleness stops being harmless. A writer holding a
+    /// stale "rebalance in flight" epoch keeps computing `write_bits()` from
+    /// `prev_prefix_bits`, same as a fresh read would while the rebalance is
+    /// genuinely still running -- but if the rebalance has *actually*
+    /// finished (`complete_rebalance` already cleared `prev_prefix_bits`)
+    /// during the up-to-`epoch_cache_ttl` window since this cache entry was
+    /// fetched, that write lands on the now-abandoned old shard layout while
+    /// every fresh `resolve()` only checks the new one -- the entry becomes
+    /// permanently unresolvable. Always re-fetching in that state closes the
+    /// window entirely; the cache still fully applies to the (overwhelmingly
+    /// common) steady-state case where no rebalance is running.
     async fn current_epoch(&self, backend: &dyn Backend, cipher: &Cipher) -> Result<ShardEpoch> {
         if let Some((fetched_at, epoch)) = *self.epoch_cache.lock().unwrap()
             && fetched_at.elapsed() < self.epoch_cache_ttl
+            && epoch.prev_prefix_bits.is_none()
         {
             return Ok(epoch);
         }
@@ -195,29 +209,55 @@ impl ShardedIndex {
         };
         let old_shard_count = 1u32 << prev_bits.min(31);
 
-        for old_shard in 0..old_shard_count {
-            let prefix = self.shard_prefix(old_shard, prev_bits);
-            for old_key in list_all_keys(backend, &prefix).await? {
-                let segment_encoded = old_key
-                    .strip_prefix(&prefix)
-                    .and_then(|s| s.strip_suffix(".json"))
-                    .with_context(|| format!("{old_key}: doesn't match this index's own key shape"))?;
-                let raw = self.segment.decode(segment_encoded)?;
-                let new_key = self.key_for(&raw, epoch.prefix_bits);
-                if new_key == old_key {
-                    continue; // this entry's shard didn't actually change
+        // Copy in passes rather than once: a claimant can land a fresh
+        // write on the old layout after this pass's `list_all_keys` already
+        // ran over that shard (still correctly targeting the old layout --
+        // see `current_epoch`'s own doc comment -- just not yet moved).
+        // Re-scanning until a whole pass finds nothing left means
+        // `prev_prefix_bits` below only ever gets cleared once the old
+        // layout is verified empty, not just "empty as of one snapshot".
+        const MAX_COPY_PASSES: u32 = 5;
+        let mut settled = false;
+        for _ in 0..MAX_COPY_PASSES {
+            let mut moved_any = false;
+            for old_shard in 0..old_shard_count {
+                let prefix = self.shard_prefix(old_shard, prev_bits);
+                for old_key in list_all_keys(backend, &prefix).await? {
+                    let segment_encoded = old_key
+                        .strip_prefix(&prefix)
+                        .and_then(|s| s.strip_suffix(".json"))
+                        .with_context(|| format!("{old_key}: doesn't match this index's own key shape"))?;
+                    let raw = self.segment.decode(segment_encoded)?;
+                    let new_key = self.key_for(&raw, epoch.prefix_bits);
+                    if new_key == old_key {
+                        continue; // this entry's shard didn't actually change
+                    }
+                    let (sealed, key_etag) = backend.get(&old_key).await?;
+                    if key_etag.is_none() {
+                        continue; // already moved (or released) by a prior partial run
+                    }
+                    let plain = cipher.open(&old_key, &sealed)?;
+                    let resealed = cipher.seal(&new_key, &plain, crate::cipher::CompressionStrategy::None);
+                    // Create-only, idempotent for the same content -- same
+                    // reasoning as `Collection::delete`'s own archive step.
+                    backend.put_cas(&new_key, resealed, None).await?;
+                    delete_object(backend, &old_key).await;
+                    moved_any = true;
                 }
-                let (sealed, key_etag) = backend.get(&old_key).await?;
-                if key_etag.is_none() {
-                    continue; // already moved (or released) by a prior partial run
-                }
-                let plain = cipher.open(&old_key, &sealed)?;
-                let resealed = cipher.seal(&new_key, &plain, crate::cipher::CompressionStrategy::None);
-                // Create-only, idempotent for the same content -- same
-                // reasoning as `Collection::delete`'s own archive step.
-                backend.put_cas(&new_key, resealed, None).await?;
-                delete_object(backend, &old_key).await;
             }
+            if !moved_any {
+                settled = true;
+                break;
+            }
+        }
+        // Still draining after `MAX_COPY_PASSES` (sustained writes landing
+        // on the old layout faster than each pass can move them) -- leave
+        // `prev_prefix_bits` set so `resolve()` keeps checking the old
+        // layout too, and a later maintenance-triggered `complete_rebalance`
+        // call can keep draining it, instead of silently abandoning
+        // stragglers by declaring the rebalance done anyway.
+        if !settled {
+            return Ok(());
         }
 
         let done = ShardEpoch {
