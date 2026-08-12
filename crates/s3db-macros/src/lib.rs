@@ -35,7 +35,7 @@ struct IndexField {
     segment: Segment,
     root: Option<String>,
     kind: Option<String>,
-    pointer_field: Option<String>,
+    pointer_field: Option<syn::Ident>,
 }
 
 /// Parsed `#[entity(index(...))]` args, before the `is_optional` check
@@ -46,7 +46,7 @@ struct IndexArgs {
     segment: Segment,
     root: Option<String>,
     kind: Option<String>,
-    pointer_field: Option<String>,
+    pointer_field: Option<syn::Ident>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -107,18 +107,22 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                             if inner.path.is_ident("segment") {
                                 let value = inner.value()?;
                                 let lit: Lit = value.parse()?;
-                                if let Lit::Str(s) = lit {
-                                    segment = match s.value().as_str() {
-                                        "base64" => Segment::Base64,
-                                        "raw" => Segment::Raw,
-                                        other => {
-                                            return Err(syn::Error::new_spanned(
-                                                s,
-                                                format!("unknown segment kind {other:?}, expected \"raw\" or \"base64\""),
-                                            ));
-                                        }
-                                    };
-                                }
+                                let Lit::Str(s) = lit else {
+                                    return Err(syn::Error::new_spanned(
+                                        lit,
+                                        "segment must be a string literal, expected \"raw\" or \"base64\"",
+                                    ));
+                                };
+                                segment = match s.value().as_str() {
+                                    "base64" => Segment::Base64,
+                                    "raw" => Segment::Raw,
+                                    other => {
+                                        return Err(syn::Error::new_spanned(
+                                            s,
+                                            format!("unknown segment kind {other:?}, expected \"raw\" or \"base64\""),
+                                        ));
+                                    }
+                                };
                                 return Ok(());
                             }
                             if inner.path.is_ident("root") {
@@ -130,7 +134,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                                 return Ok(());
                             }
                             if inner.path.is_ident("pointer_field") {
-                                pointer_field = Some(parse_str_value(&inner)?);
+                                pointer_field = Some(parse_ident_value(&inner)?);
                                 return Ok(());
                             }
                             Err(inner.error("unsupported #[entity(index(...))] key, expected \"segment\", \"root\", \"kind\", or \"pointer_field\""))
@@ -198,7 +202,10 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .clone()
             .unwrap_or_else(|| format!("{collection_prefix}.index"));
         let kind = index.kind.clone().unwrap_or_else(|| field_ident.to_string());
-        let pointer_field = format_ident!("{}", index.pointer_field.clone().unwrap_or_else(|| "key".to_string()));
+        let pointer_field = index
+            .pointer_field
+            .clone()
+            .unwrap_or_else(|| syn::Ident::new("key", field_ident.span()));
         let segment_tokens = match index.segment {
             Segment::Raw => quote! { s3db::Segment::Raw },
             Segment::Base64 => quote! { s3db::Segment::Base64 },
@@ -343,6 +350,17 @@ fn parse_str_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<String> {
     let value = meta.value()?;
     let lit: syn::LitStr = value.parse()?;
     Ok(lit.value())
+}
+
+/// Like [`parse_str_value`], but for keys (`pointer_field = "..."`) whose
+/// value must be usable as a Rust field name in generated code — validated
+/// here so a bad string produces a clean `syn::Error` pointing at the
+/// literal, instead of a `format_ident!`/`Ident::new` panic later.
+fn parse_ident_value(meta: &syn::meta::ParseNestedMeta) -> syn::Result<syn::Ident> {
+    let value = meta.value()?;
+    let lit: syn::LitStr = value.parse()?;
+    syn::parse_str::<syn::Ident>(&lit.value())
+        .map_err(|_| syn::Error::new_spanned(&lit, format!("{:?} is not a valid identifier", lit.value())))
 }
 
 fn is_option_type(ty: &syn::Type) -> bool {
