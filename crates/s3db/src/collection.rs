@@ -702,34 +702,83 @@ impl Collection {
 
     pub async fn list_names(&self, backend: &dyn Backend) -> Result<Vec<String>> {
         let scan_prefix = format!("{}/", self.prefix);
+        // `name_from_key` drops this collection's own bookkeeping
+        // (`.history/`, `.deleted/`, `.created/`, `.schema.json`), which is
+        // never an entry.
         let mut names: Vec<String> = list_all_keys(backend, &scan_prefix)
             .await?
             .into_iter()
-            .filter_map(|key| {
-                let rest = key.strip_prefix(&scan_prefix)?;
-                // `.history/`/`.deleted/`/`.created/` are this collection's
-                // own internal bookkeeping (archived versions, tombstones,
-                // creation timestamps — see `Self::history_prefix`/
-                // `Self::tombstone_key`/`Self::created_at_key`), not real
-                // entries; a real `name` never starts with `.` in practice
-                // (usernames, uids, ...), but this checks the exact
-                // reserved prefixes rather than relying on that.
-                if rest.starts_with(".history/") || rest.starts_with(".deleted/") || rest.starts_with(".created/") {
-                    return None;
-                }
-                match self.entropy {
-                    KeyEntropy::None => rest.strip_suffix(self.suffix).map(str::to_string),
-                    // `rest` is "{bucket:04x}/{name}{suffix}" -- skip the
-                    // bucket segment, it's not part of `name`.
-                    KeyEntropy::HashPrefix { .. } => {
-                        let (_bucket, name_and_suffix) = rest.split_once('/')?;
-                        name_and_suffix.strip_suffix(self.suffix).map(str::to_string)
-                    }
-                }
-            })
+            .filter_map(|key| self.name_from_key(&key, &scan_prefix))
             .collect();
         names.sort();
         Ok(names)
+    }
+
+    /// One page of [`Self::list_names`], in ascending name order.
+    ///
+    /// Same cursor contract as [`Backend::list_page`] (`after` is a *name*
+    /// here, not a key, since that's what a caller of this method holds),
+    /// for the case `list_names` can't serve: a collection large enough that
+    /// materializing every name at once is the problem — a migration pass, an
+    /// export, a sweep over millions of entries.
+    ///
+    /// Because this collection's reserved bookkeeping namespaces get filtered
+    /// *after* the page comes back, a page can contain fewer than `limit`
+    /// names while more still remain; trust the returned cursor, never the
+    /// page's length, to decide whether to continue.
+    pub async fn list_names_page(
+        &self,
+        backend: &dyn Backend,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<String>, Option<String>)> {
+        let scan_prefix = format!("{}/", self.prefix);
+        // The cursor a caller hands back is a name; the backend wants a key.
+        let after_key = match after {
+            Some(name) => Some(self.key(name)?),
+            None => None,
+        };
+        let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit).await?;
+        let mut names = Vec::with_capacity(page.entries.len());
+        for (key, _size) in &page.entries {
+            if let Some(name) = self.name_from_key(key, &scan_prefix) {
+                names.push(name);
+            }
+        }
+        let next_after = match page.next_after {
+            // Translate the backend's key cursor back into a name cursor. A
+            // page whose last key is bookkeeping (so it produced no name)
+            // still has to advance, hence the cursor comes from the key, not
+            // from `names.last()`.
+            Some(key) => self.name_from_key(&key, &scan_prefix),
+            None => None,
+        };
+        Ok((names, next_after))
+    }
+
+    /// The entity name a full object key belongs to, or `None` if the key is
+    /// this collection's own bookkeeping rather than an entry. Shared by
+    /// [`Self::list_names`] and [`Self::list_names_page`] so the two can't
+    /// disagree about what counts as an entry.
+    fn name_from_key(&self, key: &str, scan_prefix: &str) -> Option<String> {
+        let rest = key.strip_prefix(scan_prefix)?;
+        // Anything under this prefix whose first component starts with `.` is
+        // this crate's own bookkeeping, never an entry: `validate_path`
+        // forbids a name from starting one, so the rule is exact rather than
+        // heuristic. It used to be a list of the three known namespaces
+        // (`.history/`, `.deleted/`, `.created/`), which silently admitted
+        // the next one added -- `migrate`'s `.schema.json` -- as an entry
+        // named ".schema", whose key then failed to build at all.
+        if rest.starts_with('.') {
+            return None;
+        }
+        match self.entropy {
+            KeyEntropy::None => rest.strip_suffix(self.suffix).map(str::to_string),
+            KeyEntropy::HashPrefix { .. } => {
+                let (_bucket, name_and_suffix) = rest.split_once('/')?;
+                name_and_suffix.strip_suffix(self.suffix).map(str::to_string)
+            }
+        }
     }
 
     /// Every archived etag for `name`, sorted. There is deliberately no

@@ -37,6 +37,7 @@ pub mod key_rotation;
 pub mod lsm;
 pub mod maintenance;
 pub mod metrics;
+pub mod migrate;
 pub mod multi_index;
 mod naming;
 pub mod ordinal;
@@ -76,6 +77,7 @@ pub use lsm::{
 };
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
+pub use migrate::{AppliedMigration, InProgress, MigrationReport, Rewrite, SchemaState};
 pub use multi_index::MultiIndex;
 pub use payload::{
     MAX_OBJECT_BYTES, SweepReport, count_prefix, delete_object, delete_prefix, get_json, list_all_keys, put_json,

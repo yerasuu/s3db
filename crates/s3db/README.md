@@ -283,6 +283,22 @@ A `Preparing` record at `.conf/txn/<txn_id>.json` survives a crash mid-transacti
 s3db::txn::run_with_publisher(backend, &cipher, ops, &my_publisher).await?;
 ```
 
+## Schema migrations (opt-in)
+
+MessagePack plus `serde` already handles the easy half of schema evolution: adding an `Option` field or dropping one needs no migration. The other half — renaming a field, changing its type, backfilling a value with no sensible `Default` — needs every stored entry rewritten, and needs somebody to remember which rewrites already ran. `migrate` is that bookkeeping, per collection, at `<prefix>/.schema.json`:
+
+```rust
+let report = s3db::migrate::migrate_entries::<WorkV1, WorkV2, _>(
+    &backend, &cipher, &WORKS, /* version */ 1, "split name into title+lang",
+    |old| Ok(Rewrite::Write(WorkV2 { title: old.name, lang: "en".into() })),
+).await?;
+// report.ran == false when the recorded version already covered it
+```
+
+The record holds the highest version applied, an audit trail of each migration, and a **resume cursor** checkpointed once per page. The cursor is what makes this safe on a large collection: a pass that dies halfway would otherwise have to either re-run from the start — feeding already-converted entries back into a transform that has no reason to accept them — or bump the version and abandon the tail. A resumed run continues from exactly where it stopped, so the transform only ever sees `Old` values.
+
+Entries are rewritten under CAS, so a concurrent writer is never silently clobbered; it lands in `MigrationReport::conflicted` instead, and re-running picks those up. `Rewrite::Keep` skips an entry without a write. `migrate::baseline` adopts the mechanism on data that already predates it, and refuses to lower a recorded version.
+
 ## Point-in-time reads (opt-in)
 
 `snapshot::ReadSnapshot` gives a best-effort, time-bounded view over a `Collection`'s `.history/` archive — **not** real MVCC, no cross-entity atomicity, same honesty `backup::BackupConsistency::FuzzySnapshot` already commits to for a full-bucket backup, just at single-entity scale:
