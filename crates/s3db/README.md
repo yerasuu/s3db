@@ -360,6 +360,16 @@ let reports = scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;  // per 
 
 `MaintenanceScanner` is narrower than a single-scan-many-conditions design might suggest: there's no schema-migration or key-rotation rescan in this crate to fuse in (see `maintenance`'s own module doc for why neither applies today), so what it actually consolidates is running `gc::sweep` over every registered collection from one call and one config, not fusing separate scans into a single read per object.
 
+### Driving an LSM table's maintenance
+
+A `Table` acks a write once its local WAL is durable — nothing is in the bucket, and nothing is visible to another process, until a flush turns the memtable into an SSTable; and every flush adds one more SSTable for reads to consult, so compaction has to happen too. `lsm::maintenance::tick` runs both, flush first (the flush is what pushes the count over the compaction threshold, so the other order always defers the newest SSTable by a tick):
+
+```rust
+let report = s3db::lsm::maintenance::tick(&table, &LsmMaintenanceConfig::default()).await?;
+```
+
+Deliberately a `tick` you drive from your own timer, not a task this crate spawns: who owns the background task, how it shuts down, and whether flushes may contend with foreground writes are all caller decisions. `flush_even_if_small` publishes an under-threshold memtable anyway — write amplification traded for visibility, which is the right trade when the readers are in other processes, since that is the only way they see anything at all.
+
 ## Write-ahead log (opt-in)
 
 `txn::run` already recovers a crashed multi-key transaction; `wal` covers the gap that leaves — a single `put_cas` outside a transaction whose response never arrives, so nobody can tell "never attempted" from "attempted, landed or not, we don't know" from the outside:

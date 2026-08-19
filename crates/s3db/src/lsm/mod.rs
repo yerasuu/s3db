@@ -42,6 +42,7 @@
 mod bloom;
 pub mod compactor;
 mod location;
+pub mod maintenance;
 pub mod manifest;
 mod memtable;
 pub mod query;
@@ -54,6 +55,7 @@ mod wal;
 
 pub use compactor::{CompactionReport, compact, should_compact};
 pub use location::{BackendRegistry, DEFAULT_BACKEND_ID, TableLocation};
+pub use maintenance::{LsmMaintenanceConfig, LsmMaintenanceReport, tick};
 pub use manifest::{Manifest, ManifestEntry};
 pub use memtable::{MemValue, Memtable};
 pub use query::Predicate;

@@ -387,6 +387,16 @@ impl Table {
         Ok(merged)
     }
 
+    /// `true` when the memtable holds nothing to flush. Distinct from
+    /// [`Self::should_flush`], which asks whether a flush is *due*: a table
+    /// can hold acked writes that haven't reached the threshold, and a caller
+    /// that wants those published anyway (see
+    /// [`super::maintenance::LsmMaintenanceConfig::flush_even_if_small`])
+    /// needs to tell "nothing to do" apart from "not yet worth it".
+    pub async fn is_empty(&self) -> bool {
+        self.state.lock().await.memtable.is_empty()
+    }
+
     pub async fn should_flush(&self) -> bool {
         self.state.lock().await.memtable.approx_bytes() >= self.flush_threshold_bytes
     }
