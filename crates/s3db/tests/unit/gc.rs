@@ -25,7 +25,7 @@ async fn sweep_leaves_a_fresh_pending_tombstone_alone() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
 
     let report = sweep(&backend, &cipher, &coll, &GcConfig::default()).await.unwrap();
     assert_eq!(
@@ -42,7 +42,7 @@ async fn sweep_retries_an_aged_pending_delete() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
     // Since LocalBackend's own delete always confirms, the tombstone is
     // already Purged after `delete` -- age it out immediately with a
     // zero retry threshold instead, which exercises the same "past
@@ -66,7 +66,7 @@ async fn sweep_forgets_an_aged_purged_tombstone() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await; // LocalBackend confirms -> tombstone is Purged
+    coll.delete(&backend, &cipher, "a").await.unwrap(); // LocalBackend confirms -> tombstone is Purged
     tokio::time::sleep(Duration::from_millis(5)).await; // ensure strictly past a zero-width grace period
 
     let config = GcConfig {

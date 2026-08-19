@@ -109,7 +109,7 @@ async fn release_removes_the_entry_from_whichever_layout_it_is_in() {
     idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
         .await
         .unwrap();
-    idx.release(&backend, &cipher, "alice").await;
+    idx.release(&backend, &cipher, "alice").await.unwrap();
     let (resolved, _) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
     assert_eq!(resolved, None);
 }

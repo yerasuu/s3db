@@ -258,10 +258,11 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
             /// Best-effort release of this `#field_ident` claim — a no-op if
             /// the field is `None` on an optional index.
-            pub async fn #release(&self, backend: &dyn s3db::Backend) {
+            pub async fn #release(&self, backend: &dyn s3db::Backend) -> anyhow::Result<()> {
                 if let Some(raw) = #value_expr {
-                    Self::#const_name.release(backend, raw).await;
+                    Self::#const_name.release(backend, raw).await?;
                 }
+                Ok(())
             }
 
             /// Builds (but doesn't send) a create-only claim of this entity's
@@ -274,7 +275,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             pub fn #claim_op(&self) -> anyhow::Result<Option<s3db::txn::TxnOp>> {
                 match #value_expr {
                     Some(raw) => Ok(Some(s3db::txn::TxnOp::create(
-                        Self::#const_name.key(raw),
+                        Self::#const_name.key(raw)?,
                         &#pointer_name { #pointer_field: self.#key_field.as_str().to_string() },
                     )?)),
                     None => Ok(None),
@@ -315,11 +316,11 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             where
                 Self: serde::Serialize,
             {
-                s3db::txn::TxnOp::create(Self::COLLECTION.key(self.#key_field.as_str()), self)
+                s3db::txn::TxnOp::create(Self::COLLECTION.key(self.#key_field.as_str())?, self)
             }
 
             /// Soft-delete by key -- see [`s3db::Collection::delete`].
-            pub async fn delete(backend: &dyn s3db::Backend, cipher: &s3db::Cipher, key: &str) {
+            pub async fn delete(backend: &dyn s3db::Backend, cipher: &s3db::Cipher, key: &str) -> anyhow::Result<()> {
                 Self::COLLECTION.delete(backend, cipher, key).await
             }
 
@@ -331,7 +332,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// Writes this entity's S3 key into `buf`, reusing its existing
             /// allocation across repeated calls instead of allocating a
             /// fresh `String` each time -- see [`s3db::Collection::write_key`].
-            pub fn write_key(buf: &mut String, key: &str) {
+            pub fn write_key(buf: &mut String, key: &str) -> anyhow::Result<()> {
                 Self::COLLECTION.write_key(buf, key)
             }
 

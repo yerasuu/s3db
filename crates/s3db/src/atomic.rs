@@ -121,11 +121,11 @@ pub async fn put_with_index<T: Serialize, P: Serialize>(
         anyhow::anyhow!("this backend has no native transaction capability (see docs/s3db-local-mode.md)")
     })?;
 
-    let row_key = collection.key(name);
+    let row_key = collection.key(name)?;
     let row_plain = rmp_serde::to_vec_named(value)?;
     let row_sealed = cipher.seal(&row_key, &row_plain, CompressionStrategy::None);
 
-    let index_key = index.key(index_raw);
+    let index_key = index.key(index_raw)?;
     let index_plain = rmp_serde::to_vec_named(pointer)?;
     let index_sealed = cipher.seal(&index_key, &index_plain, CompressionStrategy::None);
 

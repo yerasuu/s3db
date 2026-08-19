@@ -5,6 +5,7 @@
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
+use crate::naming::validate_path;
 use crate::payload::{delete_object, get_json, list_all_keys, put_json};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -150,10 +151,16 @@ impl Collection {
         self
     }
 
-    pub fn key(&self, name: &str) -> String {
+    /// This collection's object key for `name`.
+    ///
+    /// Fallible because `name` is caller-controlled and gets interpolated
+    /// straight into the key: see [`crate::naming::validate_segment`] for
+    /// what a name carrying a `/` (or a leading `.`) would otherwise do to
+    /// the namespace it lands in.
+    pub fn key(&self, name: &str) -> Result<String> {
         let mut buf = String::new();
-        self.write_key(&mut buf, name);
-        buf
+        self.write_key(&mut buf, name)?;
+        Ok(buf)
     }
 
     /// Same key [`Self::key`] builds, written directly into a caller-owned
@@ -162,8 +169,11 @@ impl Collection {
     /// several `get`/`put` calls against this one `Collection`) reuses its
     /// existing heap allocation instead of allocating anew each time.
     /// `#[derive(Entity)]`-generated types expose this as `T::write_key`.
-    pub fn write_key(&self, buf: &mut String, name: &str) {
+    ///
+    /// `buf` is left cleared, not half-written, if `name` is rejected.
+    pub fn write_key(&self, buf: &mut String, name: &str) -> Result<()> {
         buf.clear();
+        validate_path(name, "entity name")?;
         buf.push_str(&self.prefix);
         buf.push('/');
         match self.entropy {
@@ -176,21 +186,29 @@ impl Collection {
         }
         buf.push_str(name);
         buf.push_str(self.suffix);
+        Ok(())
     }
 
     /// Namespace for `name`'s archived versions — parallel to (not nested
     /// inside) `name`'s own [`Self::key`], so it's independent of whatever
     /// `suffix` this collection uses for its main entries.
-    fn history_prefix(&self, name: &str) -> String {
-        format!("{}/.history/{name}", self.prefix)
+    ///
+    /// Validates `name` in its own right rather than trusting that
+    /// [`Self::key`] already did: this namespace is reached by several
+    /// paths (`delete`, `restore`, the GC sweep) that don't all build the
+    /// main key first.
+    fn history_prefix(&self, name: &str) -> Result<String> {
+        validate_path(name, "entity name")?;
+        Ok(format!("{}/.history/{name}", self.prefix))
     }
 
     /// Where [`Self::delete`]'s tombstone for `name` lives -- parallel to
     /// (not nested inside) `name`'s own [`Self::key`] and [`Self::history_prefix`],
     /// same reasoning as both: independent of whatever `suffix` this
     /// collection uses for its main entries.
-    fn tombstone_key(&self, name: &str) -> String {
-        format!("{}/.deleted/{name}.json", self.prefix)
+    fn tombstone_key(&self, name: &str) -> Result<String> {
+        validate_path(name, "entity name")?;
+        Ok(format!("{}/.deleted/{name}.json", self.prefix))
     }
 
     /// Reads `name`. `None` (not `T::default()`) is the "doesn't exist"
@@ -202,7 +220,7 @@ impl Collection {
         cipher: &Cipher,
         name: &str,
     ) -> Result<(Option<T>, Option<String>)> {
-        let (value, etag) = get_json::<T>(backend, &self.key(name), cipher).await?;
+        let (value, etag) = get_json::<T>(backend, &self.key(name)?, cipher).await?;
         Ok((etag.is_some().then_some(value), etag))
     }
 
@@ -217,7 +235,7 @@ impl Collection {
         cipher: &Cipher,
         name: &str,
     ) -> Result<(T, Option<String>)> {
-        get_json(backend, &self.key(name), cipher).await
+        get_json(backend, &self.key(name)?, cipher).await
     }
 
     /// Compare-and-swap write. `expected_etag = None` means "must not exist
@@ -230,7 +248,7 @@ impl Collection {
         value: &T,
         expected_etag: Option<&str>,
     ) -> Result<Cas> {
-        put_json(backend, &self.key(name), value, expected_etag, cipher).await
+        put_json(backend, &self.key(name)?, value, expected_etag, cipher).await
     }
 
     /// Same compare-and-swap write as [`Self::put`], but archives whatever
@@ -258,13 +276,13 @@ impl Collection {
                 // propagate.
                 put_json(
                     backend,
-                    &format!("{}/{etag}.json", self.history_prefix(name)),
+                    &format!("{}/{etag}.json", self.history_prefix(name)?),
                     &current_value,
                     None,
                     cipher,
                 )
                 .await?;
-                self.archive_history_timestamp(backend, cipher, name, etag).await;
+                self.archive_history_timestamp(backend, cipher, name, etag).await?;
             }
         }
         let cas = self.put(backend, cipher, name, value, expected_etag).await?;
@@ -272,13 +290,14 @@ impl Collection {
             // A fresh create that actually landed -- see
             // `Self::record_created_at`'s own doc comment for why this
             // matters to `crate::snapshot::ReadSnapshot`.
-            self.record_created_at(backend, cipher, name).await;
+            self.record_created_at(backend, cipher, name).await?;
         }
         Ok(cas)
     }
 
-    fn created_at_key(&self, name: &str) -> String {
-        format!("{}/.created/{name}.json", self.prefix)
+    fn created_at_key(&self, name: &str) -> Result<String> {
+        validate_path(name, "entity name")?;
+        Ok(format!("{}/.created/{name}.json", self.prefix))
     }
 
     /// Records when `name` was first created via [`Self::put_versioned`] --
@@ -291,11 +310,12 @@ impl Collection {
     /// just means [`Self::created_at`] returns `None`, which
     /// `ReadSnapshot::get` already treats as "can't place it in time,"
     /// same tolerance as an unplaceable history version.
-    async fn record_created_at(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) {
+    async fn record_created_at(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
         let record = CreatedAt {
             created_at_ms: now_ms(),
         };
-        let _ = put_json(backend, &self.created_at_key(name), &record, None, cipher).await;
+        let _ = put_json(backend, &self.created_at_key(name)?, &record, None, cipher).await;
+        Ok(())
     }
 
     /// When `name` was first created via [`Self::put_versioned`], if known
@@ -303,12 +323,12 @@ impl Collection {
     /// [`Self::put`], created before this tracking existed, or a lost race
     /// on [`Self::record_created_at`]).
     pub async fn created_at(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<Option<u64>> {
-        let (record, etag) = get_json::<CreatedAt>(backend, &self.created_at_key(name), cipher).await?;
+        let (record, etag) = get_json::<CreatedAt>(backend, &self.created_at_key(name)?, cipher).await?;
         Ok(etag.map(|_| record.created_at_ms))
     }
 
-    fn history_timestamp_key(&self, name: &str, etag: &str) -> String {
-        format!("{}/{etag}.meta.json", self.history_prefix(name))
+    fn history_timestamp_key(&self, name: &str, etag: &str) -> Result<String> {
+        Ok(format!("{}/{etag}.meta.json", self.history_prefix(name)?))
     }
 
     /// Records when the `etag` version of `name` was archived, alongside
@@ -322,11 +342,18 @@ impl Collection {
     /// [`Self::version_timestamp`] returns `None` for this version, which
     /// [`crate::snapshot::ReadSnapshot`] already treats as "can't place
     /// this version in time, skip it").
-    async fn archive_history_timestamp(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, etag: &str) {
+    async fn archive_history_timestamp(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+        etag: &str,
+    ) -> Result<()> {
         let record = HistoryTimestamp {
             archived_at_ms: now_ms(),
         };
-        let _ = put_json(backend, &self.history_timestamp_key(name, etag), &record, None, cipher).await;
+        let _ = put_json(backend, &self.history_timestamp_key(name, etag)?, &record, None, cipher).await;
+        Ok(())
     }
 
     /// When the `etag` version of `name` was archived, if that's known --
@@ -342,7 +369,7 @@ impl Collection {
         etag: &str,
     ) -> Result<Option<u64>> {
         let (record, found) =
-            get_json::<HistoryTimestamp>(backend, &self.history_timestamp_key(name, etag), cipher).await?;
+            get_json::<HistoryTimestamp>(backend, &self.history_timestamp_key(name, etag)?, cipher).await?;
         Ok(found.map(|_| record.archived_at_ms))
     }
 
@@ -354,8 +381,8 @@ impl Collection {
     /// gone). A delete that fails to land leaves the tombstone `Pending`: a
     /// durable, inspectable record that this key still owes a real purge,
     /// instead of a lost fire-and-forget with no trace anyone could act on.
-    pub async fn delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) {
-        let key = self.key(name);
+    pub async fn delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
+        let key = self.key(name)?;
         let (sealed, etag) = match backend.get(&key).await {
             Ok(v) => v,
             Err(e) => {
@@ -365,9 +392,9 @@ impl Collection {
         };
         let restore_etag = self
             .archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref())
-            .await;
+            .await?;
 
-        let tombstone_key = self.tombstone_key(name);
+        let tombstone_key = self.tombstone_key(name)?;
         let (_, mut tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher)
             .await
             .unwrap_or_default();
@@ -399,7 +426,10 @@ impl Collection {
             }
         }
         if !wrote_pending {
-            return; // couldn't even record intent -- nothing to retry from, bail
+            // Couldn't even record intent -- nothing to retry from, bail.
+            // Not an error: the tombstone is best-effort by design, same as
+            // the underlying delete it tracks.
+            return Ok(());
         }
 
         let confirmed = backend
@@ -422,6 +452,7 @@ impl Collection {
         }
         // Else: leave `Pending` -- there's no GC sweep to retry it yet, but
         // the record is there for whenever one exists.
+        Ok(())
     }
 
     /// Re-encrypts `name`'s current sealed bytes under its own
@@ -441,16 +472,16 @@ impl Collection {
         key: &str,
         sealed: &[u8],
         etag: Option<&str>,
-    ) -> Option<String> {
-        let etag = etag?;
+    ) -> Result<Option<String>> {
+        let Some(etag) = etag else { return Ok(None) };
         let plaintext = match cipher.open(key, sealed) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("warning: couldn't decrypt {name} to archive it before deleting: {e:#}");
-                return None;
+                return Ok(None);
             }
         };
-        let history_key = format!("{}/{etag}.json", self.history_prefix(name));
+        let history_key = format!("{}/{etag}.json", self.history_prefix(name)?);
         let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None);
         // Create-only, but idempotent in practice: the same etag always
         // archives the same content, so a `Cas::Conflict` here just means
@@ -458,12 +489,12 @@ impl Collection {
         // that got this far but failed later) -- fine either way.
         match backend.put_cas(&history_key, resealed, None).await {
             Ok(_) => {
-                self.archive_history_timestamp(backend, cipher, name, etag).await;
-                Some(etag.to_string())
+                self.archive_history_timestamp(backend, cipher, name, etag).await?;
+                Ok(Some(etag.to_string()))
             }
             Err(e) => {
                 eprintln!("warning: couldn't archive {name} before deleting it: {e:#}");
-                None
+                Ok(None)
             }
         }
     }
@@ -481,7 +512,7 @@ impl Collection {
         cipher: &Cipher,
         name: &str,
     ) -> Result<()> {
-        let tombstone_key = self.tombstone_key(name);
+        let tombstone_key = self.tombstone_key(name)?;
         let (tombstone, _) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
         let etag = tombstone
             .restore_etag
@@ -509,7 +540,7 @@ impl Collection {
         name: &str,
         value: &T,
     ) -> Result<()> {
-        let key = self.key(name);
+        let key = self.key(name)?;
         let (_, mut expected_etag) = backend.get(&key).await?;
         for _ in 0..3 {
             match put_json(backend, &key, value, expected_etag.as_deref(), cipher).await? {
@@ -550,7 +581,7 @@ impl Collection {
     /// again. Returns `true` if `name`'s tombstone is `Purged` by the time
     /// this returns (already was, or just became so).
     pub async fn retry_pending_purge(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<bool> {
-        let tombstone_key = self.tombstone_key(name);
+        let tombstone_key = self.tombstone_key(name)?;
         let (tombstone, tomb_etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
         if tomb_etag.is_none() {
             return Ok(false); // nothing to retry
@@ -559,7 +590,7 @@ impl Collection {
             return Ok(true);
         }
         let confirmed = backend
-            .delete(&self.key(name))
+            .delete(&self.key(name)?)
             .await
             .map(|o| o.confirmed == o.attempted)
             .unwrap_or(false);
@@ -579,7 +610,7 @@ impl Collection {
     /// delete still isn't confirmed would destroy the one durable sign that
     /// a retry is still owed.
     pub async fn forget_tombstone(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
-        let tombstone_key = self.tombstone_key(name);
+        let tombstone_key = self.tombstone_key(name)?;
         let (tombstone, etag) = get_json::<Tombstone>(backend, &tombstone_key, cipher).await?;
         if etag.is_some() && tombstone.purge_state == PurgeState::Purged {
             delete_object(backend, &tombstone_key).await;
@@ -590,9 +621,10 @@ impl Collection {
     /// Best-effort removal of one archived history version and its
     /// companion timestamp -- for a maintenance sweep pruning old
     /// versions. Never touches `name`'s live object.
-    pub async fn forget_history_version(&self, backend: &dyn Backend, name: &str, version: &str) {
-        delete_object(backend, &format!("{}/{version}.json", self.history_prefix(name))).await;
-        delete_object(backend, &self.history_timestamp_key(name, version)).await;
+    pub async fn forget_history_version(&self, backend: &dyn Backend, name: &str, version: &str) -> Result<()> {
+        delete_object(backend, &format!("{}/{version}.json", self.history_prefix(name)?)).await;
+        delete_object(backend, &self.history_timestamp_key(name, version)?).await;
+        Ok(())
     }
 
     /// Every name currently stored, sorted.
@@ -632,7 +664,7 @@ impl Collection {
     /// "rollback" method — restoring an old version is just [`Self::get_version`]
     /// followed by [`Self::put_versioned`], composed by the caller.
     pub async fn list_versions(&self, backend: &dyn Backend, name: &str) -> Result<Vec<String>> {
-        let scan_prefix = format!("{}/", self.history_prefix(name));
+        let scan_prefix = format!("{}/", self.history_prefix(name)?);
         let mut etags: Vec<String> = list_all_keys(backend, &scan_prefix)
             .await?
             .into_iter()
@@ -661,7 +693,7 @@ impl Collection {
         etag: &str,
     ) -> Result<Option<T>> {
         let (value, found_etag) =
-            get_json::<T>(backend, &format!("{}/{etag}.json", self.history_prefix(name)), cipher).await?;
+            get_json::<T>(backend, &format!("{}/{etag}.json", self.history_prefix(name)?), cipher).await?;
         Ok(found_etag.is_some().then_some(value))
     }
 
@@ -676,7 +708,7 @@ impl Collection {
         let names = self.list_names(backend.as_ref()).await?;
         let mut set = JoinSet::new();
         for name in names {
-            let key = self.key(&name);
+            let key = self.key(&name)?;
             let backend = Arc::clone(backend);
             let cipher = Arc::clone(cipher);
             set.spawn(async move { get_json::<T>(backend.as_ref(), &key, &cipher).await });

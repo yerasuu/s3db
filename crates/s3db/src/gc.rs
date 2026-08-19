@@ -111,7 +111,7 @@ pub async fn sweep(
                 if protected {
                     continue; // a live ReadSnapshot might still need this version
                 }
-                collection.forget_history_version(backend, &name, &version).await;
+                collection.forget_history_version(backend, &name, &version).await?;
                 report.history_versions_pruned += 1;
             }
         }

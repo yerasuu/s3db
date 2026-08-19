@@ -58,8 +58,8 @@ async fn put_then_get_roundtrips_by_key() {
 #[test]
 fn write_key_matches_the_collection_key() {
     let mut buf = String::new();
-    Account::write_key(&mut buf, "alice");
-    assert_eq!(buf, Account::COLLECTION.key("alice"));
+    Account::write_key(&mut buf, "alice").unwrap();
+    assert_eq!(buf, Account::COLLECTION.key("alice").unwrap());
 }
 
 #[tokio::test]
@@ -124,7 +124,16 @@ async fn claiming_a_none_optional_index_is_a_no_op_success() {
         is_admin: false,
     };
     assert!(account.claim_email(&backend, &cipher).await.unwrap());
-    assert_eq!(Account::find_by_email(&backend, &cipher, "").await.unwrap(), None);
+    // Nothing was claimed, so a real (never-claimed) address resolves to
+    // nothing. Deliberately not the empty string: an empty index segment is
+    // rejected outright now, which would test the guard rather than the
+    // no-op-claim behaviour this test is about.
+    assert_eq!(
+        Account::find_by_email(&backend, &cipher, "nobody@example.com")
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -157,7 +166,7 @@ async fn release_then_find_by_reports_missing() {
     };
     account.put(&backend, &cipher, None).await.unwrap();
     account.claim_email(&backend, &cipher).await.unwrap();
-    account.release_email(&backend).await;
+    account.release_email(&backend).await.unwrap();
     assert_eq!(
         Account::find_by_email(&backend, &cipher, "alice@example.com")
             .await
@@ -223,7 +232,10 @@ fn index_root_kind_and_pointer_field_overrides_match_a_hand_written_index() {
     // Same key shape `SecondaryIndex::new(".conf/index", "widget-owner", Segment::Raw)`
     // would build by hand -- proves the override lands on an arbitrary
     // root/kind, not just the macro's own collection-prefix/field-name defaults.
-    assert_eq!(Widget::OWNER_INDEX.key("alice"), ".conf/index/widget-owner/alice.json");
+    assert_eq!(
+        Widget::OWNER_INDEX.key("alice").unwrap(),
+        ".conf/index/widget-owner/alice.json"
+    );
 }
 
 #[tokio::test]
@@ -254,7 +266,7 @@ async fn claim_op_is_none_for_an_unset_optional_index() {
     };
     assert!(widget.owner_claim_op().unwrap().is_none());
     widget.put(&backend, &cipher, None).await.unwrap();
-    assert_eq!(Widget::find_by_owner(&backend, &cipher, "").await.unwrap(), None);
+    assert_eq!(Widget::find_by_owner(&backend, &cipher, "nobody").await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -275,4 +287,20 @@ async fn create_op_matches_a_plain_put_for_the_same_entity() {
     );
     let (fetched, _) = Account::get(&backend, &cipher, "alice").await.unwrap();
     assert_eq!(fetched, Some(account));
+}
+
+/// A `Segment::Raw` index takes its `raw` straight into the object key, so
+/// a value that isn't a single safe path component has to be refused rather
+/// than silently relocating the pointer object.
+#[tokio::test]
+async fn a_raw_segment_index_refuses_a_path_unsafe_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    for bad in ["", "a/b", "..", ".hidden"] {
+        assert!(
+            Widget::find_by_owner(&backend, &cipher, bad).await.is_err(),
+            "{bad:?} should be refused"
+        );
+        assert!(Widget::OWNER_INDEX.key(bad).is_err(), "{bad:?} should be refused");
+    }
 }

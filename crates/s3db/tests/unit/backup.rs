@@ -35,7 +35,7 @@ async fn backup_then_restore_roundtrips_every_entity() {
 
     // Wipe the live collection, then restore.
     for name in ["a", "b", "c"] {
-        backend.delete(&coll.key(name)).await.unwrap();
+        backend.delete(&coll.key(name).unwrap()).await.unwrap();
     }
     assert!(coll.list_names(&backend).await.unwrap().is_empty());
 
@@ -57,7 +57,7 @@ async fn backup_includes_tombstones_by_default_and_restore_brings_them_back() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
     assert_eq!(coll.list_tombstones(&backend, &cipher).await.unwrap().len(), 1);
 
     let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
@@ -83,7 +83,7 @@ async fn backup_can_opt_out_of_tombstones_and_says_so_in_the_manifest() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
 
     let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", false)
         .await

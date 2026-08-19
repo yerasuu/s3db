@@ -108,7 +108,7 @@ pub async fn backup_collection(
     let mut entity_count = 0;
     let mut entity_conflicts = 0;
     for name in collection.list_names(src_backend).await? {
-        let key = collection.key(&name);
+        let key = collection.key(&name)?;
         let (sealed, etag) = src_backend.get(&key).await?;
         if etag.is_none() {
             continue; // vanished between list_names and this read -- skip, not an error
@@ -192,13 +192,13 @@ pub async fn restore_collection(
     };
 
     for name in backup_view.list_names(backup_backend).await? {
-        let key = backup_view.key(&name);
+        let key = backup_view.key(&name)?;
         let (sealed, backup_etag) = backup_backend.get(&key).await?;
         if backup_etag.is_none() {
             continue;
         }
         let plain = backup_cipher.open(&key, &sealed)?;
-        let dest_key = collection.key(&name);
+        let dest_key = collection.key(&name)?;
         let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None);
         // Overwrites whatever's currently at `dest_key` -- restore is a
         // deliberate, caller-initiated overwrite, not a CAS-protected merge.

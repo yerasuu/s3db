@@ -35,6 +35,7 @@ pub mod key_rotation;
 pub mod lsm;
 pub mod maintenance;
 pub mod metrics;
+mod naming;
 pub mod payload;
 pub mod range;
 pub mod request_cache;

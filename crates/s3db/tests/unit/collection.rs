@@ -21,7 +21,7 @@ async fn hash_prefix_key_nests_under_a_bucket_and_still_roundtrips() {
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     let coll = Collection::new("widgets").with_hash_prefix(16);
 
-    let key = coll.key("alice");
+    let key = coll.key("alice").unwrap();
     assert!(key.starts_with("widgets/"), "{key}");
     assert!(key.ends_with("/alice.json"), "{key}");
     assert_ne!(
@@ -42,11 +42,11 @@ fn write_key_matches_key_and_reuses_the_same_buffer() {
     let mut buf = String::with_capacity(64);
     let original_capacity = buf.capacity();
 
-    coll.write_key(&mut buf, "alice");
-    assert_eq!(buf, coll.key("alice"));
+    coll.write_key(&mut buf, "alice").unwrap();
+    assert_eq!(buf, coll.key("alice").unwrap());
 
-    coll.write_key(&mut buf, "bob");
-    assert_eq!(buf, coll.key("bob"));
+    coll.write_key(&mut buf, "bob").unwrap();
+    assert_eq!(buf, coll.key("bob").unwrap());
     assert_eq!(
         buf.capacity(),
         original_capacity,
@@ -58,8 +58,8 @@ fn write_key_matches_key_and_reuses_the_same_buffer() {
 fn write_key_matches_key_with_hash_prefix_entropy_too() {
     let coll = Collection::new("widgets").with_hash_prefix(16);
     let mut buf = String::new();
-    coll.write_key(&mut buf, "alice");
-    assert_eq!(buf, coll.key("alice"));
+    coll.write_key(&mut buf, "alice").unwrap();
+    assert_eq!(buf, coll.key("alice").unwrap());
 }
 
 #[tokio::test]
@@ -125,7 +125,7 @@ async fn delete_makes_get_report_missing() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
     let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
     assert_eq!(value, None);
 }
@@ -138,9 +138,9 @@ async fn delete_writes_a_purged_tombstone_with_a_restore_etag() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
 
-    let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher)
+    let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a").unwrap(), &cipher)
         .await
         .unwrap();
     assert_eq!(tombstone.purge_state, PurgeState::Purged);
@@ -152,9 +152,9 @@ async fn delete_of_a_never_written_name_leaves_nothing_to_restore() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     let coll = Collection::new("widgets");
-    coll.delete(&backend, &cipher, "ghost").await;
+    coll.delete(&backend, &cipher, "ghost").await.unwrap();
 
-    let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("ghost"), &cipher)
+    let (tombstone, _) = get_json::<Tombstone>(&backend, &coll.tombstone_key("ghost").unwrap(), &cipher)
         .await
         .unwrap();
     assert_eq!(tombstone.restore_etag, None);
@@ -169,13 +169,13 @@ async fn restore_brings_back_the_deleted_value_and_clears_the_tombstone() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
 
     coll.restore::<Widget>(&backend, &cipher, "a").await.unwrap();
 
     let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
     assert_eq!(value, Some(Widget { count: 1 }));
-    let (_, tomb_etag) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a"), &cipher)
+    let (_, tomb_etag) = get_json::<Tombstone>(&backend, &coll.tombstone_key("a").unwrap(), &cipher)
         .await
         .unwrap();
     assert!(tomb_etag.is_none(), "tombstone must be gone after a successful restore");
@@ -189,7 +189,7 @@ async fn restore_overwrites_whatever_object_currently_occupies_the_key() {
     coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    coll.delete(&backend, &cipher, "a").await;
+    coll.delete(&backend, &cipher, "a").await.unwrap();
     // Something re-occupies the now-empty key before the restore runs
     // -- `write_object_for_restore`'s CAS-with-reread must still win,
     // not bounce off a stale-etag conflict against it.
@@ -228,7 +228,7 @@ async fn nested_suffix_roundtrips_and_lists_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     let coll = Collection::new_with_suffix("repos", "/.conf/config.json");
-    assert_eq!(coll.key("acme/web"), "repos/acme/web/.conf/config.json");
+    assert_eq!(coll.key("acme/web").unwrap(), "repos/acme/web/.conf/config.json");
     coll.put(&backend, &cipher, "acme/web", &Widget { count: 9 }, None)
         .await
         .unwrap();
@@ -435,4 +435,28 @@ async fn put_versioned_conflicts_on_stale_etag_without_archiving() {
         .unwrap();
     assert_eq!(cas, Cas::Conflict);
     assert_eq!(coll.list_versions(&backend, "a").await.unwrap(), Vec::<String>::new());
+}
+
+/// A `Collection` name goes straight into the object key, so a name that
+/// could reach one of the crate's own reserved namespaces
+/// (`.history/`, `.deleted/`, `.created/`) has to be refused at the key
+/// builder rather than silently landing there.
+#[tokio::test]
+async fn rejects_a_name_that_would_reach_a_reserved_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    for bad in ["", ".deleted/a", "a/.history/b", "../elsewhere", "a//b", ".hidden"] {
+        assert!(coll.key(bad).is_err(), "{bad:?} should be refused by key()");
+        assert!(
+            coll.put(&backend, &cipher, bad, &Widget { count: 1 }, None)
+                .await
+                .is_err(),
+            "{bad:?} should be refused by put()"
+        );
+        assert!(
+            coll.delete(&backend, &cipher, bad).await.is_err(),
+            "{bad:?} should be refused by delete()"
+        );
+    }
 }

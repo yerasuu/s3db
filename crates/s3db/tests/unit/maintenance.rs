@@ -27,12 +27,12 @@ async fn run_sweeps_every_registered_collection() {
         .put(&backend, &cipher, "a", &Widget { count: 1 }, None)
         .await
         .unwrap();
-    widgets.delete(&backend, &cipher, "a").await;
+    widgets.delete(&backend, &cipher, "a").await.unwrap();
     gadgets
         .put(&backend, &cipher, "b", &Widget { count: 2 }, None)
         .await
         .unwrap();
-    gadgets.delete(&backend, &cipher, "b").await;
+    gadgets.delete(&backend, &cipher, "b").await.unwrap();
 
     let scanner = MaintenanceScanner::new(GcConfig {
         tombstone_purge_age: Duration::ZERO,

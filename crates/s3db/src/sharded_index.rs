@@ -95,13 +95,13 @@ impl ShardedIndex {
         format!("{}/{}/{shard:0width$x}/", self.root, self.kind)
     }
 
-    fn key_for(&self, raw: &str, prefix_bits: u8) -> String {
+    fn key_for(&self, raw: &str, prefix_bits: u8) -> Result<String> {
         let shard = shard_of(raw, prefix_bits);
-        format!(
+        Ok(format!(
             "{}{}.json",
             self.shard_prefix(shard, prefix_bits),
-            self.segment.encode(raw)
-        )
+            self.segment.encode(raw)?
+        ))
     }
 
     /// Reads the current epoch, short-TTL-cached (not per-request) so a
@@ -145,7 +145,7 @@ impl ShardedIndex {
         value: &T,
     ) -> Result<bool> {
         let epoch = self.current_epoch(backend, cipher).await?;
-        let key = self.key_for(raw, epoch.write_bits());
+        let key = self.key_for(raw, epoch.write_bits())?;
         match put_json(backend, &key, value, None, cipher).await? {
             crate::backend::Cas::Ok => Ok(true),
             crate::backend::Cas::Conflict => Ok(false),
@@ -162,25 +162,26 @@ impl ShardedIndex {
         raw: &str,
     ) -> Result<(Option<T>, Option<String>)> {
         let epoch = self.current_epoch(backend, cipher).await?;
-        let (value, etag) = get_json::<T>(backend, &self.key_for(raw, epoch.prefix_bits), cipher).await?;
+        let (value, etag) = get_json::<T>(backend, &self.key_for(raw, epoch.prefix_bits)?, cipher).await?;
         if etag.is_some() {
             return Ok((Some(value), etag));
         }
         if let Some(prev_bits) = epoch.prev_prefix_bits {
-            let (value, etag) = get_json::<T>(backend, &self.key_for(raw, prev_bits), cipher).await?;
+            let (value, etag) = get_json::<T>(backend, &self.key_for(raw, prev_bits)?, cipher).await?;
             return Ok((etag.is_some().then_some(value), etag));
         }
         Ok((None, None))
     }
 
-    pub async fn release(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str) {
+    pub async fn release(&self, backend: &dyn Backend, cipher: &Cipher, raw: &str) -> Result<()> {
         let Ok(epoch) = self.current_epoch(backend, cipher).await else {
-            return;
+            return Ok(());
         };
-        delete_object(backend, &self.key_for(raw, epoch.write_bits())).await;
+        delete_object(backend, &self.key_for(raw, epoch.write_bits())?).await;
         if let Some(prev_bits) = epoch.prev_prefix_bits {
-            delete_object(backend, &self.key_for(raw, prev_bits)).await;
+            delete_object(backend, &self.key_for(raw, prev_bits)?).await;
         }
+        Ok(())
     }
 
     /// Doubles `prefix_bits`, pinning every writer to the old layout
@@ -245,7 +246,7 @@ impl ShardedIndex {
                         .and_then(|s| s.strip_suffix(".json"))
                         .with_context(|| format!("{old_key}: doesn't match this index's own key shape"))?;
                     let raw = self.segment.decode(segment_encoded)?;
-                    let new_key = self.key_for(&raw, epoch.prefix_bits);
+                    let new_key = self.key_for(&raw, epoch.prefix_bits)?;
                     if new_key == old_key {
                         continue; // this entry's shard didn't actually change
                     }

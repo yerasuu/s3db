@@ -11,6 +11,7 @@
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
+use crate::naming::validate_segment;
 use crate::payload::{delete_object, get_json, put_json};
 use crate::range::as_range;
 use anyhow::{Context, Result, bail};
@@ -66,22 +67,34 @@ impl IndexKey for u128 {
 /// How a raw claim key becomes a safe path segment.
 #[derive(Debug, Clone, Copy)]
 pub enum Segment {
-    /// `raw` is already a validated safe path component (no `/`, `\`,
-    /// control chars) — used as-is.
+    /// `raw` must already be a safe path component (no `/`, `\`, control
+    /// chars, no leading `.`) — used as-is, after
+    /// [`crate::naming::validate_segment`] checks that it really is one.
+    ///
+    /// The check is enforced, not assumed: this variant is what
+    /// `#[derive(Entity)]` picks by default, so an index over a
+    /// user-supplied field (an email, a username) lands here without the
+    /// caller having chosen it, and a `raw` carrying a `/` would silently
+    /// relocate the pointer object into a sibling namespace rather than
+    /// producing a merely odd-looking key.
     Raw,
     /// `raw` is arbitrary bytes (a fingerprint, an email) that may contain
     /// path-unsafe characters — URL-safe base64, no padding. Reversible,
-    /// not a hash: nothing here needs `raw` to stay secret.
+    /// not a hash: nothing here needs `raw` to stay secret. Safe by
+    /// construction, so nothing is rejected here.
     Base64,
 }
 
 impl Segment {
-    pub(crate) fn encode(&self, raw: &str) -> String {
+    pub(crate) fn encode(&self, raw: &str) -> Result<String> {
         match self {
-            Segment::Raw => raw.to_string(),
+            Segment::Raw => {
+                validate_segment(raw, "index segment")?;
+                Ok(raw.to_string())
+            }
             Segment::Base64 => {
                 use base64::Engine;
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes())
+                Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes()))
             }
         }
     }
@@ -116,8 +129,13 @@ impl SecondaryIndex {
         SecondaryIndex { root, kind, segment }
     }
 
-    pub fn key(&self, raw: &str) -> String {
-        format!("{}/{}/{}.json", self.root, self.kind, self.segment.encode(raw))
+    pub fn key(&self, raw: &str) -> Result<String> {
+        Ok(format!(
+            "{}/{}/{}.json",
+            self.root,
+            self.kind,
+            self.segment.encode(raw)?
+        ))
     }
 
     /// Same prefix as [`Self::key`], deliberately *without* the `.json`
@@ -134,8 +152,8 @@ impl SecondaryIndex {
     /// Comparing the bound against `raw` directly, with no suffix on either
     /// side, has no such edge case: extending a string (with `.json` or
     /// anything else) can never make it sort before the string it extends.
-    fn segment_prefix(&self, raw: &str) -> String {
-        format!("{}/{}/{}", self.root, self.kind, self.segment.encode(raw))
+    fn segment_prefix(&self, raw: &str) -> Result<String> {
+        Ok(format!("{}/{}/{}", self.root, self.kind, self.segment.encode(raw)?))
     }
 
     /// The `raw` segment [`Self::segment_prefix`] came from, reversing
@@ -163,7 +181,7 @@ impl SecondaryIndex {
         value: &T,
         expected_etag: Option<&str>,
     ) -> Result<Cas> {
-        put_json(backend, &self.key(raw), value, expected_etag, cipher).await
+        put_json(backend, &self.key(raw)?, value, expected_etag, cipher).await
     }
 
     pub async fn resolve<T: DeserializeOwned + Default>(
@@ -172,7 +190,7 @@ impl SecondaryIndex {
         cipher: &Cipher,
         raw: &str,
     ) -> Result<(Option<T>, Option<String>)> {
-        let (value, etag) = get_json::<T>(backend, &self.key(raw), cipher).await?;
+        let (value, etag) = get_json::<T>(backend, &self.key(raw)?, cipher).await?;
         Ok((etag.is_some().then_some(value), etag))
     }
 
@@ -186,7 +204,7 @@ impl SecondaryIndex {
         raw: &str,
         value: &T,
     ) -> Result<bool> {
-        match put_json(backend, &self.key(raw), value, None, cipher).await? {
+        match put_json(backend, &self.key(raw)?, value, None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => Ok(false),
         }
@@ -217,7 +235,7 @@ impl SecondaryIndex {
         F: FnOnce(T) -> Fut,
         Fut: std::future::Future<Output = Result<bool>>,
     {
-        let key = self.key(raw);
+        let key = self.key(raw)?;
         match put_json(backend, &key, value, None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => {
@@ -236,8 +254,9 @@ impl SecondaryIndex {
         }
     }
 
-    pub async fn release(&self, backend: &dyn Backend, raw: &str) {
-        delete_object(backend, &self.key(raw)).await;
+    pub async fn release(&self, backend: &dyn Backend, raw: &str) -> Result<()> {
+        delete_object(backend, &self.key(raw)?).await;
+        Ok(())
     }
 
     /// Same key shape as [`Self::key`], but for an [`IndexKey`] instead of
@@ -298,7 +317,7 @@ impl SecondaryIndex {
         pointer: &P,
         value: &V,
     ) -> Result<bool> {
-        match put_json(backend, &self.key(raw), &(pointer, value), None, cipher).await? {
+        match put_json(backend, &self.key(raw)?, &(pointer, value), None, cipher).await? {
             Cas::Ok => Ok(true),
             Cas::Conflict => Ok(false),
         }
@@ -313,7 +332,7 @@ impl SecondaryIndex {
         cipher: &Cipher,
         raw: &str,
     ) -> Result<Option<V>> {
-        let (entry, etag) = get_json::<(P, V)>(backend, &self.key(raw), cipher).await?;
+        let (entry, etag) = get_json::<(P, V)>(backend, &self.key(raw)?, cipher).await?;
         Ok(etag.map(|_| entry.1))
     }
 
@@ -342,7 +361,7 @@ impl SecondaryIndex {
         let range =
             as_range(backend).context("this backend has no native range capability (see docs/s3db-local-mode.md)")?;
         let entries = range
-            .range(&self.segment_prefix(start_raw), &self.segment_prefix(end_raw))
+            .range(&self.segment_prefix(start_raw)?, &self.segment_prefix(end_raw)?)
             .await?;
         let mut out = Vec::with_capacity(entries.len());
         for (key, sealed) in entries {

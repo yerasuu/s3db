@@ -28,7 +28,7 @@ fn base64_segment_matches_the_original_url_safe_no_pad_scheme() {
     use base64::Engine;
     let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"SHA256:abc/def+ghi");
     assert_eq!(
-        idx.key("SHA256:abc/def+ghi"),
+        idx.key("SHA256:abc/def+ghi").unwrap(),
         format!(".conf/index/pubkey/{expected}.json")
     );
 }
@@ -55,7 +55,7 @@ fn typed_key_never_allocates_an_intermediate_string_representation() {
     // key_typed really uses key_bytes(), not `.to_string()`.
     let idx = SecondaryIndex::new(".conf/index", "byid", Segment::Raw);
     let as_typed_key = idx.key_typed(&42u64);
-    let as_raw_string_key = idx.key("42");
+    let as_raw_string_key = idx.key("42").unwrap();
     assert_ne!(as_typed_key, as_raw_string_key);
 }
 
@@ -116,7 +116,7 @@ struct Widget {
 #[test]
 fn raw_segment_is_used_verbatim() {
     let idx = SecondaryIndex::new(".conf/index", "namespace", Segment::Raw);
-    assert_eq!(idx.key("alice"), ".conf/index/namespace/alice.json");
+    assert_eq!(idx.key("alice").unwrap(), ".conf/index/namespace/alice.json");
 }
 
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn release_makes_resolve_report_missing() {
     idx.claim_once(&backend, &cipher, "alice", &Pointer { owner: "alice".into() })
         .await
         .unwrap();
-    idx.release(&backend, "alice").await;
+    idx.release(&backend, "alice").await.unwrap();
     let (resolved, _etag) = idx.resolve::<Pointer>(&backend, &cipher, "alice").await.unwrap();
     assert_eq!(resolved, None);
 }
