@@ -22,7 +22,8 @@ use crate::lsm::compactor::CompactionReport;
 use anyhow::Result;
 
 /// Which passes a [`tick`] is allowed to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LsmMaintenanceConfig {
     /// Flush the memtable when it has reached its threshold.
     pub flush: bool,

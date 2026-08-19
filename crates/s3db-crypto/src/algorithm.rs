@@ -31,7 +31,8 @@ pub(crate) const NONCE_FIELD_LEN: usize = 24;
 /// Wire codes are permanent: a new algorithm gets the next free code, and an
 /// existing one is never renumbered or removed, or every object already
 /// sealed under it becomes unreadable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CipherAlgorithm {
     /// 24-byte nonce (vs. 12 for plain ChaCha20Poly1305). With random nonces
     /// (not a counter) the extra 12 bytes matter: at this object volume, a
@@ -209,9 +210,14 @@ impl Sealer {
 /// Whether a [`crate::Cipher`] encrypts at all, and with what. `Enabled` is
 /// the default: turning encryption off takes an explicit `Disabled`, never
 /// an omission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Loadable straight from a config file: `mode = "enabled"` (with an optional
+/// `algorithm`) or `mode = "disabled"`. Deliberately tagged rather than a bare
+/// bool, because "off" has to be spelled out — see [`Self::Disabled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
 pub enum EncryptionMode {
     Enabled {
+        #[serde(default)]
         algorithm: CipherAlgorithm,
     },
     /// No AEAD, no key derivation, no passphrase required — objects are

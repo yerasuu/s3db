@@ -40,7 +40,8 @@ const MAX_DECOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 
 /// How [`crate::Cipher::seal`] decides whether to zstd-compress `plaintext`
 /// before encrypting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "compression", rename_all = "snake_case")]
 pub enum CompressionStrategy {
     /// Never compress. `s3db`'s own default profile (small, uniform
     /// objects -- see `s3db::payload::MAX_OBJECT_BYTES`) fixes this

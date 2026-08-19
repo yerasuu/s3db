@@ -43,12 +43,17 @@ use tokio::sync::Semaphore;
 /// keep-alive on and a generous idle timeout: otherwise the concurrency this
 /// config grants can end up bottlenecked on re-establishing connections
 /// `ThrottledBackend` already decided could be in flight.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Every field is optional in a config file: whatever a caller omits comes from
+/// [`Default`], so a config only ever spells out what it actually changes.
+#[serde(default)]
 pub struct ResilienceConfig {
     pub max_concurrent_get: usize,
     pub max_concurrent_put: usize,
     pub max_concurrent_list: usize,
     pub max_retries: u32,
+    /// Milliseconds in a config file — see [`crate::serde_duration`].
+    #[serde(with = "crate::serde_duration")]
     pub base_backoff: Duration,
     pub circuit_breaker: CircuitBreakerConfig,
     pub cache: CacheConfig,
@@ -354,13 +359,16 @@ impl Backend for RetryBackend {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CircuitBreakerConfig {
     /// Consecutive real failures (never a `Cas::Conflict`) before the
     /// breaker opens.
     pub failure_threshold: u32,
     /// How long the breaker stays open (failing fast, not even calling the
-    /// inner backend) before letting one trial call through.
+    /// inner backend) before letting one trial call through. Milliseconds in a
+    /// config file.
+    #[serde(with = "crate::serde_duration")]
     pub open_duration: Duration,
 }
 

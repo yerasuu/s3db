@@ -41,8 +41,32 @@ Five drivers, selected via `BackendConfig` (a `#[serde(tag = "driver")]` enum) a
 
 ```rust
 let cfg: BackendConfig = toml::from_str(&config_text)?; // { driver = "s3", bucket = "...", ... }
-let backend: Arc<dyn Backend> = build_backend(&cfg);
+let backend: Arc<dyn Backend> = build_backend(&cfg)?;
 ```
+
+Every tuning type is loadable from that same file: `ResilienceConfig` (and its nested `CircuitBreakerConfig`/`CacheConfig`), `GcConfig`, `ExpiryConfig`, `LsmMaintenanceConfig`, `MemoryBudget`, plus `EncryptionMode`/`CipherAlgorithm`/`CompressionStrategy`. Each carries a container-level `#[serde(default)]`, so a config file spells out only what it changes and everything else comes from `Default`. `Duration` fields are **milliseconds** — serde's own `Duration` is a `{ secs, nanos }` struct, which is unwritable by hand for what are all timeouts, ages and backoffs.
+
+```toml
+driver = "s3"
+bucket = "novels"
+access_key_id = "..."
+secret_access_key = "..."
+
+[encryption]
+mode = "enabled"          # "disabled" has to be spelled out; algorithm optional
+
+[resilience]
+max_concurrent_get = 128
+base_backoff = 250        # ms
+
+[resilience.cache]
+ttl = 5000                # ms
+
+[gc]
+history_max_age = 86400000
+```
+
+**A serialized config is secret material.** These types derive `Serialize`, and serializing one writes every credential in the clear — deliberately not papered over with `skip_serializing`, which would produce a config that can't authenticate. Give the file permissions to match.
 
 ## Encryption
 

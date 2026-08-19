@@ -23,7 +23,8 @@ use tokio::task::JoinSet;
 /// more than `max_buffer_bytes` of buffered response bodies at once --
 /// tune `max_buffer_bytes` for the memory this process can actually spare,
 /// not a per-call guess.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MemoryBudget {
     pub max_buffer_bytes: usize,
 }

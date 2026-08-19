@@ -82,3 +82,8 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+# Only the config-file test needs a TOML parser: this crate takes `serde` and
+# lets the application choose its own format.
+toml = "0.9"

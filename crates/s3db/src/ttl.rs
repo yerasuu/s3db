@@ -54,7 +54,8 @@ pub struct ExpiryAt {
 }
 
 /// How [`expire_due`] removes an expired entry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExpiryConfig {
     /// `true` routes the removal through [`Collection::delete`], so the entry
     /// leaves a tombstone and an archived version and stays restorable.
