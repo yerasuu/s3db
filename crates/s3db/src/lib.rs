@@ -38,6 +38,7 @@ pub mod lsm;
 pub mod maintenance;
 pub mod metrics;
 mod naming;
+pub mod ordinal;
 pub mod payload;
 pub mod range;
 pub mod request_cache;

@@ -237,6 +237,15 @@ const USERS: Collection = Collection::new(".conf/users").with_hash_prefix(256);
 // get/put/list_names are unaffected, still keyed by `name`.
 ```
 
+## Numeric names
+
+Object storage sorts keys as bytes, and so does `Collection::list_names` — so `"10"` sorts before `"9"`, invisibly, until an entity keyed by a number reaches double digits. `ordinal::encode_u64`/`decode_u64` (and the `i64` pair, which biases negatives so they sort correctly without a `'-'`) write fixed-width zero-padded names, making lexicographic order and numeric order the same thing for every value the type can hold.
+
+```rust
+chapters.put(backend, &cipher, &ordinal::encode_u64(10), &chapter, None).await?;
+let n = ordinal::decode_u64(&name);  // None for anything it didn't write, unpadded names included
+```
+
 ## Multi-key transactions
 
 `txn::run` bundles several create-only writes into one all-or-nothing unit — no update/liveness protocol needed, because every op is a create and the target key is its own lock:
