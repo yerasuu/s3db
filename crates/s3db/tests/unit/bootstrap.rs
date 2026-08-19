@@ -234,3 +234,37 @@ async fn changing_the_passphrase_needs_the_current_one() {
     // Nothing was written: the original passphrase still opens the bucket.
     assert!(get_or_create_cipher(&backend, "old pw").await.is_ok());
 }
+
+/// `get_or_create_cipher` is right for a server; it is wrong for anything
+/// pointed at a bucket by hand, where a mistyped path would silently become a
+/// newly initialized bucket.
+#[tokio::test]
+async fn open_cipher_refuses_an_unbootstrapped_bucket_without_writing() {
+    let (_dir, backend) = temp_backend();
+
+    let err = crate::bootstrap::open_cipher(&backend, "pass").await.unwrap_err();
+
+    assert!(err.to_string().contains("never bootstrapped"), "{err:#}");
+    assert_eq!(
+        crate::payload::list_all_keys(&backend, "").await.unwrap(),
+        Vec::<String>::new(),
+        "it must not have created the encryption config it refused to find"
+    );
+}
+
+#[tokio::test]
+async fn open_cipher_opens_a_bootstrapped_bucket_and_rejects_a_wrong_passphrase() {
+    let (_dir, backend) = temp_backend();
+    let created = crate::bootstrap::get_or_create_cipher(&backend, "right").await.unwrap();
+    let sealed = created
+        .seal("k", b"payload", crate::cipher::CompressionStrategy::None)
+        .unwrap();
+
+    let opened = crate::bootstrap::open_cipher(&backend, "right").await.unwrap();
+    assert_eq!(opened.open("k", &sealed).unwrap(), b"payload");
+
+    assert!(
+        crate::bootstrap::open_cipher(&backend, "wrong").await.is_err(),
+        "a wrong passphrase must fail here, not deeper in the app"
+    );
+}

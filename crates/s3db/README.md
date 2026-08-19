@@ -422,6 +422,24 @@ let cached: Arc<dyn Backend> = Arc::new(RequestCache::new(Arc::clone(&backend)))
 // use `cached` for this one connection/request, then drop it
 ```
 
+## Inspecting a bucket by hand
+
+Every object is encrypted MessagePack, which is the point, and which means that when something looks wrong there is no equivalent of opening a `psql` shell. `s3db-inspect` is that:
+
+```console
+$ export S3DB_PASSPHRASE=...
+$ s3db-inspect --local /srv/bucket ls ""            # keys and sizes, paged
+$ s3db-inspect --local /srv/bucket names widgets    # a Collection's entry names
+$ s3db-inspect --local /srv/bucket get widgets/w1.json
+{ "count": 1 }
+$ s3db-inspect --local /srv/bucket schema widgets   # migration bookkeeping
+$ s3db-inspect --local /srv/bucket verify ""        # decrypt everything, exit 1 if anything fails
+```
+
+`--config <file.json>` takes a serialized `BackendConfig` for the remote drivers. Read-only apart from `rm`, which needs `--yes`. The passphrase comes from `S3DB_PASSPHRASE` and never from an argument, which would land in shell history and in every `ps` listing on the machine; commands that don't need it (`ls`, `count`, `rm`) don't ask for one.
+
+It opens the bucket with `bootstrap::open_cipher`, never `get_or_create_cipher`: for a server, whichever instance starts first initializing the bucket is correct, but for anything pointed at a path by hand a typo must fail rather than quietly become a newly initialized empty bucket whose encryption config was written by the command that was only supposed to look at it.
+
 ## Raw primitive
 
 `Backend::list_page(prefix, after, limit)` is `list_prefix` with a ceiling: ascending key order, `limit` entries at most, and `ListPage::next_after` carrying the key to resume from (`None` when exhausted). The cursor is a **key**, not an opaque provider token, so it is portable and stateless — persist one, resume in another process, and it keeps working even if the key it names was deleted in between, which is what a sweep that deletes as it pages needs. `s3` pushes it into the request (`start_after`/`max_keys`) and `redb` into its B-tree range; the other drivers inherit a default that lists, sorts, and slices — correct and consistently ordered, bounding the caller rather than the fetch. `delete_prefix` and `count_prefix` both page, so neither holds more than one page of keys regardless of prefix size.

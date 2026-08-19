@@ -8,7 +8,7 @@ Extracted from gitquarry, where it started as storage plumbing that turned out t
 
 | Crate | What it is |
 |---|---|
-| [`s3db`](crates/s3db) | The engine: `Backend` drivers, `Collection`/`Singleton`/`Blob`, `SecondaryIndex`, transactions, the `lsm` table engine, GC, backup, caching |
+| [`s3db`](crates/s3db) | The engine (plus the `s3db-inspect` and `s3db-local-migrate` binaries): `Backend` drivers, `Collection`/`Singleton`/`Blob`, `SecondaryIndex`, transactions, the `lsm` table engine, GC, backup, caching |
 | [`s3db-crypto`](crates/s3db-crypto) | The AEAD primitive behind encryption-at-rest (XChaCha20Poly1305 or AES-256-GCM + Argon2id + optional zstd), usable standalone |
 | [`s3db-macros`](crates/s3db-macros) | `#[derive(Entity)]` — generates the `Collection`/`SecondaryIndex` boilerplate for a struct |
 

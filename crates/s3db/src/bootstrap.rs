@@ -163,6 +163,39 @@ pub async fn get_or_create_cipher_with_policy(
     bail!("couldn't initialize bucket encryption after several attempts (high contention)")
 }
 
+/// Opens an already-bootstrapped bucket's [`Cipher`], **never creating one**.
+///
+/// [`get_or_create_cipher`] is right for a server: whichever instance starts
+/// first initializes the bucket. It is wrong for anything pointed at a bucket
+/// by hand — an inspection tool, a backup script, an operator's one-off — where
+/// a mistyped path or a not-yet-restored bucket would silently become a newly
+/// initialized empty one, its encryption config written by the very command
+/// that was only supposed to look. Failing is the useful answer there.
+///
+/// Errors if the bucket has no encryption config, or if `passphrase` doesn't
+/// authenticate against the one it has.
+pub async fn open_cipher(backend: &dyn Backend, passphrase: &str) -> Result<Cipher> {
+    open_cipher_with_algorithm(backend, CipherAlgorithm::default(), passphrase).await
+}
+
+/// [`open_cipher`] for a bucket written with a non-default
+/// [`CipherAlgorithm`]. The algorithm only selects what *new* writes would
+/// use, so it rarely matters for reading (each object records its own), but a
+/// caller that has it in config may as well pass it.
+pub async fn open_cipher_with_algorithm(
+    backend: &dyn Backend,
+    algorithm: CipherAlgorithm,
+    passphrase: &str,
+) -> Result<Cipher> {
+    let (meta, etag) = get_json_plain::<EncryptionMeta>(backend, ENCRYPTION_META_KEY).await?;
+    if etag.is_none() {
+        bail!(
+            "this bucket has no {ENCRYPTION_META_KEY}: it was never bootstrapped, or the path is wrong.              Refusing to create one -- use get_or_create_cipher if initializing is actually intended"
+        );
+    }
+    open_meta(passphrase, algorithm, &meta)
+}
+
 /// Replaces the passphrase protecting this bucket, leaving the data key —
 /// and therefore every object already sealed under it — untouched.
 ///
