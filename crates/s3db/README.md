@@ -383,6 +383,27 @@ let reports = scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;  // per 
 
 `MaintenanceScanner` is narrower than a single-scan-many-conditions design might suggest: there's no schema-migration or key-rotation rescan in this crate to fuse in (see `maintenance`'s own module doc for why neither applies today), so what it actually consolidates is running `gc::sweep` over every registered collection from one call and one config, not fusing separate scans into a single read per object.
 
+### One writer, many readers
+
+A `Table` acks into a **local** WAL and holds rows in an **in-process** memtable. Both words are load-bearing: they are why a write is cheap, and why a second process writing the same table is not a supported configuration. Two writers do not merely see stale data — they corrupt history, because a row's age is decided by the order its SSTable was appended to the manifest. If A writes `k=1`, B later writes `k=2`, and A flushes second, A's older value wins permanently, and nothing in the format records when either row was written, so nothing downstream can resolve it.
+
+Making concurrent writers safe for real means a timestamp or sequence number on **every row**, carried through the WAL, the memtable, the SSTable blocks, and every merge in `Table::get`, `Table::scan` and the compactor — a change to the storage format, not a coordination layer on top. That is not implemented. What is, is making the supported topology explicit and enforced instead of documented and hoped for:
+
+```rust
+// the writer
+let lease = WriterLease::acquire(backend, &cipher, "rows", "worker-1", Duration::from_secs(30)).await?;
+let table = Table::open(TableConfig::new(..).with_writer_lease(lease)).await?;
+table.renew_lease().await?;     // from your own timer; errors if it was taken over
+table.release_lease().await;    // on shutdown, so the next writer needn't wait out the TTL
+
+// every other process
+let reader = Table::open_read_only(TableConfig::new(..)).await?;   // no WAL, writes refused
+```
+
+A second `acquire` is refused while the first lease is live; an unrenewed one is taken over after its TTL, which is how a crashed writer's table becomes writable again. `open_read_only` creates no WAL and refuses every write, so a reader can't drift into being an accidental second writer — which is what would happen if it used `open`, whose table would happily accept writes and eventually flush them. A reader sees everything flushed and nothing that isn't, so its staleness is bounded by the writer's flush interval (`flush_even_if_small`).
+
+**The lease is not a fence.** Between a lease expiring and its holder noticing, that holder can still write, and S3 cannot reject the write on the lease's behalf — a real fence needs the storage layer to check a token, meaning a CAS against the lease on every single write. So it prevents the failure that actually happens (two instances of a service started against the same table), and a taken-over lease should be read as "the old writer may still be finishing", never "the old writer is definitely gone".
+
 ### Driving an LSM table's maintenance
 
 A `Table` acks a write once its local WAL is durable — nothing is in the bucket, and nothing is visible to another process, until a flush turns the memtable into an SSTable; and every flush adds one more SSTable for reads to consult, so compaction has to happen too. `lsm::maintenance::tick` runs both, flush first (the flush is what pushes the count over the compaction threshold, so the other order always defers the newest SSTable by a tick):
