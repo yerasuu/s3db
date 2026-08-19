@@ -216,6 +216,18 @@ idx.claim_inline(backend, &cipher, &fingerprint, &pointer, &user).await?;
 let user: Option<User> = idx.resolve_inline(backend, &cipher, &fingerprint).await?;
 ```
 
+**`MultiIndex`** — the other index shape: `value -> every member that has it`, for a field that isn't unique (every chapter in a volume, every work carrying a genre, every job in a state):
+
+```rust
+const BY_GENRE: MultiIndex = MultiIndex::new("idx", "genre", Segment::Raw);
+
+BY_GENRE.add_member(backend, &cipher, "action", "work-a").await?;
+let works: Vec<String> = BY_GENRE.members(backend, "action").await?;   // listings only, nothing read
+BY_GENRE.remove(backend, "action", "work-a").await;
+```
+
+Membership lives in the key (`<root>/<kind>/<value>/<member>.json`), not in a list inside one object. The list-in-one-object alternative outgrows `MAX_OBJECT_BYTES` on the first value with a few thousand members, serializes every add and remove on a single key, and can't be read without fetching and decrypting the whole thing. With the member in the key, adds are independent writes, size is unbounded, and `members` answers from a paged listing — no object fetched, nothing decrypted. Pass `&()` as the payload when the member name is the whole answer, or a small denormalized struct (read back with `members_with`) when a reader would otherwise fetch every member's entity to render a list — same trade, and same staleness obligation, as `claim_inline`.
+
 **`ShardedIndex`** — `SecondaryIndex`, but the key spreads across `2^prefix_bits` shards instead of one flat prefix, for an index hot enough to hit a single S3 partition's throughput ceiling:
 
 ```rust
