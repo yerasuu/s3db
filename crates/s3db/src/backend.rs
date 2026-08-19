@@ -181,6 +181,41 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// generically, for every implementor at once -- can't give it. Every
     /// implementor's body is the same one line, `self`.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// This backend's native-transaction capability, if it has one.
+    ///
+    /// Capability discovery used to be a downcast to a concrete driver type
+    /// performed by the caller (`atomic::as_atomic`), which could only ever
+    /// see the type at the very top of an `Arc<dyn Backend>`: a driver behind
+    /// [`crate::CachedBackend`] or any other decorator silently lost the
+    /// capability, and the resilience stack always puts at least one
+    /// decorator in the way. Asking the backend itself lets every layer
+    /// answer for its own chain.
+    ///
+    /// A decorator that only observes traffic (metrics, retries, throttling)
+    /// forwards this to what it wraps — the resulting call bypasses that
+    /// layer, which costs its bookkeeping and nothing else. A decorator whose
+    /// correctness depends on seeing every write (the caches) must **not**
+    /// forward a bare inner reference: a batch committed straight to the
+    /// driver would leave cached entries for the keys it just changed. Those
+    /// implement the capability themselves, so the invalidation still
+    /// happens. Which is exactly why this is a method here rather than a
+    /// downcast out there: a layer can insert itself into the capability
+    /// instead of being skipped by it.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        None
+    }
+
+    /// This backend's ordered-range-scan capability, if it has one — same
+    /// discovery mechanism as [`Self::as_atomic`], see there.
+    ///
+    /// A range scan is a read that populates no cache, so a caching
+    /// decorator forwards this rather than implementing it: bypassing a
+    /// write-through cache on a read can't return anything staler than the
+    /// cache itself holds.
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        None
+    }
 }
 
 /// Builds the right [`Backend`] for `cfg` — the single place that turns

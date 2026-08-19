@@ -114,6 +114,18 @@ impl Backend for MeteredBackend {
         self
     }
 
+    /// Forwards the capability: this layer only observes traffic, so a call
+    /// that goes straight to the inner backend loses its metrics and nothing
+    /// else -- see [`Backend::as_atomic`] for the layers where that
+    /// trade-off would not be acceptable.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner.as_atomic()
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner.as_range()
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let result = self.inner.get(key).await;
         self.record("get", &result);
@@ -281,6 +293,18 @@ impl RetryBackend {
 impl Backend for RetryBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Forwards the capability: this layer only observes traffic, so a call
+    /// that goes straight to the inner backend loses its retries and nothing
+    /// else -- see [`Backend::as_atomic`] for the layers where that
+    /// trade-off would not be acceptable.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner.as_atomic()
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner.as_range()
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
@@ -457,6 +481,18 @@ impl ThrottledBackend {
 impl Backend for ThrottledBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Forwards the capability: this layer only observes traffic, so a call
+    /// that goes straight to the inner backend loses its concurrency permit and circuit breaker and nothing
+    /// else -- see [`Backend::as_atomic`] for the layers where that
+    /// trade-off would not be acceptable.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner.as_atomic()
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner.as_range()
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {

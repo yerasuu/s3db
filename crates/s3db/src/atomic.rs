@@ -7,16 +7,16 @@
 //! (`TxnRecord` + crash recovery), which is the only way to approximate
 //! atomicity without a native transaction to lean on.
 //!
-//! Detected by downcasting `&dyn Backend` (see [`as_atomic`]), not by
-//! widening [`Backend`] itself — every backend keeps implementing the same
-//! small required surface either way; this is strictly additive for the one
-//! backend that can actually back it up.
+//! Discovered by asking the backend chain ([`Backend::as_atomic`]), whose
+//! default answer is `None` — every driver keeps implementing the same small
+//! required surface, and a decorator gets to either forward the capability or
+//! insert itself into it (see that method for why the caches must do the
+//! latter).
 
 use crate::backend::Backend;
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::collection::Collection;
 use crate::index::SecondaryIndex;
-use crate::local::LocalBackend;
 use anyhow::Result;
 use serde::Serialize;
 
@@ -42,6 +42,16 @@ pub enum BatchOp {
     Delete { key: String },
 }
 
+impl BatchOp {
+    /// The key this op touches -- what a decorator needs in order to
+    /// invalidate its own view of it (see [`Backend::as_atomic`]).
+    pub fn key(&self) -> &str {
+        match self {
+            BatchOp::Put { key, .. } | BatchOp::Delete { key } => key,
+        }
+    }
+}
+
 /// What [`AtomicBackend::commit_batch`] did — deliberately as coarse as
 /// [`crate::backend::Cas`]: a caller that needs to know *which* op
 /// conflicted is asking for something this trait doesn't promise, same
@@ -63,24 +73,12 @@ pub trait AtomicBackend: Backend {
     async fn commit_batch(&self, ops: Vec<BatchOp>) -> Result<BatchOutcome>;
 }
 
-/// Downcasts `backend` to a concrete type known to implement
-/// [`AtomicBackend`] — currently only [`LocalBackend::Redb`]. A `dyn
-/// Backend` can't be downcast straight to a trait object of a *different*
-/// trait, so this has to name every concrete type that might implement
-/// [`AtomicBackend`] explicitly; today there's exactly one. Shared by
-/// [`crate::txn::run`] and [`put_with_index`] so the detection logic (and
-/// its one limitation) lives in exactly one place.
-///
-/// Detection is on the concrete type at the top of the `Arc<dyn Backend>`,
-/// not on what it might wrap — a `RedbBackend` behind
-/// [`crate::cache::CachedBackend`] or another decorator won't be found here,
-/// since the decorator itself is what `as_any` returns. That's an accepted
-/// limitation, not a bug.
+/// This backend chain's [`AtomicBackend`], if any — a thin wrapper over
+/// [`Backend::as_atomic`], kept so call sites inside this crate read the
+/// same as they did when discovery was a downcast performed here. See that
+/// method for why the backend answers instead of being downcast.
 pub(crate) fn as_atomic(backend: &dyn Backend) -> Option<&dyn AtomicBackend> {
-    match backend.as_any().downcast_ref::<LocalBackend>()? {
-        LocalBackend::Redb(inner) => Some(inner),
-        LocalBackend::Files(_) => None,
-    }
+    backend.as_atomic()
 }
 
 /// Writes one [`Collection`] entry and claims one [`SecondaryIndex`]

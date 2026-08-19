@@ -6,7 +6,7 @@
 //! or request and drop it afterward — never stash it somewhere long-lived.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 #[cfg(any(test, feature = "streaming"))]
 use std::path::Path;
@@ -39,9 +39,40 @@ impl RequestCache {
 }
 
 #[async_trait::async_trait]
+impl crate::atomic::AtomicBackend for RequestCache {
+    async fn commit_batch(&self, ops: Vec<crate::atomic::BatchOp>) -> Result<crate::atomic::BatchOutcome> {
+        let touched: Vec<String> = ops.iter().map(|op| op.key().to_string()).collect();
+        let inner = self
+            .inner
+            .as_atomic()
+            .context("RequestCache::commit_batch: the wrapped backend has no native transaction")?;
+        let result = inner.commit_batch(ops).await;
+        let mut reads = self.reads.lock().unwrap();
+        for key in touched {
+            reads.remove(&key);
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
 impl Backend for RequestCache {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Same reasoning as [`crate::CachedBackend`]: this layer claims the
+    /// capability so its own invalidation still runs, rather than handing out
+    /// a reference that would let a batch bypass it. See
+    /// [`Backend::as_atomic`].
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner
+            .as_atomic()
+            .map(|_| self as &dyn crate::atomic::AtomicBackend)
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner.as_range()
     }
 
     async fn get(&self, key: &str) -> Result<CachedGet> {

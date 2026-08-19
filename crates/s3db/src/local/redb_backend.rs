@@ -129,6 +129,14 @@ impl Backend for RedbBackend {
         self
     }
 
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        Some(self)
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        Some(self)
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         let db = self.database().await?.clone();
         let key = key.to_string();

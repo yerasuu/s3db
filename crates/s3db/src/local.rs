@@ -61,6 +61,18 @@ impl Backend for LocalBackend {
         self
     }
 
+    /// Forwards to the selected engine, so the answer depends on which one
+    /// this directory uses rather than on `local` being in play at all --
+    /// only [`RedbBackend`] has a native transaction, [`FilesBackend`] has
+    /// hand-rolled `flock` CAS and honestly can't offer one.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner().as_atomic()
+    }
+
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner().as_range()
+    }
+
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         self.inner().get(key).await
     }

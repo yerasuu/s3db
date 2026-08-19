@@ -7,7 +7,7 @@
 //! type's own doc comment for when to reach for which.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(feature = "streaming")]
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -61,6 +61,30 @@ pub struct CachedBackend {
     config: CacheConfig,
     entries: Mutex<lru::LruCache<String, Entry>>,
     total_bytes: Mutex<usize>,
+}
+
+#[async_trait::async_trait]
+impl crate::atomic::AtomicBackend for CachedBackend {
+    /// Commits through the inner backend's transaction, then drops this
+    /// cache's entry for every key the batch touched -- regardless of
+    /// outcome, exactly as [`Backend::put_cas`] already does here, since a
+    /// `BatchOutcome::Conflict` still means the stored value may have moved
+    /// underneath us.
+    async fn commit_batch(&self, ops: Vec<crate::atomic::BatchOp>) -> Result<crate::atomic::BatchOutcome> {
+        let touched: Vec<String> = ops.iter().map(|op| op.key().to_string()).collect();
+        // `as_atomic` only claims this capability when the inner backend has
+        // one, so this is unreachable unless a caller built the trait object
+        // some other way.
+        let inner = self
+            .inner
+            .as_atomic()
+            .context("CachedBackend::commit_batch: the wrapped backend has no native transaction")?;
+        let result = inner.commit_batch(ops).await;
+        for key in touched {
+            self.remove(&key);
+        }
+        result
+    }
 }
 
 impl std::fmt::Debug for CachedBackend {
@@ -135,6 +159,24 @@ impl CachedBackend {
 impl Backend for CachedBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Claims the capability for *this* layer, not the driver's, whenever the
+    /// driver has one -- see [`Backend::as_atomic`]. Handing out a bare inner
+    /// reference would let a batch change keys this cache still holds stale
+    /// entries for, which is the one bypass that turns into wrong reads
+    /// rather than lost bookkeeping.
+    fn as_atomic(&self) -> Option<&dyn crate::atomic::AtomicBackend> {
+        self.inner
+            .as_atomic()
+            .map(|_| self as &dyn crate::atomic::AtomicBackend)
+    }
+
+    /// Forwarded, not claimed: a range scan populates nothing here, and
+    /// bypassing a write-through cache on a read can't return anything
+    /// staler than the cache itself holds.
+    fn as_range(&self) -> Option<&dyn crate::range::RangeBackend> {
+        self.inner.as_range()
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {

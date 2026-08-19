@@ -9,11 +9,11 @@
 //! backends a real range primitive of their own (`Backend::get_range` over
 //! sorted SSTable blocks), a different mechanism for a different substrate.
 //!
-//! Detected the same way as [`crate::atomic::AtomicBackend`]: downcasting
-//! `&dyn Backend` (see [`as_range`]), not by widening [`Backend`] itself.
+//! Discovered the same way as [`crate::atomic::AtomicBackend`]: by asking
+//! the backend chain ([`Backend::as_range`]), so a driver behind a decorator
+//! keeps the capability instead of silently losing it.
 
 use crate::backend::Backend;
-use crate::local::LocalBackend;
 use anyhow::Result;
 
 /// See the module doc for which backends can honestly implement this.
@@ -27,13 +27,8 @@ pub trait RangeBackend: Backend {
     async fn range(&self, start_key: &str, end_key: &str) -> Result<Vec<(String, Vec<u8>)>>;
 }
 
-/// Downcasts `backend` to a concrete type known to implement
-/// [`RangeBackend`] — same idiom, and the same single-implementor
-/// limitation, as [`crate::atomic::as_atomic`] (see that function's doc for
-/// the reasoning, which applies here unchanged).
+/// This backend chain's [`RangeBackend`], if any — a thin wrapper over
+/// [`Backend::as_range`], see there.
 pub(crate) fn as_range(backend: &dyn Backend) -> Option<&dyn RangeBackend> {
-    match backend.as_any().downcast_ref::<LocalBackend>()? {
-        LocalBackend::Redb(inner) => Some(inner),
-        LocalBackend::Files(_) => None,
-    }
+    backend.as_range()
 }

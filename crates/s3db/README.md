@@ -76,6 +76,8 @@ MeteredBackend -> RetryBackend -> ThrottledBackend -> CachedBackend -> driver
 
 `RetryBackend` sits *outside* `ThrottledBackend` on purpose: each attempt (including retries) acquires and releases its own concurrency permit around just that one call, so a retry's backoff sleep never holds a permit hostage — the reverse order lets a slow retry sequence starve the very budget everything else is competing for. The circuit breaker lives inside `ThrottledBackend` (per-call permit + breaker share the same layer) and opens after `CircuitBreakerConfig::failure_threshold` consecutive real errors (never a `Cas::Conflict`), failing fast without touching the inner backend until `open_duration` elapses and lets one trial call through.
 
+Capabilities beyond `Backend`'s required surface (`as_atomic`, `as_range`) are discovered by asking the chain, not by downcasting its top: a driver behind this stack keeps its native transaction instead of silently losing it. The observe-only layers forward the capability; the caches implement it themselves and invalidate the keys a batch touched, since that is the one bypass that would turn into wrong reads rather than lost bookkeeping.
+
 `CachedBackend` (raw bytes + etag, cross-request LRU) sits innermost, right above the driver — see [`cache::CacheConfig`]: `max_entries` is the primary O(1) budget, `max_bytes` an optional safety net checked only once entries are already at capacity. `request_cache::RequestCache` is *not* part of this stack — it belongs outside all of it, at the application layer, wrapping whatever `build_resilient_backend` returns, since its own invalidation needs to see a write's result after retry/throttle already ran.
 
 ```rust
