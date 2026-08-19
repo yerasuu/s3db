@@ -167,6 +167,22 @@ user.release_email(backend).await;                          // best-effort uncla
 
 **A note on entity field types.** Every `String` field is its own heap allocation — a struct with 6-8 short text fields (names, ids-as-text, slugs) makes 6-8 allocations per instance deserialized, which shows up at this crate's target volume for objects that get cached (`cache::TypedCache`) or moved through `BatchLoader`. For text that's short and bounded (usernames, ids, slugs — not free-form/long text like descriptions), consider [`compact_str::CompactString`](https://docs.rs/compact_str) in place of `String`: it inlines strings up to ~24 bytes with no heap allocation at all, and is drop-in compatible with `serde`. This is a recommendation for how you define your own entity structs, not something this crate enforces or depends on itself.
 
+**`Blob`** — a value too big for one object, spanning several, still addressed and CAS'd as one thing:
+
+```rust
+const PAGES: Blob = Blob::new("pages");
+
+PAGES.put(backend, &cipher, "chapter-1", &html, None).await?;          // CAS on the manifest
+let (html, etag) = PAGES.get(&backend, &cipher, "chapter-1").await?;   // assembled, length-checked
+let (manifest, etag) = PAGES.head(backend, &cipher, "chapter-1").await?; // size without the parts
+```
+
+`put_json`'s 256 KiB cap exists for good reasons and `put_stream` gives up encryption, CAS, and history to get past it; this is the middle ground, on `Backend`'s required surface only — no feature flag, no driver support, identical on every driver. The manifest at `<prefix>/<name>.json` is the blob's identity and the thing etags refer to; parts live under `<prefix>/.parts/<name>/<generation>/<index>`.
+
+Each write puts its parts under a **fresh random generation** and CAS-writes the manifest last. Overwriting parts in place would let a reader holding the previous manifest assemble part 0 of the new value with part 1 of the old — tearing below the level CAS protects. Generations make that impossible, and reduce the worst case to a read that fails because its generation was already swept. A crash mid-write leaves orphan parts nothing references; a lost CAS race sweeps its own; `sweep_orphan_parts(min_age_ms)` clears the rest, skipping generations young enough to still be an in-flight write (which is why a generation id carries its own timestamp — nothing in `Backend` reports an mtime).
+
+`get` checks the assembled length against the manifest, so a missing part is an `Err`, never a silently short body. `delete` is a hard delete, not a tombstone: keeping parts this size around to be restorable is a storage decision a caller should make explicitly.
+
 **`Singleton`** — same shape, one fixed key, no name:
 
 ```rust
