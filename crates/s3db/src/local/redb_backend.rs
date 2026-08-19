@@ -300,6 +300,54 @@ impl Backend for RedbBackend {
         }
     }
 
+    /// The one engine where a cursor is native: keys live in a B-tree, so
+    /// `range(after..)` starts the scan at the page boundary instead of
+    /// walking to it, and the scan stops as soon as the page is full.
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        let db = self.database().await?.clone();
+        let prefix = prefix.to_string();
+        let after = after.map(str::to_string);
+        tokio::task::spawn_blocking(move || {
+            let read_txn = db.begin_read().context("beginning redb read transaction")?;
+            let table = match read_txn.open_table(TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(crate::backend::ListPage::default()),
+                Err(e) => return Err(e).context("opening redb table"),
+            };
+            // Start at whichever is later: the prefix itself, or just past
+            // the cursor. `after` is exclusive, and redb's range start is
+            // inclusive, so the cursor key is skipped explicitly below
+            // rather than by constructing a successor key.
+            let start = match &after {
+                Some(after) if after.as_str() > prefix.as_str() => after.as_str(),
+                _ => prefix.as_str(),
+            };
+            let mut entries = Vec::new();
+            let mut next_after = None;
+            for entry in table.range(start..).context("scanning redb")? {
+                let (key, value) = entry.context("reading redb range entry")?;
+                let key = key.value();
+                if !key.starts_with(prefix.as_str()) {
+                    break;
+                }
+                if after.as_deref().is_some_and(|after| key <= after) {
+                    continue;
+                }
+                if entries.len() == limit {
+                    // One entry past the page: proof that more remain,
+                    // without fetching another page to find out.
+                    next_after = entries.last().map(|(key, _): &(String, u64)| key.clone());
+                    break;
+                }
+                let (_, body) = value.value();
+                entries.push((key.to_string(), body.len() as u64));
+            }
+            Ok(crate::backend::ListPage { entries, next_after })
+        })
+        .await
+        .context("redb page task panicked")?
+    }
+
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let db = self.database().await?.clone();
         let prefix = prefix.to_string();

@@ -150,6 +150,11 @@ impl Backend for MeteredBackend {
         result
     }
 
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        let result = self.inner.list_page(prefix, after, limit).await;
+        self.record("list", &result);
+        result
+    }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let result = self.inner.list_prefix(prefix).await;
         self.record("list", &result);
@@ -323,6 +328,9 @@ impl Backend for RetryBackend {
         self.run(|| self.inner.delete_many(keys)).await
     }
 
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        self.run(|| self.inner.list_page(prefix, after, limit)).await
+    }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         self.run(|| self.inner.list_prefix(prefix)).await
     }
@@ -512,6 +520,10 @@ impl Backend for ThrottledBackend {
         self.guarded(&self.put_permits, self.inner.delete_many(keys)).await
     }
 
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        self.guarded(&self.list_permits, self.inner.list_page(prefix, after, limit))
+            .await
+    }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         self.guarded(&self.list_permits, self.inner.list_prefix(prefix)).await
     }

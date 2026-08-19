@@ -205,3 +205,86 @@ async fn count_prefix_counts_keys_and_bytes() {
     assert_eq!(count_prefix(&backend, "c/").await.unwrap(), (2, 35));
     assert_eq!(count_prefix(&backend, "nothing/").await.unwrap(), (0, 0));
 }
+
+/// A sweep must page rather than hold every key at once — asserted by capping
+/// what any single listing is allowed to return.
+#[derive(Debug)]
+struct PageWatchBackend {
+    inner: LocalBackend,
+    widest_page: std::sync::atomic::AtomicUsize,
+    full_listings: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Backend for PageWatchBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.full_listings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.list_prefix(prefix).await
+    }
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        let page = self.inner.list_page(prefix, after, limit).await?;
+        self.widest_page
+            .fetch_max(page.entries.len(), std::sync::atomic::Ordering::SeqCst);
+        Ok(page)
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+#[tokio::test]
+async fn delete_prefix_and_count_prefix_go_through_pages_not_one_big_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inner, _cipher) = test_backend_and_cipher(dir.path());
+    let backend = PageWatchBackend {
+        inner,
+        widest_page: std::sync::atomic::AtomicUsize::new(0),
+        full_listings: std::sync::atomic::AtomicUsize::new(0),
+    };
+    for n in 0..25u32 {
+        backend
+            .put_cas(&format!("work/{n:04}"), b"body".to_vec(), None)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(count_prefix(&backend, "work/").await.unwrap().0, 25);
+    let report = delete_prefix(&backend, "work/").await.unwrap();
+
+    assert!(report.is_complete(), "{report:?}");
+    assert_eq!(report.confirmed, 25);
+    assert_eq!(
+        backend.full_listings.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "neither may fall back to an unbounded list_prefix"
+    );
+    let widest = backend.widest_page.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        widest <= 1000,
+        "a page must stay within the sweep page size, saw {widest}"
+    );
+}

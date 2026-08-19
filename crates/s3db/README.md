@@ -368,6 +368,8 @@ let cached: Arc<dyn Backend> = Arc::new(RequestCache::new(Arc::clone(&backend)))
 
 ## Raw primitive
 
+`Backend::list_page(prefix, after, limit)` is `list_prefix` with a ceiling: ascending key order, `limit` entries at most, and `ListPage::next_after` carrying the key to resume from (`None` when exhausted). The cursor is a **key**, not an opaque provider token, so it is portable and stateless — persist one, resume in another process, and it keeps working even if the key it names was deleted in between, which is what a sweep that deletes as it pages needs. `s3` pushes it into the request (`start_after`/`max_keys`) and `redb` into its B-tree range; the other drivers inherit a default that lists, sorts, and slices — correct and consistently ordered, bounding the caller rather than the fetch. `delete_prefix` and `count_prefix` both page, so neither holds more than one page of keys regardless of prefix size.
+
 `payload::delete_prefix` sweeps every object under a prefix — the cascade object storage has no equivalent for, since the children of a deleted entity are just keys sharing a prefix. Each pass re-lists, so it is idempotent and resumable: a partial sweep (crash, exhausted pass budget, a delete that didn't confirm) is finished by calling it again, no cursor to persist. It returns a `SweepReport` whose `remaining` says whether it is done, and stops early if a pass confirms nothing rather than re-listing the same keys eight times. An empty prefix is refused.
 
 `payload::count_prefix` answers "how many objects, how many bytes" from one listing — the right fallback for a count not hot enough to justify maintaining a counter with `Collection::update`, and O(number of keys) in requests and memory for one that is.

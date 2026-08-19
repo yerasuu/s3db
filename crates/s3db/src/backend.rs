@@ -72,6 +72,18 @@ pub struct DeleteOutcome {
     pub confirmed: usize,
 }
 
+/// One page of [`Backend::list_page`], in ascending key order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListPage {
+    /// `(key, size)` pairs, same shape as [`Backend::list_prefix`].
+    pub entries: Vec<(String, u64)>,
+    /// Pass as the next call's `after` to continue; `None` means the
+    /// listing is exhausted. A page whose `entries` fill `limit` exactly
+    /// still carries `Some` when more keys remain, so a caller never has to
+    /// infer completion from a page's length.
+    pub next_after: Option<String>,
+}
+
 impl DeleteOutcome {
     /// Sums a batch of per-key outcomes into one — every driver's
     /// `delete_many` fans out to individual deletes and needs to fold the
@@ -181,6 +193,52 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// generically, for every implementor at once -- can't give it. Every
     /// implementor's body is the same one line, `self`.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// One bounded page of a prefix listing, in ascending key order.
+    ///
+    /// [`Self::list_prefix`] returns every key under a prefix in one
+    /// `Vec`, which is fine for the collection sizes this crate's own
+    /// primitives assume and wrong for anything larger: the caller has no
+    /// way to bound what it is about to hold. This is the same scan with a
+    /// ceiling on it -- `after` resumes strictly after that key (`None`
+    /// starts at the beginning), `limit` caps the entries returned, and
+    /// [`ListPage::next_after`] is the key to pass as the next call's
+    /// `after`, or `None` when the listing is exhausted.
+    ///
+    /// The cursor is a **key**, not an opaque provider token, so it is
+    /// portable and stateless: a caller can persist one, resume a sweep in
+    /// another process, or hand it to a different driver over the same
+    /// data. That costs the drivers whose SDKs only offer opaque
+    /// continuation tokens (Azure, GCS) the ability to push the cursor
+    /// down, which is what the default body below is for.
+    ///
+    /// **The default body bounds the caller, not the driver.** It lists the
+    /// whole prefix, sorts it, and slices out the page -- so every driver is
+    /// immediately correct and consistently ordered, and a driver that can
+    /// genuinely push `after`/`limit` into its own request (`s3`'s
+    /// `start_after`/`max_keys`, `redb`'s ordered range) overrides it to
+    /// also bound what gets fetched. A caller that needs the strong
+    /// guarantee should check its driver rather than assume.
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<ListPage> {
+        let mut entries = self.list_prefix(prefix).await?;
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let start = match after {
+            // `partition_point` over sorted keys: the first index whose key
+            // is strictly greater than `after`, which is where the next page
+            // begins whether or not `after` itself still exists.
+            Some(after) => entries.partition_point(|(key, _)| key.as_str() <= after),
+            None => 0,
+        };
+        let end = start.saturating_add(limit).min(entries.len());
+        let page: Vec<(String, u64)> = entries[start..end].to_vec();
+        let next_after = (end < entries.len())
+            .then(|| page.last().map(|(key, _)| key.clone()))
+            .flatten();
+        Ok(ListPage {
+            entries: page,
+            next_after,
+        })
+    }
 
     /// This backend's native-transaction capability, if it has one.
     ///

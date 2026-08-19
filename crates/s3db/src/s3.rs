@@ -272,6 +272,50 @@ impl Backend for S3Backend {
         Ok(outcome)
     }
 
+    /// Pushes the cursor into the request itself: `start_after` is exactly
+    /// this method's `after` (S3 lists lexicographically and skips up to and
+    /// including that key server-side) and `max_keys` caps what the response
+    /// carries, so neither this process nor the wire moves more than one
+    /// page.
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        let mut req = self.client.list_objects_v2().bucket(&self.bucket).prefix(prefix);
+        if let Some(after) = after {
+            req = req.start_after(after);
+        }
+        // S3 caps `max-keys` at 1000 and silently clamps a larger value; ask
+        // for the clamped number rather than pretending a bigger page was
+        // honoured.
+        req = req.max_keys(limit.clamp(1, 1000) as i32);
+        let out = match req.send().await {
+            Ok(out) => out,
+            Err(err) => {
+                let permanent = status_is_permanent(&err);
+                return tag_if(
+                    permanent,
+                    Err(err).with_context(|| format!("listing {prefix} in {}", self.bucket)),
+                );
+            }
+        };
+        let entries: Vec<(String, u64)> = out
+            .contents()
+            .iter()
+            .filter_map(|o| {
+                let key = o.key()?.to_string();
+                let size = o.size().unwrap_or(0).max(0) as u64;
+                Some((key, size))
+            })
+            .collect();
+        // `is_truncated` is S3's own answer to "is there more", which is
+        // more reliable than comparing the page's length against a `max_keys`
+        // the service may have clamped.
+        let next_after = out
+            .is_truncated()
+            .unwrap_or(false)
+            .then(|| entries.last().map(|(key, _)| key.clone()))
+            .flatten();
+        Ok(crate::backend::ListPage { entries, next_after })
+    }
+
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let mut objects = Vec::new();
         let mut continuation: Option<String> = None;

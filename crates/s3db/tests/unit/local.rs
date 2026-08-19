@@ -171,3 +171,118 @@ async fn files_engine_serializes_contending_writers_without_blocking_the_runtime
     assert_eq!(wins, 1, "exactly one create-only write can win");
     assert_eq!(conflicts, 7);
 }
+
+/// The cursor contract, asserted against both engines — `redb` pushes it into
+/// its B-tree range, `files` gets the sorting default — so the two can never
+/// drift on what a page means.
+#[tokio::test]
+async fn both_engines_page_a_prefix_in_key_order() {
+    for engine in [LocalEngine::Files, LocalEngine::Redb] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), engine);
+        // Written out of order on purpose: a page is defined by key order,
+        // not insertion order.
+        for n in [3u32, 1, 5, 2, 4] {
+            b.put_cas(&format!("p/{n:04}"), vec![0u8; n as usize], None)
+                .await
+                .unwrap();
+        }
+
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = b.list_page("p/", after.as_deref(), 2).await.unwrap();
+            pages += 1;
+            assert!(page.entries.len() <= 2, "engine {engine:?} overran the limit");
+            seen.extend(page.entries.iter().map(|(key, _size)| key.clone()));
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+            assert!(pages < 10, "engine {engine:?} never finished");
+        }
+
+        assert_eq!(
+            seen,
+            vec!["p/0001", "p/0002", "p/0003", "p/0004", "p/0005"],
+            "engine {engine:?}"
+        );
+        assert_eq!(pages, 3, "engine {engine:?}: 5 keys at 2 per page");
+    }
+}
+
+#[tokio::test]
+async fn both_engines_agree_on_an_empty_and_a_partial_page() {
+    for engine in [LocalEngine::Files, LocalEngine::Redb] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), engine);
+
+        let empty = b.list_page("nothing/", None, 10).await.unwrap();
+        assert!(empty.entries.is_empty(), "engine {engine:?}");
+        assert_eq!(empty.next_after, None, "engine {engine:?}");
+
+        b.put_cas("p/a", b"x".to_vec(), None).await.unwrap();
+        let partial = b.list_page("p/", None, 10).await.unwrap();
+        assert_eq!(partial.entries.len(), 1, "engine {engine:?}");
+        assert_eq!(
+            partial.next_after, None,
+            "engine {engine:?}: a page short of the limit is the last one"
+        );
+
+        // A cursor past every key yields nothing, not a wrap-around.
+        let past = b.list_page("p/", Some("p/zzz"), 10).await.unwrap();
+        assert!(past.entries.is_empty(), "engine {engine:?}");
+        assert_eq!(past.next_after, None, "engine {engine:?}");
+    }
+}
+
+/// A page whose entries exactly fill the limit must still say whether more
+/// remain — otherwise a caller has to guess, and guessing wrong either drops
+/// the tail or makes one wasted request per sweep.
+#[tokio::test]
+async fn a_full_page_reports_whether_more_remain() {
+    for engine in [LocalEngine::Files, LocalEngine::Redb] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), engine);
+        for n in 0..4u32 {
+            b.put_cas(&format!("p/{n:04}"), b"x".to_vec(), None).await.unwrap();
+        }
+
+        let full_with_more = b.list_page("p/", None, 2).await.unwrap();
+        assert_eq!(full_with_more.entries.len(), 2, "engine {engine:?}");
+        assert_eq!(
+            full_with_more.next_after.as_deref(),
+            Some("p/0001"),
+            "engine {engine:?}"
+        );
+
+        let full_exactly = b.list_page("p/", None, 4).await.unwrap();
+        assert_eq!(full_exactly.entries.len(), 4, "engine {engine:?}");
+        assert_eq!(
+            full_exactly.next_after, None,
+            "engine {engine:?}: the limit matching the key count is still the last page"
+        );
+    }
+}
+
+/// `after` names a key, so it keeps working when that key is gone — which is
+/// the whole point for a sweep that deletes as it pages.
+#[tokio::test]
+async fn a_cursor_survives_the_deletion_of_the_key_it_names() {
+    for engine in [LocalEngine::Files, LocalEngine::Redb] {
+        let dir = tempfile::tempdir().unwrap();
+        let b = backend(dir.path(), engine);
+        for n in 0..4u32 {
+            b.put_cas(&format!("p/{n:04}"), b"x".to_vec(), None).await.unwrap();
+        }
+        b.delete("p/0001").await.unwrap();
+
+        let page = b.list_page("p/", Some("p/0001"), 10).await.unwrap();
+        assert_eq!(
+            page.entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["p/0002", "p/0003"],
+            "engine {engine:?}"
+        );
+    }
+}

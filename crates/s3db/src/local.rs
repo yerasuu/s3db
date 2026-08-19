@@ -89,6 +89,10 @@ impl Backend for LocalBackend {
         self.inner().delete_many(keys).await
     }
 
+    async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
+        self.inner().list_page(prefix, after, limit).await
+    }
+
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         self.inner().list_prefix(prefix).await
     }

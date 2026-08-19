@@ -4,7 +4,7 @@
 //! [`put_json`] is MessagePack now, but the function names/signatures stay
 //! the same, so nothing above this module noticed the switch.
 
-use crate::backend::{Backend, Cas};
+use crate::backend::{Backend, Cas, ListPage};
 use crate::cipher::{Cipher, CompressionStrategy};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -143,6 +143,11 @@ impl SweepReport {
 /// should decide whether to keep sweeping.
 const MAX_SWEEP_PASSES: u32 = 8;
 
+/// Keys per [`Backend::list_page`] call inside [`delete_prefix`] and
+/// [`count_prefix`]. Matches S3's own `max-keys` ceiling, so a page is one
+/// request on the driver where that matters most.
+const SWEEP_PAGE_KEYS: usize = 1000;
+
 /// Deletes every object under `prefix`, resumably.
 ///
 /// This is the cascade that a relational schema gets from
@@ -169,36 +174,69 @@ pub async fn delete_prefix(backend: &dyn Backend, prefix: &str) -> Result<SweepR
     }
     let mut report = SweepReport::default();
     for _pass in 0..MAX_SWEEP_PASSES {
-        let keys = list_all_keys(backend, prefix).await?;
-        if keys.is_empty() {
+        let mut listed_anything = false;
+        let mut confirmed_this_pass = 0usize;
+        // Paged rather than one big listing: a sweep is exactly the operation
+        // most likely to run over a prefix far larger than the caller wants
+        // to hold in memory, and the page cursor moves past keys already
+        // deleted, so paging costs nothing here.
+        let mut after: Option<String> = None;
+        loop {
+            let page = backend.list_page(prefix, after.as_deref(), SWEEP_PAGE_KEYS).await?;
+            if page.entries.is_empty() {
+                break;
+            }
+            listed_anything = true;
+            let ListPage { entries, next_after } = page;
+            let keys: Vec<String> = entries.into_iter().map(|(key, _size)| key).collect();
+            let exhausted = next_after.is_none();
+            after = next_after.or_else(|| keys.last().cloned());
+            report.attempted += keys.len();
+            let outcome = backend.delete_many(&keys).await?;
+            report.confirmed += outcome.confirmed;
+            confirmed_this_pass += outcome.confirmed;
+            if exhausted {
+                break;
+            }
+        }
+        if !listed_anything {
             report.remaining = 0;
             return Ok(report);
         }
-        report.attempted += keys.len();
-        let outcome = backend.delete_many(&keys).await?;
-        report.confirmed += outcome.confirmed;
-        if outcome.confirmed == 0 {
-            report.remaining = keys.len();
+        if confirmed_this_pass == 0 {
+            report.remaining = count_prefix(backend, prefix).await?.0 as usize;
             return Ok(report);
         }
     }
-    report.remaining = list_all_keys(backend, prefix).await?.len();
+    report.remaining = count_prefix(backend, prefix).await?.0 as usize;
     Ok(report)
 }
 
 /// How many objects live under `prefix`, and how many bytes they occupy.
 ///
-/// One `list_prefix` (which every driver already paginates internally), not
-/// a read of anything — sizes come from the listing itself. The cheapest
-/// honest answer to "how many are there" without maintaining a counter, and
-/// the right fallback for a count that isn't hot enough to justify one. For
-/// a count that *is* hot, keep a counter with
-/// [`crate::Collection::update`] instead: this is O(number of keys) in both
-/// requests and memory, every call.
+/// A paged listing, not a read of anything — sizes come from the listing
+/// itself, and the pages mean memory stays flat no matter how many keys
+/// there are. The cheapest honest answer to "how many are there" without
+/// maintaining a counter, and the right fallback for a count that isn't hot
+/// enough to justify one. For a count that *is* hot, keep a counter with
+/// [`crate::Collection::update`] instead: this is still O(number of keys) in
+/// requests, every call.
 pub async fn count_prefix(backend: &dyn Backend, prefix: &str) -> Result<(u64, u64)> {
-    let entries = backend.list_prefix(prefix).await?;
-    let bytes = entries.iter().map(|(_key, size)| *size).sum();
-    Ok((entries.len() as u64, bytes))
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    let mut after: Option<String> = None;
+    loop {
+        let page = backend.list_page(prefix, after.as_deref(), SWEEP_PAGE_KEYS).await?;
+        count += page.entries.len() as u64;
+        bytes += page.entries.iter().map(|(_key, size)| *size).sum::<u64>();
+        match page.next_after {
+            // Paged so that counting a huge prefix costs one page of memory
+            // rather than one entry per key -- the count itself is the answer,
+            // there was never a reason to hold the keys to produce it.
+            Some(next) => after = Some(next),
+            None => return Ok((count, bytes)),
+        }
+    }
 }
 
 #[cfg(test)]

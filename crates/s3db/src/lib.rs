@@ -55,7 +55,7 @@ mod local;
 mod s3;
 
 pub use atomic::{AtomicBackend, BatchOp, BatchOutcome, put_with_index};
-pub use backend::{Backend, Cas, DeleteOutcome, build_backend};
+pub use backend::{Backend, Cas, DeleteOutcome, ListPage, build_backend};
 pub use backup::{BackupConsistency, BackupManifest};
 pub use batch_loader::{BatchLoader, MemoryBudget};
 pub use blob::{Blob, BlobManifest, DEFAULT_MAX_BLOB_BYTES, DEFAULT_PART_BYTES};
