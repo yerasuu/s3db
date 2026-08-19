@@ -112,6 +112,95 @@ pub async fn list_all_keys(backend: &dyn Backend, prefix: &str) -> Result<Vec<St
         .collect())
 }
 
+/// What one [`delete_prefix`] sweep did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Keys handed to [`Backend::delete_many`] across every pass. A key
+    /// that needed two passes is counted twice — this measures work done,
+    /// not distinct keys.
+    pub attempted: usize,
+    /// Deletes the backend confirmed.
+    pub confirmed: usize,
+    /// Keys still under the prefix when the sweep stopped. Non-zero means
+    /// the sweep is unfinished, not that it failed: call it again.
+    pub remaining: usize,
+}
+
+impl SweepReport {
+    /// `true` when nothing is left under the prefix.
+    pub fn is_complete(&self) -> bool {
+        self.remaining == 0
+    }
+}
+
+/// How many list/delete passes one [`delete_prefix`] call makes before
+/// reporting what's left instead of looping again. A pass exists because
+/// [`Backend::delete`] is best-effort per key (see [`crate::DeleteOutcome`]):
+/// a delete that didn't confirm has to be retried, and the honest way to
+/// know what didn't land is to list again. Bounded because a writer
+/// concurrently creating keys under the same prefix would otherwise keep
+/// this looping forever — at which point the caller, not this function,
+/// should decide whether to keep sweeping.
+const MAX_SWEEP_PASSES: u32 = 8;
+
+/// Deletes every object under `prefix`, resumably.
+///
+/// This is the cascade that a relational schema gets from
+/// `ON DELETE CASCADE` and that object storage has no equivalent for: the
+/// children of a deleted entity are just keys sharing a prefix, and
+/// somebody has to enumerate and remove them. Idempotent by construction —
+/// each pass re-lists, so calling it again after a partial sweep (a crash,
+/// an exhausted pass budget, a delete that didn't confirm) picks up exactly
+/// what's left rather than needing a cursor persisted somewhere.
+///
+/// Stops early, without consuming its pass budget, if a pass confirms
+/// nothing at all: that means the backend is refusing these deletes rather
+/// than making slow progress, and re-listing the same keys forever won't
+/// change it.
+///
+/// `prefix` is matched as a literal string prefix, not a path component, so
+/// `"work/1"` also matches `"work/10/..."`. Pass the trailing `/` when a
+/// directory-like boundary is what's meant. An empty prefix is refused: it
+/// would match every object in the bucket, which is never something worth
+/// expressing by accident.
+pub async fn delete_prefix(backend: &dyn Backend, prefix: &str) -> Result<SweepReport> {
+    if prefix.is_empty() {
+        bail!("delete_prefix: refusing an empty prefix (it would match every object in the bucket)");
+    }
+    let mut report = SweepReport::default();
+    for _pass in 0..MAX_SWEEP_PASSES {
+        let keys = list_all_keys(backend, prefix).await?;
+        if keys.is_empty() {
+            report.remaining = 0;
+            return Ok(report);
+        }
+        report.attempted += keys.len();
+        let outcome = backend.delete_many(&keys).await?;
+        report.confirmed += outcome.confirmed;
+        if outcome.confirmed == 0 {
+            report.remaining = keys.len();
+            return Ok(report);
+        }
+    }
+    report.remaining = list_all_keys(backend, prefix).await?.len();
+    Ok(report)
+}
+
+/// How many objects live under `prefix`, and how many bytes they occupy.
+///
+/// One `list_prefix` (which every driver already paginates internally), not
+/// a read of anything — sizes come from the listing itself. The cheapest
+/// honest answer to "how many are there" without maintaining a counter, and
+/// the right fallback for a count that isn't hot enough to justify one. For
+/// a count that *is* hot, keep a counter with
+/// [`crate::Collection::update`] instead: this is O(number of keys) in both
+/// requests and memory, every call.
+pub async fn count_prefix(backend: &dyn Backend, prefix: &str) -> Result<(u64, u64)> {
+    let entries = backend.list_prefix(prefix).await?;
+    let bytes = entries.iter().map(|(_key, size)| *size).sum();
+    Ok((entries.len() as u64, bytes))
+}
+
 #[cfg(test)]
 #[path = "../tests/unit/payload.rs"]
 mod tests;

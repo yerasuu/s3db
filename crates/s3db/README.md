@@ -341,6 +341,10 @@ let cached: Arc<dyn Backend> = Arc::new(RequestCache::new(Arc::clone(&backend)))
 
 ## Raw primitive
 
+`payload::delete_prefix` sweeps every object under a prefix — the cascade object storage has no equivalent for, since the children of a deleted entity are just keys sharing a prefix. Each pass re-lists, so it is idempotent and resumable: a partial sweep (crash, exhausted pass budget, a delete that didn't confirm) is finished by calling it again, no cursor to persist. It returns a `SweepReport` whose `remaining` says whether it is done, and stops early if a pass confirms nothing rather than re-listing the same keys eight times. An empty prefix is refused.
+
+`payload::count_prefix` answers "how many objects, how many bytes" from one listing — the right fallback for a count not hot enough to justify maintaining a counter with `Collection::update`, and O(number of keys) in requests and memory for one that is.
+
 Everything above builds on `payload::{get_json, put_json}` — encrypt/decrypt plus a single `Backend::get`/`put_cas` call — and `delete_object`/`list_all_keys` as thin wrappers over `Backend::delete`/`list_prefix`.
 
 The wire format is MessagePack (`rmp-serde`), not JSON: this crate's own entities are always Rust structs with `serde`, and the object is *always* encrypted, so JSON's "it's readable if you squint at the raw bytes" benefit never applied in the first place — MessagePack is smaller and faster to parse for the same schema-evolution story (`#[entity(...)]`'s migrations tolerate added/removed fields the same way either format). `.conf/encryption.json` is the one deliberate exception, via `get_json_plain`/`put_json_plain`: unencrypted and plain JSON on purpose, since it's the one object meant to be read by hand during an incident.
