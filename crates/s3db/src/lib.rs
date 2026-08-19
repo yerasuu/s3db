@@ -59,7 +59,7 @@ pub use batch_loader::{BatchLoader, MemoryBudget};
 pub use cache::{CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode};
 pub use coalescer::WriteCoalescer;
-pub use collection::{Collection, KeyEntropy, PurgeState, Singleton, Tombstone};
+pub use collection::{Collection, KeyEntropy, MAX_UPDATE_ATTEMPTS, PurgeState, Singleton, Tombstone, Update};
 pub use config::{AzureParams, BackendConfig, GcsParams, LocalEngine, LocalParams, R2Params, S3Params};
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;

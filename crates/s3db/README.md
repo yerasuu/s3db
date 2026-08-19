@@ -119,6 +119,15 @@ USERS.put(backend, &cipher, "alice", &user, etag.as_deref()).await?;
 let names: Vec<String> = USERS.list_names(backend).await?;
 ```
 
+`update` is the CAS read-modify-write loop every upsert and counter otherwise hand-rolls: it reads the entry (`T::default()` when absent, so it creates), hands `mutate` a copy, writes conditioned on the etag it read, and on conflict re-reads and re-runs `mutate` against the fresh value — with jittered backoff, since a conflict means a competing write landed. `mutate` answers `Update::Write` or `Update::Keep` (SQL's `ON CONFLICT DO NOTHING`, without paying a write to express it), and must be a pure function of the value it's handed — it runs once per attempt and earlier results are discarded. `Singleton::update` is the same against its one fixed key.
+
+```rust
+let total = COUNTERS.update::<Counters, _>(backend, &cipher, "chapters", |c| {
+    c.total += 1;
+    Ok(Update::Write)
+}).await?;
+```
+
 `put_versioned` archives the previous value (under its own etag, at `<prefix>/.history/<name>/<etag>.json`) before overwriting — `list_versions`/`get_version` read it back. `list_all`/`find_all` fan out concurrently across every entry — full scan, only for admin views or small collections.
 
 `delete` is a soft-delete: it archives the current value the same way `put_versioned` does, writes a tombstone at `<prefix>/.deleted/<name>.json` recording that archive's etag, then best-effort-deletes the real object — the tombstone's `purge_state` stays `Pending` if that underlying delete never confirms, `Purged` once it does. `restore` reads the tombstone's `restore_etag`, writes that archived value back (winning over any orphaned object still occupying the key), and clears the tombstone:

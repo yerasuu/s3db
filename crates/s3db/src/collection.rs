@@ -107,6 +107,39 @@ pub enum KeyEntropy {
     HashPrefix { buckets: u32 },
 }
 
+/// How many CAS attempts [`Collection::update`] makes before giving up.
+/// Sized for contention, not for a broken backend: eight attempts with full
+/// jitter is far past the point where a real write pattern still collides
+/// (two writers racing lose at most once each), so exhausting it means
+/// something is hammering one key rather than that the budget was too
+/// small -- an error the caller should see, not a wait it should keep
+/// paying.
+pub const MAX_UPDATE_ATTEMPTS: u32 = 8;
+
+/// Base delay for [`Collection::update`]'s jittered backoff between CAS
+/// attempts. Deliberately shorter than [`crate::ResilienceConfig`]'s
+/// transport backoff: a lost CAS race means someone else's write *landed*,
+/// so the value to re-read is already there -- there's nothing to wait out
+/// except the other writers in the same herd.
+const UPDATE_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// What [`Collection::update`]'s mutator decided, after seeing the current
+/// value.
+///
+/// Without a `Keep`, a caller expressing "create it if absent, leave it
+/// alone otherwise" (SQL's `ON CONFLICT DO NOTHING`, and every `ensure_*`
+/// function ever written) would have to write the value back unchanged --
+/// paying a round trip, bumping the etag, and racing other writers over an
+/// update that was never wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Update {
+    /// Persist the mutated value.
+    Write,
+    /// Leave the stored value as it is; [`Collection::update`] returns it
+    /// without writing.
+    Keep,
+}
+
 #[derive(Debug, Clone)]
 pub struct Collection {
     pub prefix: Cow<'static, str>,
@@ -628,6 +661,51 @@ impl Collection {
     }
 
     /// Every name currently stored, sorted.
+    /// Read-modify-write of one entry under CAS, retrying the read when it
+    /// loses the race.
+    ///
+    /// This is the loop three separate places in this crate had already
+    /// hand-rolled (`Self::restore`, the tombstone write inside
+    /// `Self::delete`, `sharded_index`'s epoch bump) and that every caller
+    /// implementing an upsert or a counter has to hand-roll too: read the
+    /// current value with its etag, derive the next one, `put` conditioned
+    /// on that etag, and on [`Cas::Conflict`] start over from a fresh read
+    /// -- because a conflict means someone else's write landed, so the
+    /// value `mutate` was handed is stale and its result must be discarded,
+    /// not retried as-is.
+    ///
+    /// A missing entry is `T::default()`, and the first attempt writes with
+    /// `expected_etag: None` ("must not exist yet"). So this is an upsert:
+    /// `mutate` sees either the stored value or the default, and can tell
+    /// them apart by whatever field of `T` distinguishes them.
+    ///
+    /// **`mutate` must be a pure function of the value it's handed.** It is
+    /// called once per attempt, always against a freshly read value, and
+    /// its earlier results are thrown away -- a mutator that instead
+    /// accumulates into a captured variable (pushing to a `Vec` it owns,
+    /// incrementing a local counter) will double-count on every retry.
+    /// Deriving the new value from its `&mut T` argument alone is always
+    /// safe; anything else is the caller's own hazard.
+    ///
+    /// Returns the value as it now stands: the one written, or the stored
+    /// one *as read* if `mutate` answered [`Update::Keep`] -- so a mutator
+    /// that modified its buffer and then decided against writing it cannot
+    /// hand back a value that was never stored. That guarantee is what the
+    /// `T: Clone` bound pays for: `mutate` works on a copy.
+    pub async fn update<T, F>(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        name: &str,
+        mutate: F,
+    ) -> Result<T>
+    where
+        T: Clone + Serialize + DeserializeOwned + Default,
+        F: FnMut(&mut T) -> Result<Update>,
+    {
+        update_at_key(backend, cipher, &self.key(name)?, mutate).await
+    }
+
     pub async fn list_names(&self, backend: &dyn Backend) -> Result<Vec<String>> {
         let scan_prefix = format!("{}/", self.prefix);
         let mut names: Vec<String> = list_all_keys(backend, &scan_prefix)
@@ -819,6 +897,51 @@ impl Singleton {
     ) -> Result<Cas> {
         put_json(backend, self.key, value, expected_etag, cipher).await
     }
+
+    /// [`Collection::update`] against this singleton's one fixed key --
+    /// same CAS-retry contract, including the requirement that `mutate` be
+    /// a pure function of the value it's handed.
+    pub async fn update<T, F>(&self, backend: &dyn Backend, cipher: &Cipher, mutate: F) -> Result<T>
+    where
+        T: Clone + Serialize + DeserializeOwned + Default,
+        F: FnMut(&mut T) -> Result<Update>,
+    {
+        update_at_key(backend, cipher, self.key, mutate).await
+    }
+}
+
+/// The CAS read-modify-write loop behind [`Collection::update`] and
+/// [`Singleton::update`] -- the two differ only in how they arrive at a
+/// key, so the retry contract lives here once instead of in both.
+async fn update_at_key<T, F>(backend: &dyn Backend, cipher: &Cipher, key: &str, mut mutate: F) -> Result<T>
+where
+    T: Clone + Serialize + DeserializeOwned + Default,
+    F: FnMut(&mut T) -> Result<Update>,
+{
+    for attempt in 0..MAX_UPDATE_ATTEMPTS {
+        let (stored, etag) = get_json::<T>(backend, key, cipher).await?;
+        // `mutate` gets a copy, so answering `Keep` can return the value as
+        // it actually stands in the backend rather than whatever the
+        // mutator happened to leave in the buffer before deciding not to
+        // write it. One clone per attempt, of a type already bounded by
+        // `MAX_OBJECT_BYTES`, buys a `Keep` that can't lie.
+        let mut next = stored.clone();
+        if mutate(&mut next)? == Update::Keep {
+            return Ok(stored);
+        }
+        match put_json(backend, key, &next, etag.as_deref(), cipher).await? {
+            Cas::Ok => return Ok(next),
+            // Someone else wrote between our read and our put, so the value
+            // `mutate` just produced was derived from stale input and gets
+            // discarded. Back off with jitter before re-reading: under a
+            // herd of writers on one key (a counter), retrying in lockstep
+            // just reproduces the same collision.
+            Cas::Conflict => {
+                tokio::time::sleep(crate::resilience::full_jitter_backoff(UPDATE_BASE_BACKOFF, attempt)).await;
+            }
+        }
+    }
+    bail!("update: too many CAS conflicts on {key} (gave up after {MAX_UPDATE_ATTEMPTS} attempts)")
 }
 
 #[cfg(test)]

@@ -165,6 +165,27 @@ impl Backend for MeteredBackend {
     }
 }
 
+/// Full jitter: a random delay in `[0, base * 2^attempt]` -- spreads out a
+/// herd of callers that all started retrying at the same moment instead of
+/// them all retrying in lockstep. Shared by [`RetryBackend`] (retrying a
+/// transient transport failure) and
+/// [`crate::collection::Collection::update`] (retrying a lost CAS race):
+/// different causes, but the same thundering-herd problem and the same
+/// answer to it, so one implementation rather than two that drift.
+pub(crate) fn full_jitter_backoff(base: Duration, attempt: u32) -> Duration {
+    let max = base.saturating_mul(1u32 << attempt.min(10));
+    let mut jitter = [0u8; 8];
+    match getrandom::fill(&mut jitter) {
+        // RNG unavailable: fall back to the unjittered max delay rather than
+        // panicking mid-retry-loop over a missing jitter source.
+        Err(_) => max,
+        Ok(()) => {
+            let fraction = u64::from_le_bytes(jitter) as f64 / u64::MAX as f64;
+            max.mul_f64(fraction)
+        }
+    }
+}
+
 /// Retries a real `Err` (never a `Cas::Conflict`, which is a legitimate
 /// business outcome, not a failure) up to `max_retries` times, exponential
 /// backoff with jitter between attempts. Sits *outside*
@@ -194,21 +215,8 @@ impl RetryBackend {
         }
     }
 
-    /// Full jitter: a random delay in `[0, base * 2^attempt]` -- spreads
-    /// out a herd of callers that all started retrying at the same moment
-    /// (a shared backend blip) instead of them all retrying in lockstep.
     fn backoff_for(&self, attempt: u32) -> Duration {
-        let max = self.base_backoff.saturating_mul(1u32 << attempt.min(10));
-        let mut jitter = [0u8; 8];
-        match getrandom::fill(&mut jitter) {
-            // RNG unavailable: fall back to the unjittered max delay rather
-            // than panicking mid-retry-loop over a missing jitter source.
-            Err(_) => max,
-            Ok(()) => {
-                let fraction = u64::from_le_bytes(jitter) as f64 / u64::MAX as f64;
-                max.mul_f64(fraction)
-            }
-        }
+        full_jitter_backoff(self.base_backoff, attempt)
     }
 
     async fn run<T, F, Fut>(&self, f: F) -> Result<T>

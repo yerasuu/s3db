@@ -555,3 +555,130 @@ async fn list_all_bounds_its_fan_out_by_the_budget_and_still_returns_everything(
     );
     assert!(peak > 1, "budget of 2 should still fetch concurrently, peaked at {peak}");
 }
+
+#[tokio::test]
+async fn update_creates_when_absent_and_mutates_when_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+
+    let created = coll
+        .update::<Widget, _>(&backend, &cipher, "w", |w| {
+            w.count += 1;
+            Ok(Update::Write)
+        })
+        .await
+        .unwrap();
+    assert_eq!(created, Widget { count: 1 }, "absent entry starts from T::default()");
+
+    let bumped = coll
+        .update::<Widget, _>(&backend, &cipher, "w", |w| {
+            w.count += 10;
+            Ok(Update::Write)
+        })
+        .await
+        .unwrap();
+    assert_eq!(bumped, Widget { count: 11 });
+    let (stored, _etag) = coll.get::<Widget>(&backend, &cipher, "w").await.unwrap();
+    assert_eq!(stored, Some(Widget { count: 11 }));
+}
+
+#[tokio::test]
+async fn update_keep_writes_nothing_and_leaves_the_etag_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    coll.put(&backend, &cipher, "w", &Widget { count: 7 }, None)
+        .await
+        .unwrap();
+    let (_, before) = coll.get::<Widget>(&backend, &cipher, "w").await.unwrap();
+
+    let kept = coll
+        .update::<Widget, _>(&backend, &cipher, "w", |w| {
+            w.count = 999;
+            Ok(Update::Keep)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(kept, Widget { count: 7 }, "Keep returns the stored value, not the mutated one");
+    let (stored, after) = coll.get::<Widget>(&backend, &cipher, "w").await.unwrap();
+    assert_eq!(stored, Some(Widget { count: 7 }));
+    assert_eq!(after, before, "Keep must not bump the etag");
+}
+
+#[tokio::test]
+async fn update_propagates_a_mutator_error_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+
+    let err = coll
+        .update::<Widget, _>(&backend, &cipher, "w", |_| anyhow::bail!("nope"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("nope"));
+
+    let (stored, _etag) = coll.get::<Widget>(&backend, &cipher, "w").await.unwrap();
+    assert_eq!(stored, None, "a refused mutation must not create the entry");
+}
+
+/// The whole point of the CAS retry: concurrent increments must all land,
+/// which a read-then-blind-write would silently lose.
+#[tokio::test]
+async fn concurrent_updates_all_land_without_losing_an_increment() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let backend = Arc::new(backend);
+    let cipher = Arc::new(cipher);
+    let coll = Collection::new("widgets");
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let backend = Arc::clone(&backend);
+        let cipher = Arc::clone(&cipher);
+        let coll = coll.clone();
+        set.spawn(async move {
+            coll.update::<Widget, _>(backend.as_ref(), &cipher, "counter", |w| {
+                w.count += 1;
+                Ok(Update::Write)
+            })
+            .await
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        joined.unwrap().unwrap();
+    }
+
+    let (stored, _etag) = coll
+        .get::<Widget>(backend.as_ref(), &cipher, "counter")
+        .await
+        .unwrap();
+    assert_eq!(stored, Some(Widget { count: 8 }), "every concurrent increment must survive");
+}
+
+#[tokio::test]
+async fn singleton_update_shares_the_same_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let single = Singleton::new("global.json");
+
+    single
+        .update::<Widget, _>(&backend, &cipher, |w| {
+            w.count += 3;
+            Ok(Update::Write)
+        })
+        .await
+        .unwrap();
+    let kept = single
+        .update::<Widget, _>(&backend, &cipher, |w| {
+            w.count = 0;
+            Ok(Update::Keep)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(kept, Widget { count: 3 });
+    let (stored, _etag) = single.get::<Widget>(&backend, &cipher).await.unwrap();
+    assert_eq!(stored, Widget { count: 3 });
+}
