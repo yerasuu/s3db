@@ -44,7 +44,15 @@ enum Inner {
         /// sealed by any algorithm regardless of which one this instance
         /// seals with -- that's what makes changing the default affect new
         /// writes only, never forcing a re-seal of what's already stored.
-        keyed: [Keyed; CipherAlgorithm::ALL.len()],
+        ///
+        /// Behind an `Arc` so `Cipher: Clone` is a refcount bump rather than
+        /// a copy of the key material: a plain clone would scatter another
+        /// set of expanded AEAD keys into a fresh allocation, and every one
+        /// of those is a place the `zeroize` feature then has to wipe (and
+        /// a place a core dump can find). One clone per request across a
+        /// server's lifetime adds up to a lot of copies of the one secret
+        /// worth protecting here.
+        keyed: Arc<[Keyed; CipherAlgorithm::ALL.len()]>,
         /// The algorithm [`Cipher::seal`] writes with. Never consulted on
         /// `open`: there the object's own header decides.
         active: CipherAlgorithm,
@@ -112,7 +120,7 @@ impl Cipher {
     ) -> Result<Self> {
         let key = kdf::derive(passphrase, salt)?;
         Ok(Cipher(Inner::Encrypting {
-            keyed: CipherAlgorithm::ALL.map(|a| Keyed::new(a, &key)),
+            keyed: Arc::new(CipherAlgorithm::ALL.map(|a| Keyed::new(a, &key))),
             active: algorithm,
             nonces_issued: Arc::new(AtomicU64::new(0)),
         }))
@@ -135,7 +143,7 @@ impl Cipher {
     /// [`Self::derive`] exists to do.
     pub fn from_key(key: &[u8; kdf::KEY_LEN], algorithm: CipherAlgorithm) -> Self {
         Cipher(Inner::Encrypting {
-            keyed: CipherAlgorithm::ALL.map(|a| Keyed::new(a, key)),
+            keyed: Arc::new(CipherAlgorithm::ALL.map(|a| Keyed::new(a, key))),
             active: algorithm,
             nonces_issued: Arc::new(AtomicU64::new(0)),
         })

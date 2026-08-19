@@ -54,7 +54,7 @@ pub struct AzureBackend {
     bucket: String,
     tenant_id: String,
     client_id: String,
-    client_secret: String,
+    client_secret: crate::config::Secret,
     container: OnceCell<BlobContainerClient>,
 }
 
@@ -85,7 +85,7 @@ impl AzureBackend {
                 let credential = ClientSecretCredential::new(
                     &self.tenant_id,
                     self.client_id.clone(),
-                    Secret::from(self.client_secret.clone()),
+                    Secret::from(self.client_secret.to_string()),
                     None,
                 )
                 .context("building Entra ID credential")?;

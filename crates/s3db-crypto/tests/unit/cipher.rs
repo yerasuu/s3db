@@ -312,3 +312,16 @@ fn a_data_key_wrapped_under_a_passphrase_key_unwraps_only_with_it() {
     let wrong = Cipher::derive("wrong", &[3u8; SALT_LEN]).unwrap();
     assert!(wrong.open("wrap", &wrapped).is_err());
 }
+
+/// Cloning a `Cipher` must share the one copy of the key material, not make
+/// another. Checked through the shared nonce counter, which lives next to it
+/// and is observable: if the clone got its own state, the budget would reset
+/// with it.
+#[test]
+fn cloning_shares_key_state_rather_than_copying_it() {
+    let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    let clone = c.clone();
+    c.seal("k", b"x", CompressionStrategy::None).unwrap();
+    clone.set_nonces_issued(1 << 32);
+    assert!(c.seal("k", b"x", CompressionStrategy::None).is_err());
+}

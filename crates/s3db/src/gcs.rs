@@ -62,9 +62,14 @@ impl GcsBackend {
     async fn client_pair(&self) -> Result<&(Storage, StorageControl)> {
         self.clients
             .get_or_try_init(|| async {
-                let key_json = tokio::fs::read_to_string(&self.service_account_json_path)
-                    .await
-                    .with_context(|| format!("reading {}", self.service_account_json_path))?;
+                // Zeroizing: this file is the service account's *private
+                // key*, not just a path to it, and it stays in memory only
+                // as long as it takes to parse.
+                let key_json = zeroize::Zeroizing::new(
+                    tokio::fs::read_to_string(&self.service_account_json_path)
+                        .await
+                        .with_context(|| format!("reading {}", self.service_account_json_path))?,
+                );
                 let key: serde_json::Value = serde_json::from_str(&key_json)
                     .with_context(|| format!("{}: invalid JSON", self.service_account_json_path))?;
                 let credentials = service_account::Builder::new(key)

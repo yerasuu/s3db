@@ -1,4 +1,22 @@
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+/// A credential field.
+///
+/// [`Zeroizing`] so the secret is wiped from memory when the config (or a
+/// backend that cloned it out) is dropped, rather than lingering in freed
+/// heap for anything that later reads it -- a core dump, a swapped page, an
+/// allocator reusing the block. It is not a substitute for the `Debug` impls
+/// below, which stay hand-written and redacted: zeroizing controls *when*
+/// the bytes stop existing, not who can print them while they do.
+///
+/// **These structs still derive `Serialize`, and serializing one writes
+/// every secret in the clear.** That is inherent to a config type that has
+/// to round-trip through a file, and deliberately not papered over with
+/// `skip_serializing` (which would silently produce a config that can't
+/// authenticate). Treat a serialized `BackendConfig` as secret material and
+/// give it file permissions to match.
+pub type Secret = Zeroizing<String>;
 
 /// Which storage driver a bucket entry uses, and that driver's own
 /// connection parameters — tagged on `driver` so every entry shares the
@@ -23,7 +41,7 @@ pub struct S3Params {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint_url: Option<String>,
     pub access_key_id: String,
-    pub secret_access_key: String,
+    pub secret_access_key: Secret,
     #[serde(default)]
     pub path_style: bool,
     /// A plain `http://` `endpoint_url` is refused by default -- credentials
@@ -61,7 +79,7 @@ pub struct R2Params {
     /// this bucket's S3-compatible endpoint.
     pub account_id: String,
     pub access_key_id: String,
-    pub secret_access_key: String,
+    pub secret_access_key: Secret,
 }
 
 impl std::fmt::Debug for R2Params {
@@ -129,7 +147,7 @@ pub struct AzureParams {
     /// are supported, so `account_key` is gone in favor of these three.
     pub tenant_id: String,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: Secret,
 }
 
 impl std::fmt::Debug for AzureParams {
