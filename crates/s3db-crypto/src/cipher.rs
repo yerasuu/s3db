@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use zeroize::Zeroizing;
 
 /// Bytes every sealed object reserves for its nonce, whichever algorithm
 /// sealed it -- see [`NONCE_FIELD_LEN`] for why it's fixed rather than
@@ -115,6 +116,34 @@ impl Cipher {
             active: algorithm,
             nonces_issued: Arc::new(AtomicU64::new(0)),
         }))
+    }
+
+    /// A `Cipher` over raw key material that nothing derived from a
+    /// passphrase — the other half of a wrap-a-data-key scheme, where the
+    /// passphrase-derived key from [`Self::derive`] exists only to seal
+    /// *this* key and never touches user data itself.
+    ///
+    /// That indirection is what makes changing a passphrase cheap: with the
+    /// data key wrapped, a new passphrase re-seals 32 bytes, where deriving
+    /// the data key straight from the passphrase would mean re-encrypting
+    /// every object in the bucket to change it. See `s3db::bootstrap` for
+    /// the storage side.
+    ///
+    /// No KDF runs here: `key` is used as-is, so it must be uniformly
+    /// random ([`Self::random_key`]) or itself the output of a KDF. Passing
+    /// a low-entropy value straight in would skip exactly the work
+    /// [`Self::derive`] exists to do.
+    pub fn from_key(key: &[u8; kdf::KEY_LEN], algorithm: CipherAlgorithm) -> Self {
+        Cipher(Inner::Encrypting {
+            keyed: CipherAlgorithm::ALL.map(|a| Keyed::new(a, key)),
+            active: algorithm,
+            nonces_issued: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// A fresh random key for [`Self::from_key`], wiped on drop.
+    pub fn random_key() -> Result<Zeroizing<[u8; kdf::KEY_LEN]>> {
+        kdf::random_key()
     }
 
     /// A `Cipher` that doesn't encrypt -- see [`EncryptionMode::Disabled`]

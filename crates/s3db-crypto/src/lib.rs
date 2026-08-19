@@ -32,4 +32,4 @@ mod stream;
 pub use algorithm::{CipherAlgorithm, EncryptionMode};
 pub use cipher::Cipher;
 pub use compression::CompressionStrategy;
-pub use kdf::SALT_LEN;
+pub use kdf::{KDF_VERSION, KEY_LEN, SALT_LEN};

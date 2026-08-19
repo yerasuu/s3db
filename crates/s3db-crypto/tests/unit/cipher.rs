@@ -277,3 +277,38 @@ fn xchacha_has_no_nonce_budget() {
     c.set_nonces_issued(u64::MAX);
     assert!(c.seal("k", b"x", CompressionStrategy::None).is_ok());
 }
+
+/// `from_key` takes raw material, so two ciphers built from the same key
+/// interoperate exactly as if they had derived it -- that is what lets a
+/// wrapped data key survive a passphrase change.
+#[test]
+fn from_key_round_trips_between_independent_ciphers() {
+    let key = Cipher::random_key().unwrap();
+    let a = Cipher::from_key(&key, CipherAlgorithm::default());
+    let b = Cipher::from_key(&key, CipherAlgorithm::default());
+    let sealed = a.seal("k", b"payload", CompressionStrategy::None).unwrap();
+    assert_eq!(b.open("k", &sealed).unwrap(), b"payload");
+}
+
+#[test]
+fn random_key_is_not_the_same_twice() {
+    let a = Cipher::random_key().unwrap();
+    let b = Cipher::random_key().unwrap();
+    assert_ne!(*a, *b);
+}
+
+/// A key derived from a passphrase can wrap a data key, and the wrapping is
+/// AEAD like everything else here: a wrong passphrase fails to unwrap rather
+/// than yielding wrong-but-plausible key material.
+#[test]
+fn a_data_key_wrapped_under_a_passphrase_key_unwraps_only_with_it() {
+    let data_key = Cipher::random_key().unwrap();
+    let wrapper = Cipher::derive("right", &[3u8; SALT_LEN]).unwrap();
+    let wrapped = wrapper
+        .seal("wrap", data_key.as_slice(), CompressionStrategy::None)
+        .unwrap();
+
+    assert_eq!(wrapper.open("wrap", &wrapped).unwrap(), *data_key);
+    let wrong = Cipher::derive("wrong", &[3u8; SALT_LEN]).unwrap();
+    assert!(wrong.open("wrap", &wrapped).is_err());
+}
