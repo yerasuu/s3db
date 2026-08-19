@@ -81,9 +81,11 @@ Capabilities beyond `Backend`'s required surface (`as_atomic`, `as_range`) are d
 `CachedBackend` (raw bytes + etag, cross-request LRU) sits innermost, right above the driver — see [`cache::CacheConfig`]: `max_entries` is the primary O(1) budget, `max_bytes` an optional safety net checked only once entries are already at capacity. `request_cache::RequestCache` is *not* part of this stack — it belongs outside all of it, at the application layer, wrapping whatever `build_resilient_backend` returns, since its own invalidation needs to see a write's result after retry/throttle already ran.
 
 ```rust
-let metrics: s3db::SharedMetrics = std::sync::Arc::new(s3db::NoopMetrics); // or your own MetricsRecorder
+let metrics: s3db::SharedMetrics = std::sync::Arc::new(s3db::InMemoryMetrics::default()); // or NoopMetrics, or your own
 let backend = s3db::resilience::build_resilient_backend(raw_backend, s3db::ResilienceConfig::default(), metrics);
 ```
+
+`MetricsRecorder` stays a trait — this crate has no business deciding where an application's telemetry goes — but "wire it to whatever you already use" only answers a caller that has something already, and `NoopMetrics` was the only alternative, so metering a backend produced numbers nobody could read. `InMemoryMetrics` is the middle: it accumulates counters (summed) and gauges (last value wins) in a map and renders the Prometheus text format on demand, with no dependency and no exporter runtime — serve `render_prometheus()` from whatever HTTP handler you already have. Cardinality stays the caller's problem: names arrive already formatted, so baking a per-key label into one grows the map without bound.
 
 The connection pool for the underlying HTTP client (each driver's own construction) isn't part of `ResilienceConfig` — it's sized once, at driver-construction time — but should match (not exceed) `max_concurrent_get + max_concurrent_put + max_concurrent_list`, with keep-alive and a generous idle timeout, so the concurrency this config grants doesn't end up bottlenecked on re-establishing connections.
 

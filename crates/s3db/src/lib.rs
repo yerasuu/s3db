@@ -77,7 +77,7 @@ pub use lsm::{
     SecondaryLsmIndex, Table, TableConfig, TableLocation, Value, ValueKind, compact, should_compact,
 };
 pub use maintenance::{MaintenanceReport, MaintenanceScanner};
-pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
+pub use metrics::{InMemoryMetrics, MetricsRecorder, NoopMetrics, SharedMetrics};
 pub use migrate::{AppliedMigration, InProgress, MigrationReport, Rewrite, SchemaState};
 pub use multi_index::MultiIndex;
 pub use payload::{
