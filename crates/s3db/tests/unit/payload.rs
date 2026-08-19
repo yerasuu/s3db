@@ -163,7 +163,11 @@ async fn delete_prefix_refuses_an_empty_prefix() {
     backend.put_cas("k", b"body".to_vec(), None).await.unwrap();
 
     assert!(delete_prefix(&backend, "").await.is_err());
-    assert_eq!(list_all_keys(&backend, "").await.unwrap().len(), 1, "nothing may be deleted");
+    assert_eq!(
+        list_all_keys(&backend, "").await.unwrap().len(),
+        1,
+        "nothing may be deleted"
+    );
 }
 
 #[tokio::test]

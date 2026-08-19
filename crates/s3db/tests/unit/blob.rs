@@ -28,7 +28,9 @@ async fn roundtrips_a_value_larger_than_one_object() {
     let body = body_of(5000);
 
     assert_eq!(
-        blob.put(backend.as_ref(), &cipher, "chapter-1", &body, None).await.unwrap(),
+        blob.put(backend.as_ref(), &cipher, "chapter-1", &body, None)
+            .await
+            .unwrap(),
         Cas::Ok
     );
 
@@ -77,7 +79,9 @@ async fn put_is_compare_and_swap_on_the_manifest() {
 
     // Create-only against an existing blob loses.
     assert_eq!(
-        blob.put(backend.as_ref(), &cipher, "k", &body_of(10), None).await.unwrap(),
+        blob.put(backend.as_ref(), &cipher, "k", &body_of(10), None)
+            .await
+            .unwrap(),
         Cas::Conflict
     );
     // A stale etag loses too.
@@ -115,7 +119,9 @@ async fn a_conflicting_put_sweeps_the_parts_it_wrote() {
         .len();
 
     assert_eq!(
-        blob.put(backend.as_ref(), &cipher, "k", &body_of(4000), None).await.unwrap(),
+        blob.put(backend.as_ref(), &cipher, "k", &body_of(4000), None)
+            .await
+            .unwrap(),
         Cas::Conflict
     );
 
@@ -148,7 +154,10 @@ async fn an_overwrite_writes_a_new_generation_and_retires_the_old_one() {
     let (second, _etag) = blob.head(backend.as_ref(), &cipher, "k").await.unwrap();
     let second_generation = second.unwrap().generation;
 
-    assert_ne!(first_generation, second_generation, "each write gets its own generation");
+    assert_ne!(
+        first_generation, second_generation,
+        "each write gets its own generation"
+    );
     let live: Vec<String> = crate::payload::list_all_keys(backend.as_ref(), "pages/.parts/k/")
         .await
         .unwrap();
@@ -171,7 +180,10 @@ async fn get_refuses_to_return_a_truncated_body() {
     // delete, or a sweep racing a read, looks like.
     let (manifest, _etag) = blob.head(backend.as_ref(), &cipher, "k").await.unwrap();
     let generation = manifest.unwrap().generation;
-    backend.delete(&format!("pages/.parts/k/{generation}/0001")).await.unwrap();
+    backend
+        .delete(&format!("pages/.parts/k/{generation}/0001"))
+        .await
+        .unwrap();
 
     let err = blob.get(&backend, &cipher, "k").await.unwrap_err();
     assert!(
@@ -195,7 +207,9 @@ async fn delete_removes_the_manifest_and_every_part() {
     let (read, _etag) = blob.get(&backend, &cipher, "k").await.unwrap();
     assert_eq!(read, None);
     assert_eq!(
-        crate::payload::list_all_keys(backend.as_ref(), "pages/.parts/k/").await.unwrap(),
+        crate::payload::list_all_keys(backend.as_ref(), "pages/.parts/k/")
+            .await
+            .unwrap(),
         Vec::<String>::new()
     );
 }
@@ -264,7 +278,9 @@ async fn sweep_orphan_parts_removes_abandoned_writes_but_spares_the_live_one() {
     // stamped old enough to be past any age guard.
     for index in 0..3 {
         let key = format!("pages/.parts/k/0000000000001-deadbeef/{index:04}");
-        let sealed = cipher.seal(&key, b"orphan", crate::cipher::CompressionStrategy::None).unwrap();
+        let sealed = cipher
+            .seal(&key, b"orphan", crate::cipher::CompressionStrategy::None)
+            .unwrap();
         backend.put_cas(&key, sealed, None).await.unwrap();
     }
 
@@ -293,7 +309,9 @@ async fn sweep_orphan_parts_spares_a_generation_younger_than_the_guard() {
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     let blob = blob();
     let key = format!("pages/.parts/k/{:013}-abc123/0000", now_ms());
-    let sealed = cipher.seal(&key, b"in flight", crate::cipher::CompressionStrategy::None).unwrap();
+    let sealed = cipher
+        .seal(&key, b"in flight", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     backend.put_cas(&key, sealed, None).await.unwrap();
 
     let report = blob
@@ -303,7 +321,10 @@ async fn sweep_orphan_parts_spares_a_generation_younger_than_the_guard() {
 
     assert_eq!(report.confirmed, 0, "{report:?}");
     assert_eq!(
-        crate::payload::list_all_keys(backend.as_ref(), "pages/.parts/k/").await.unwrap().len(),
+        crate::payload::list_all_keys(backend.as_ref(), "pages/.parts/k/")
+            .await
+            .unwrap()
+            .len(),
         1
     );
 }

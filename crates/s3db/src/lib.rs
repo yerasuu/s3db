@@ -74,7 +74,9 @@ pub use lsm::{
 };
 pub use maintenance::MaintenanceScanner;
 pub use metrics::{MetricsRecorder, NoopMetrics, SharedMetrics};
-pub use payload::{MAX_OBJECT_BYTES, SweepReport, count_prefix, delete_object, delete_prefix, get_json, list_all_keys, put_json};
+pub use payload::{
+    MAX_OBJECT_BYTES, SweepReport, count_prefix, delete_object, delete_prefix, get_json, list_all_keys, put_json,
+};
 pub use range::RangeBackend;
 pub use request_cache::RequestCache;
 pub use resilience::{

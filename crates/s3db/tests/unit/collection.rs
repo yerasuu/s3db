@@ -546,14 +546,21 @@ async fn list_all_bounds_its_fan_out_by_the_budget_and_still_returns_everything(
         .collect();
     counts.sort_unstable();
 
-    assert_eq!(counts, (0..20).collect::<Vec<u32>>(), "every entry must still come back");
+    assert_eq!(
+        counts,
+        (0..20).collect::<Vec<u32>>(),
+        "every entry must still come back"
+    );
     let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
     assert!(
         peak <= budget.max_concurrency(),
         "fan-out peaked at {peak} concurrent gets, over the budget's {}",
         budget.max_concurrency()
     );
-    assert!(peak > 1, "budget of 2 should still fetch concurrently, peaked at {peak}");
+    assert!(
+        peak > 1,
+        "budget of 2 should still fetch concurrently, peaked at {peak}"
+    );
 }
 
 #[tokio::test]
@@ -601,7 +608,11 @@ async fn update_keep_writes_nothing_and_leaves_the_etag_alone() {
         .await
         .unwrap();
 
-    assert_eq!(kept, Widget { count: 7 }, "Keep returns the stored value, not the mutated one");
+    assert_eq!(
+        kept,
+        Widget { count: 7 },
+        "Keep returns the stored value, not the mutated one"
+    );
     let (stored, after) = coll.get::<Widget>(&backend, &cipher, "w").await.unwrap();
     assert_eq!(stored, Some(Widget { count: 7 }));
     assert_eq!(after, before, "Keep must not bump the etag");
@@ -650,11 +661,12 @@ async fn concurrent_updates_all_land_without_losing_an_increment() {
         joined.unwrap().unwrap();
     }
 
-    let (stored, _etag) = coll
-        .get::<Widget>(backend.as_ref(), &cipher, "counter")
-        .await
-        .unwrap();
-    assert_eq!(stored, Some(Widget { count: 8 }), "every concurrent increment must survive");
+    let (stored, _etag) = coll.get::<Widget>(backend.as_ref(), &cipher, "counter").await.unwrap();
+    assert_eq!(
+        stored,
+        Some(Widget { count: 8 }),
+        "every concurrent increment must survive"
+    );
 }
 
 #[tokio::test]

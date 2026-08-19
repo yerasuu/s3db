@@ -692,13 +692,7 @@ impl Collection {
     /// that modified its buffer and then decided against writing it cannot
     /// hand back a value that was never stored. That guarantee is what the
     /// `T: Clone` bound pays for: `mutate` works on a copy.
-    pub async fn update<T, F>(
-        &self,
-        backend: &dyn Backend,
-        cipher: &Cipher,
-        name: &str,
-        mutate: F,
-    ) -> Result<T>
+    pub async fn update<T, F>(&self, backend: &dyn Backend, cipher: &Cipher, name: &str, mutate: F) -> Result<T>
     where
         T: Clone + Serialize + DeserializeOwned + Default,
         F: FnMut(&mut T) -> Result<Update>,
@@ -787,7 +781,8 @@ impl Collection {
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
-        self.list_all_with_budget(backend, cipher, MemoryBudget::default()).await
+        self.list_all_with_budget(backend, cipher, MemoryBudget::default())
+            .await
     }
 
     /// [`Self::list_all`] with an explicit fan-out budget.
@@ -820,7 +815,10 @@ impl Collection {
         // Same tolerance as before: a name that vanished between the list
         // and the get (`Ok(None)`), or a fetch that genuinely failed
         // (`Err`), is dropped rather than failing the whole listing.
-        Ok(loaded.into_values().filter_map(|result| result.ok().flatten()).collect())
+        Ok(loaded
+            .into_values()
+            .filter_map(|result| result.ok().flatten())
+            .collect())
     }
 
     /// [`Self::list_all`] plus an in-memory filter. **O(n) in the

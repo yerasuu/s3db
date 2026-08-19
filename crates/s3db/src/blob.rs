@@ -251,7 +251,11 @@ impl Blob {
             // reclaim, not a wrong answer.
             Cas::Ok => {
                 if !previous.generation.is_empty() && previous.generation != generation {
-                    let _ = delete_prefix(backend, &format!("{}/{}/", self.parts_prefix(name)?, previous.generation)).await;
+                    let _ = delete_prefix(
+                        backend,
+                        &format!("{}/{}/", self.parts_prefix(name)?, previous.generation),
+                    )
+                    .await;
                 }
             }
             Cas::Conflict => {
