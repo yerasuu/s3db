@@ -301,6 +301,27 @@ The record holds the highest version applied, an audit trail of each migration, 
 
 Entries are rewritten under CAS, so a concurrent writer is never silently clobbered; it lands in `MigrationReport::conflicted` instead, and re-running picks those up. `Rewrite::Keep` skips an entry without a write. `migrate::baseline` adopts the mechanism on data that already predates it, and refuses to lower a recorded version.
 
+### Transactions that update, not only create
+
+`txn::run`'s create-only restriction is what makes it simple: when every write is a create, the object *is* its own lock. Updates remove that, because an `expected_etag` observed in one phase can move before the write that depends on it. `txn_update::run_update` closes the gap on the drivers with no native transaction:
+
+```rust
+let report = s3db::txn_update::run_update(backend, &cipher, vec![
+    UpdateOp::update(USERS.key("alice")?, &alice, &alice_etag)?,
+    UpdateOp::create(NAMESPACE_INDEX.key("acme")?, &reservation)?,   // creates mix in freely
+]).await?;
+if !report.applied { /* a key was locked, or an expected etag had moved — nothing was written */ }
+
+// at startup and periodically:
+s3db::txn_update::recover_stale_updates(backend, &cipher, Duration::from_secs(60)).await?;
+```
+
+Record `Preparing` → lock every key (create-only, so the lock object is its own mutex) → re-verify every expected etag, now that no other transaction can invalidate it → CAS the record to `Committed`, the point of no return → apply, release, delete. Ops are sorted by key so two overlapping transactions meet at their first shared key in the same order and one deterministically loses instead of each holding what the other needs.
+
+**Atomic against other transactions, not isolated against plain writes.** A `Collection::put` doesn't consult these locks — making every read and write in the crate check a lock object would double the cost of both, forever, for an operation most callers never use. So an unlocked writer can touch a key mid-transaction; since the alternative is a half-applied transaction, the transaction wins and names those keys in `UpdateReport::overwrote_unlocked`. **Liveness needs the sweep**: nothing steals a stale lock, because a lock whose owner already committed must not be taken by someone who would then race that owner's roll-forward. `recover_stale_updates` resolves the owner instead — rolling a `Preparing` record back, a `Committed` one *forward* (undoing a committed transaction is the one outcome the commit point exists to rule out) — and releases the locks as part of it.
+
+On `AtomicBackend` (`redb`) all of that is skipped for the native transaction, same as `txn::run`.
+
 ## Point-in-time reads (opt-in)
 
 `snapshot::ReadSnapshot` gives a best-effort, time-bounded view over a `Collection`'s `.history/` archive — **not** real MVCC, no cross-entity atomicity, same honesty `backup::BackupConsistency::FuzzySnapshot` already commits to for a full-bucket backup, just at single-entity scale:
