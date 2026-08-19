@@ -62,3 +62,21 @@ fn from_bytes_rejects_a_body_length_mismatch() {
     bytes.truncate(bytes.len() - 4); // chop off part of the last word
     assert!(Bloom::from_bytes(&bytes).is_err());
 }
+
+/// A 12-byte header declaring zero bits passes the body-length check on its
+/// own (`0 * 8 == 0` bytes of body), so without an explicit guard it builds
+/// a `Bloom` whose every `contains` divides by zero.
+#[test]
+fn from_bytes_rejects_a_zero_bit_filter() {
+    let mut bytes = 0u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&7u32.to_le_bytes());
+    assert!(Bloom::from_bytes(&bytes).is_err());
+}
+
+#[test]
+fn from_bytes_rejects_zero_hash_functions() {
+    let mut bytes = 64u64.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    assert!(Bloom::from_bytes(&bytes).is_err());
+}

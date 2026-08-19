@@ -86,6 +86,16 @@ impl Bloom {
         anyhow::ensure!(bytes.len() >= 12, "bloom filter bytes too short for header");
         let num_bits = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
         let k = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        // [`Self::new`] can never produce either of these, so only corrupt
+        // or hostile bytes reach here -- but `num_bits == 0` would make
+        // [`Self::bit_positions`]'s `% self.num_bits` a divide-by-zero
+        // panic on the very first `contains`, and the 12-byte header that
+        // encodes it passes the body-length check below (`0 * 8 == 0`)
+        // without this. `k == 0` is milder (`contains` would trivially
+        // return `true` for everything, a filter that prunes nothing) but
+        // is equally never something this crate wrote.
+        anyhow::ensure!(num_bits > 0, "bloom filter declares zero bits");
+        anyhow::ensure!(k > 0, "bloom filter declares zero hash functions");
         let word_count = num_bits.div_ceil(64) as usize;
         let body = &bytes[12..];
         anyhow::ensure!(
