@@ -694,3 +694,58 @@ async fn singleton_update_shares_the_same_contract() {
     let (stored, _etag) = single.get::<Widget>(&backend, &cipher).await.unwrap();
     assert_eq!(stored, Widget { count: 3 });
 }
+
+/// `put_versioned` archives the value being replaced, which belongs to the
+/// *previous* shape — so it must not require that value to deserialize as the
+/// type being written. It used to, which broke history for exactly the write
+/// that most needs it: the one that changes the shape.
+#[tokio::test]
+async fn put_versioned_archives_across_a_shape_change() {
+    #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct V1 {
+        name: String,
+    }
+    #[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct V2 {
+        title: String,
+        lang: String,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("works");
+    coll.put(&backend, &cipher, "w", &V1 { name: "old".into() }, None)
+        .await
+        .unwrap();
+    let (_v1, etag) = coll.get::<V1>(&backend, &cipher, "w").await.unwrap();
+
+    coll.put_versioned(
+        &backend,
+        &cipher,
+        "w",
+        &V2 {
+            title: "new".into(),
+            lang: "en".into(),
+        },
+        etag.as_deref(),
+    )
+    .await
+    .unwrap();
+
+    let (current, _etag) = coll.get::<V2>(&backend, &cipher, "w").await.unwrap();
+    assert_eq!(
+        current,
+        Some(V2 {
+            title: "new".into(),
+            lang: "en".into()
+        })
+    );
+    let versions = coll.list_versions(&backend, "w").await.unwrap();
+    assert_eq!(versions.len(), 1, "the previous shape must still have been archived");
+    let archived: Option<V1> = coll.get_version(&backend, &cipher, "w", &versions[0]).await.unwrap();
+    assert_eq!(
+        archived.map(|v| v.name).as_deref(),
+        Some("old"),
+        "and it must read back in its own shape"
+    );
+}

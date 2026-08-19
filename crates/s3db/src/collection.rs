@@ -289,7 +289,7 @@ impl Collection {
     /// [`Self::get_version`] can later fetch it back by that same etag.
     /// `expected_etag = None` (fresh create) has nothing to archive, since
     /// there's no prior value.
-    pub async fn put_versioned<T: Serialize + DeserializeOwned + Default>(
+    pub async fn put_versioned<T: Serialize>(
         &self,
         backend: &dyn Backend,
         cipher: &Cipher,
@@ -298,23 +298,24 @@ impl Collection {
         expected_etag: Option<&str>,
     ) -> Result<Cas> {
         if let Some(etag) = expected_etag {
-            let (current_value, current_etag) = self.get::<T>(backend, cipher, name).await?;
-            if let (Some(current_value), Some(current_etag)) = (current_value, current_etag)
-                && current_etag == etag
-            {
-                // Idempotent: the same etag always archives the same
-                // content, so `Cas::Conflict` here just means someone else
-                // already wrote this exact archive entry — fine. Only a
-                // genuine `Err` (backend/serialization failure) needs to
-                // propagate.
-                put_json(
-                    backend,
-                    &format!("{}/{etag}.json", self.history_prefix(name)?),
-                    &current_value,
-                    None,
-                    cipher,
-                )
-                .await?;
+            let key = self.key(name)?;
+            let (sealed, current_etag) = backend.get(&key).await?;
+            if current_etag.as_deref() == Some(etag) {
+                // Archived as bytes -- opened under the entry's key, resealed
+                // under the archive's -- not by deserializing into `T`. `T`
+                // here is the *new* value's type, and the value being archived
+                // is the old one: reading it as `T` failed outright whenever a
+                // field had been renamed or added without a default, which is
+                // exactly the write that most needs its predecessor kept.
+                // `Self::delete` already archived this way; this now matches it.
+                let plaintext = cipher.open(&key, &sealed)?;
+                let history_key = format!("{}/{etag}.json", self.history_prefix(name)?);
+                let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None)?;
+                // Idempotent: the same etag always archives the same content,
+                // so `Cas::Conflict` here just means someone else already
+                // wrote this exact archive entry — fine. Only a genuine `Err`
+                // (backend/crypto failure) needs to propagate.
+                backend.put_cas(&history_key, resealed, None).await?;
                 self.archive_history_timestamp(backend, cipher, name, etag).await?;
             }
         }

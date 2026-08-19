@@ -130,7 +130,7 @@ let total = COUNTERS.update::<Counters, _>(backend, &cipher, "chapters", |c| {
 }).await?;
 ```
 
-`put_versioned` archives the previous value (under its own etag, at `<prefix>/.history/<name>/<etag>.json`) before overwriting — `list_versions`/`get_version` read it back. `list_all`/`find_all` fan out concurrently across every entry — full scan, only for admin views or small collections.
+`put_versioned` archives the previous value as bytes — opened under the entry's key, resealed under the archive's, never deserialized into the type being written, since the value being archived belongs to the *previous* shape — (under its own etag, at `<prefix>/.history/<name>/<etag>.json`) before overwriting — `list_versions`/`get_version` read it back. `list_all`/`find_all` fan out concurrently across every entry — full scan, only for admin views or small collections.
 
 `delete` is a soft-delete: it archives the current value the same way `put_versioned` does, writes a tombstone at `<prefix>/.deleted/<name>.json` recording that archive's etag, then best-effort-deletes the real object — the tombstone's `purge_state` stays `Pending` if that underlying delete never confirms, `Purged` once it does. `restore` reads the tombstone's `restore_etag`, writes that archived value back (winning over any orphaned object still occupying the key), and clears the tombstone:
 
