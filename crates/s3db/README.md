@@ -331,6 +331,22 @@ Source and destination backend/cipher can be the same (a backup alongside the li
 
 Tombstones are included by default (`include_tombstones: true`) — omitting them silently loses the entire soft-delete audit/recovery trail at exactly the moment (disaster recovery) it's most needed; `manifest.includes_tombstones` records whichever way a caller chose.
 
+## Expiry / TTL (opt-in)
+
+Lifecycle rules are bucket console configuration, invisible to the code that decided the data should expire and absent entirely on a local directory. `ttl` is the same idea inside the crate, identical on every driver:
+
+```rust
+s3db::ttl::set_ttl(backend, &cipher, &SESSIONS, "alice", 3_600_000).await?;   // one hour
+s3db::ttl::expiry_of(backend, &cipher, &SESSIONS, "alice").await?;            // Some(deadline_ms)
+let report = s3db::ttl::expire_due(backend, &cipher, &SESSIONS, ttl::now_ms(), &ExpiryConfig::default()).await?;
+```
+
+Expiry is a **deletion, not a hiding**: `get` does not consult a second object on every read to find out whether this one lapsed — the same call `Tombstone` already documents, for the same reason. The guarantee is "gone shortly after it expires"; a caller needing the instant to be exact reads `expiry_of` and decides for itself.
+
+The deadline lives in the marker's key (`<prefix>/.expiry/<deadline as an ordinal>/<name>.json`), so a listing's ascending key order *is* time order: the sweep pages until the first deadline in the future and stops, having read no object to work out which entries were due. A reverse marker at `<prefix>/.expiry-at/<name>.json` makes `expiry_of`/`clear_expiry` single-key operations and is the authority on when an entry actually expires — which is what makes re-scheduling safe, since a superseded deadline is recognized as stale and cleaned up instead of firing. Removal is hard by default (a TTL that archives the value reclaims nothing); `ExpiryConfig { soft: true }` routes it through `Collection::delete` so it stays restorable.
+
+`MaintenanceScanner::run` runs this alongside GC over every registered collection, so a scheduled expiry doesn't depend on somebody remembering to call it.
+
 ## Garbage collection / maintenance (opt-in)
 
 `gc::sweep` runs one collection's cleanup: retries `PurgeState::Pending` tombstones' underlying delete once they're older than `tombstone_retry_age`, forgets `PurgeState::Purged` tombstone records past `tombstone_purge_age`, and (if `history_max_age` is set) prunes `.history/` entries past that age — checking `snapshot::list_leases` first, so a live `ReadSnapshot` never loses a version it still needs.
@@ -339,7 +355,7 @@ Tombstones are included by default (`include_tombstones: true`) — omitting the
 let report = s3db::gc::sweep(backend, &cipher, &USERS, &GcConfig::default()).await?;
 // or, across every collection an app registers:
 let scanner = s3db::MaintenanceScanner::new(GcConfig::default());
-scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;
+let reports = scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;  // per collection: .gc and .expiry
 ```
 
 `MaintenanceScanner` is narrower than a single-scan-many-conditions design might suggest: there's no schema-migration or key-rotation rescan in this crate to fuse in (see `maintenance`'s own module doc for why neither applies today), so what it actually consolidates is running `gc::sweep` over every registered collection from one call and one config, not fusing separate scans into a single read per object.
