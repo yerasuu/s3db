@@ -31,7 +31,20 @@ tokio = { version = "1.53.1", features = [
     "time",
 ] }
 
-aws-sdk-s3 = "1.140.0"
+# `default-features = false` to drop the `rustls` default feature: it maps to
+# `aws-smithy-runtime/tls-rustls`, which is the *legacy* connector and drags in
+# the whole rustls 0.21 / hyper 0.14 / h2 0.3 stack alongside the modern one --
+# including rustls-webpki 0.101, which carries live name-constraint bypass
+# advisories (RUSTSEC-2026-0098/0099) on the very connection that carries our
+# credentials and every object body. `default-https-client` is the modern
+# rustls 0.23 client and is all this crate actually uses; the other three are
+# just the rest of the default set, kept as-is.
+aws-sdk-s3 = { version = "1.140.0", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-smithy-runtime-api = { version = "1.14.0", features = ["client"] }
 azure_core = { version = "1.1.0", default-features = false, features = [
     "reqwest_rustls",
