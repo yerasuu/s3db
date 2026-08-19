@@ -28,6 +28,7 @@ pub mod cipher;
 pub mod coalescer;
 pub mod collection;
 pub mod config;
+pub mod encryption_conf;
 pub mod gc;
 pub mod health;
 pub mod index;

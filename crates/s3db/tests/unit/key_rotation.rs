@@ -106,7 +106,7 @@ async fn forget_key_removes_a_retired_key_from_disk() {
     let old_key_id = ring.active_key_id().to_string();
     rotate(&b, &mut ring, "second").await.unwrap();
 
-    forget_key(&b, &old_key_id).await.unwrap();
+    forget_key(&b, &ring, &old_key_id).await.unwrap();
 
     let (config, _) = get_json_plain::<EncryptionConfig>(&b, ENCRYPTION_CONFIG_KEY)
         .await
@@ -119,5 +119,90 @@ async fn forget_key_refuses_to_remove_the_active_key() {
     let dir = tempfile::tempdir().unwrap();
     let b = backend(dir.path());
     let ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
-    assert!(forget_key(&b, ring.active_key_id()).await.is_err());
+    assert!(forget_key(&b, &ring, ring.active_key_id()).await.is_err());
+}
+
+/// `EncryptionConfig` decides which key is active and which keys exist at
+/// all, so anything able to write to the bucket repointing `active_key_id`
+/// or trimming `keys` has to be caught before any of it is acted on.
+#[tokio::test]
+async fn a_tampered_config_is_refused_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let mut ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+    let first_key_id = ring.active_key_id().to_string();
+    rotate(&b, &mut ring, "second").await.unwrap();
+    let second_key_id = ring.active_key_id().to_string();
+    let retired = HashMap::from([(first_key_id.clone(), "first".to_string())]);
+
+    // Untampered, this reopens fine.
+    assert!(get_or_create_keyring(&b, "second", &retired).await.is_ok());
+
+    let (mut config, etag) = get_json_plain::<EncryptionConfig>(&b, ENCRYPTION_CONFIG_KEY)
+        .await
+        .unwrap();
+    // Repoint `active_key_id` back at the retired key.
+    config.active_key_id = first_key_id;
+    put_json_plain(&b, ENCRYPTION_CONFIG_KEY, &config, etag.as_deref())
+        .await
+        .unwrap();
+
+    let err = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("doesn't match the passphrase"), "{err:#}");
+    assert_ne!(second_key_id, config.active_key_id);
+}
+
+/// Dropping a key from `keys` has to fail the tag too -- otherwise a
+/// retired key could be silently removed from a bucket that still has
+/// objects sealed under it.
+#[tokio::test]
+async fn removing_a_key_from_the_config_is_refused_on_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let mut ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+    let first_key_id = ring.active_key_id().to_string();
+    rotate(&b, &mut ring, "second").await.unwrap();
+    let retired = HashMap::from([(first_key_id.clone(), "first".to_string())]);
+
+    let (mut config, etag) = get_json_plain::<EncryptionConfig>(&b, ENCRYPTION_CONFIG_KEY)
+        .await
+        .unwrap();
+    config.keys.retain(|k| k.key_id != first_key_id);
+    put_json_plain(&b, ENCRYPTION_CONFIG_KEY, &config, etag.as_deref())
+        .await
+        .unwrap();
+
+    assert!(get_or_create_keyring(&b, "second", &retired).await.is_err());
+}
+
+/// Each key generation gets its own random data key, so a rotation really
+/// does change what new writes are sealed under.
+#[tokio::test]
+async fn each_key_generation_has_its_own_data_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let mut ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+    let sealed_under_first = ring.active().seal("k", b"content", CompressionStrategy::None).unwrap();
+    rotate(&b, &mut ring, "second").await.unwrap();
+    assert!(ring.active().open("k", &sealed_under_first).is_err());
+    // Still readable through the ring's dual-read, though.
+    assert_eq!(ring.open("k", &sealed_under_first).unwrap(), b"content");
+}
+
+/// The deleted-config attack against the keyring path, same as
+/// `bootstrap`'s.
+#[tokio::test]
+async fn deleting_the_config_of_a_populated_bucket_refuses_to_re_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+    let sealed = ring
+        .active()
+        .seal("users/alice.json", b"secret", CompressionStrategy::None)
+        .unwrap();
+    b.put_cas("users/alice.json", sealed, None).await.unwrap();
+    b.delete(ENCRYPTION_CONFIG_KEY).await.unwrap();
+
+    let err = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap_err();
+    assert!(format!("{err:#}").contains("refusing to initialize"), "{err:#}");
 }
