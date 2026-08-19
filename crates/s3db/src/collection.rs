@@ -4,6 +4,7 @@
 //! hand-written once per entity.
 
 use crate::backend::{Backend, Cas};
+use crate::batch_loader::{BatchLoader, MemoryBudget};
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::naming::validate_path;
 use crate::payload::{delete_object, get_json, list_all_keys, put_json};
@@ -13,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::task::JoinSet;
 
 /// Real wall-clock time, not a deterministic-replay clock -- only ever
 /// stored for humans/audits to read later, same reasoning as
@@ -701,25 +701,48 @@ impl Collection {
     /// dropped rather than propagated (a name can vanish between the list
     /// and the get); unordered — sort by whatever field matters to the
     /// caller.
+    ///
+    /// Concurrency is bounded by [`MemoryBudget::default`]. Use
+    /// [`Self::list_all_with_budget`] to size it for the memory the calling
+    /// process can actually spare.
     pub async fn list_all<T>(&self, backend: &Arc<dyn Backend>, cipher: &Arc<Cipher>) -> Result<Vec<T>>
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
+        self.list_all_with_budget(backend, cipher, MemoryBudget::default()).await
+    }
+
+    /// [`Self::list_all`] with an explicit fan-out budget.
+    ///
+    /// This used to spawn one unbounded task per name, which on a
+    /// collection of a few thousand entries meant a few thousand
+    /// simultaneous in-flight `get`s — every one of them buffering a
+    /// response body up to [`crate::payload::MAX_OBJECT_BYTES`], and every
+    /// one of them competing for the same connection pool. [`BatchLoader`]
+    /// already had exactly the right bounded-fan-out shape for this
+    /// (`max_buffer_bytes / MAX_OBJECT_BYTES` permits, which is precisely
+    /// how many max-sized objects can be buffered at once within the
+    /// budget), so this delegates to it rather than growing a second
+    /// copy of that logic.
+    pub async fn list_all_with_budget<T>(
+        &self,
+        backend: &Arc<dyn Backend>,
+        cipher: &Arc<Cipher>,
+        budget: MemoryBudget,
+    ) -> Result<Vec<T>>
+    where
+        T: DeserializeOwned + Default + Send + 'static,
+    {
         let names = self.list_names(backend.as_ref()).await?;
-        let mut set = JoinSet::new();
-        for name in names {
-            let key = self.key(&name)?;
-            let backend = Arc::clone(backend);
-            let cipher = Arc::clone(cipher);
-            set.spawn(async move { get_json::<T>(backend.as_ref(), &key, &cipher).await });
+        let mut keys = Vec::with_capacity(names.len());
+        for name in &names {
+            keys.push(self.key(name)?);
         }
-        let mut items = Vec::new();
-        while let Some(result) = set.join_next().await {
-            if let Ok(Ok((value, Some(_etag)))) = result {
-                items.push(value);
-            }
-        }
-        Ok(items)
+        let loaded = BatchLoader::new(budget).load_many::<T>(backend, cipher, keys).await;
+        // Same tolerance as before: a name that vanished between the list
+        // and the get (`Ok(None)`), or a fetch that genuinely failed
+        // (`Err`), is dropped rather than failing the whole listing.
+        Ok(loaded.into_values().filter_map(|result| result.ok().flatten()).collect())
     }
 
     /// [`Self::list_all`] plus an in-memory filter. **O(n) in the
@@ -738,8 +761,24 @@ impl Collection {
     where
         T: DeserializeOwned + Default + Send + 'static,
     {
+        self.find_all_with_budget(backend, cipher, MemoryBudget::default(), predicate)
+            .await
+    }
+
+    /// [`Self::find_all`] with an explicit fan-out budget, see
+    /// [`Self::list_all_with_budget`].
+    pub async fn find_all_with_budget<T>(
+        &self,
+        backend: &Arc<dyn Backend>,
+        cipher: &Arc<Cipher>,
+        budget: MemoryBudget,
+        predicate: impl Fn(&T) -> bool,
+    ) -> Result<Vec<T>>
+    where
+        T: DeserializeOwned + Default + Send + 'static,
+    {
         Ok(self
-            .list_all::<T>(backend, cipher)
+            .list_all_with_budget::<T>(backend, cipher, budget)
             .await?
             .into_iter()
             .filter(predicate)

@@ -460,3 +460,98 @@ async fn rejects_a_name_that_would_reach_a_reserved_namespace() {
         );
     }
 }
+
+/// Records how many `get` calls are in flight at once, so a fan-out bound
+/// can be asserted as a fact about real concurrency rather than inferred
+/// from the permit arithmetic.
+#[derive(Debug)]
+struct ConcurrencyProbeBackend {
+    inner: LocalBackend,
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Backend for ConcurrencyProbeBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        // Long enough that every permitted fetch really does overlap the
+        // others; without it the local driver can finish each get before
+        // the next one starts and the peak would say 1 no matter what.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let result = self.inner.get(key).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+#[tokio::test]
+async fn list_all_bounds_its_fan_out_by_the_budget_and_still_returns_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let (writer, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    for i in 0..20u32 {
+        coll.put(&writer, &cipher, &format!("w{i}"), &Widget { count: i }, None)
+            .await
+            .unwrap();
+    }
+
+    let probe = Arc::new(ConcurrencyProbeBackend {
+        inner: test_backend_and_cipher(dir.path()).0,
+        in_flight: std::sync::atomic::AtomicUsize::new(0),
+        peak: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let backend: Arc<dyn Backend> = probe.clone();
+    let cipher = Arc::new(cipher);
+    // 2 max-sized objects' worth of buffer == 2 concurrent fetches.
+    let budget = MemoryBudget {
+        max_buffer_bytes: 2 * crate::payload::MAX_OBJECT_BYTES,
+    };
+
+    let mut counts: Vec<u32> = coll
+        .list_all_with_budget::<Widget>(&backend, &cipher, budget)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|w| w.count)
+        .collect();
+    counts.sort_unstable();
+
+    assert_eq!(counts, (0..20).collect::<Vec<u32>>(), "every entry must still come back");
+    let peak = probe.peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        peak <= budget.max_concurrency(),
+        "fan-out peaked at {peak} concurrent gets, over the budget's {}",
+        budget.max_concurrency()
+    );
+    assert!(peak > 1, "budget of 2 should still fetch concurrently, peaked at {peak}");
+}

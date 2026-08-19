@@ -1,8 +1,10 @@
-//! Concurrent fan-out fetch of many keys at once -- the same shape
-//! [`crate::collection::Collection::list_all`] already uses internally,
-//! pulled out as its own reusable primitive for a caller that already has
-//! the key list from somewhere else (an index resolve, a batch API
-//! request) instead of wanting every name in a collection.
+//! Concurrent fan-out fetch of many keys at once, bounded by a
+//! [`MemoryBudget`] -- the one place in this crate that owns "read N keys
+//! without letting N become the concurrency". [`crate::collection::Collection::list_all`]
+//! delegates here rather than keeping its own copy of the shape, so a
+//! caller that already has a key list from somewhere else (an index
+//! resolve, a batch API request) and a caller that wants every name in a
+//! collection get the same bound from the same code.
 
 use crate::backend::Backend;
 use crate::cipher::Cipher;
