@@ -20,7 +20,6 @@
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
 use anyhow::{Context, Result, bail};
-use fs4::tokio::AsyncFileExt;
 use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, File, OpenOptions};
 
@@ -167,13 +166,23 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
 
 /// Opens (creating if missing) and exclusively locks `<key>.s3dblock`,
 /// serializing every write to this one key — across processes on this
-/// machine (see module doc), not just within this one call. `flock` itself
-/// is a blocking syscall; even `fs4`'s tokio support only forwards to it
-/// directly rather than offloading to a blocking-pool thread, so a
-/// contended call here can stall this task briefly. Acceptable: the only
-/// real contention is two processes racing the same key at once — a local
-/// filesystem operation, not a network call, so the stall is bounded and
-/// short.
+/// machine (see module doc), and across tasks within this one.
+///
+/// `flock` is a blocking syscall, and `fs4`'s tokio support only forwards
+/// to it directly rather than offloading it, so waiting for a contended
+/// lock on a runtime worker blocks that whole worker rather than yielding.
+/// That is not merely slow, it deadlocks: the task that *holds* the lock
+/// releases it only after its own `await`s resume, and those need a worker
+/// to run on. With enough tasks contending one key — which is exactly what
+/// [`crate::collection::Collection::update`]'s CAS retry loop produces —
+/// every worker ends up parked in `flock` waiting for a holder that can
+/// never be scheduled to finish. On a single-threaded runtime two tasks are
+/// already enough.
+///
+/// So the wait happens on the blocking pool, where parking a thread is the
+/// expected cost, and the runtime stays free to drive the lock holder to
+/// completion. The lock lives on the file descriptor, and `from_std` keeps
+/// the same one, so the returned handle still owns it.
 async fn lock_key(lock_path: &Path) -> Result<File> {
     if let Some(dir) = lock_path.parent() {
         fs::create_dir_all(dir)
@@ -187,9 +196,16 @@ async fn lock_key(lock_path: &Path) -> Result<File> {
         .open(lock_path)
         .await
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    file.lock()
-        .with_context(|| format!("taking exclusive lock on {}", lock_path.display()))?;
-    Ok(file)
+    let context = format!("taking exclusive lock on {}", lock_path.display());
+    let std_file = file.into_std().await;
+    let locked = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+        fs4::FileExt::lock(&std_file)?;
+        Ok(std_file)
+    })
+    .await
+    .context("lock task panicked")?
+    .context(context)?;
+    Ok(File::from_std(locked))
 }
 
 #[async_trait::async_trait]

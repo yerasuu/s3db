@@ -136,3 +136,38 @@ async fn both_engines_get_range_returns_the_same_slice() {
         assert_eq!(b.get_range("k", 2, 5).await.unwrap(), b"23456", "engine {engine:?}");
     }
 }
+
+/// Deliberately on the default single-threaded runtime: the whole point is
+/// that waiting for a contended `flock` must not occupy the runtime worker
+/// that the lock holder needs in order to finish and release it. Before
+/// `lock_key` moved the wait to the blocking pool, this hung forever
+/// instead of failing — so it is a liveness test, and its timeout is the
+/// assertion.
+#[tokio::test]
+async fn files_engine_serializes_contending_writers_without_blocking_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = std::sync::Arc::new(backend(dir.path(), LocalEngine::Files));
+
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..8u8 {
+        let b = std::sync::Arc::clone(&b);
+        set.spawn(async move {
+            // Every writer races the same key with the same expectation, so
+            // exactly one can win: the losers must come back as
+            // `Cas::Conflict`, never hang and never corrupt the revision
+            // sidecar.
+            b.put_cas("contended", vec![i], None).await
+        });
+    }
+
+    let mut wins = 0;
+    let mut conflicts = 0;
+    while let Some(joined) = set.join_next().await {
+        match joined.unwrap().unwrap() {
+            Cas::Ok => wins += 1,
+            Cas::Conflict => conflicts += 1,
+        }
+    }
+    assert_eq!(wins, 1, "exactly one create-only write can win");
+    assert_eq!(conflicts, 7);
+}
