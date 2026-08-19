@@ -15,7 +15,9 @@ fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
 async fn a_successful_write_leaves_no_wal_entry_behind() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
+    let sealed = cipher
+        .seal("k", b"value", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     let cas = put_cas_with_wal(&backend, &cipher, "k", sealed, None).await.unwrap();
     assert_eq!(cas, Cas::Ok);
     assert!(
@@ -32,7 +34,9 @@ async fn a_genuine_conflict_still_clears_the_wal_entry() {
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     backend.put_cas("k", b"already there".to_vec(), None).await.unwrap();
 
-    let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
+    let sealed = cipher
+        .seal("k", b"value", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     let cas = put_cas_with_wal(&backend, &cipher, "k", sealed, None).await.unwrap();
     assert_eq!(cas, Cas::Conflict);
     assert!(
@@ -47,7 +51,9 @@ async fn a_genuine_conflict_still_clears_the_wal_entry() {
 async fn recover_stale_clears_an_entry_whose_write_actually_landed() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
+    let sealed = cipher
+        .seal("k", b"value", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     // Simulates a crash right after put_cas landed but before `complete`
     // ran: write the WAL entry, do the real write, but never clear it.
     let op_id = begin(&backend, &cipher, "k", &sealed).await.unwrap();
@@ -73,7 +79,9 @@ async fn recover_stale_clears_an_entry_whose_write_actually_landed() {
 async fn recover_stale_clears_an_entry_whose_write_never_landed_without_touching_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
+    let sealed = cipher
+        .seal("k", b"value", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     // Simulates a crash before the real put_cas ever ran.
     begin(&backend, &cipher, "k", &sealed).await.unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -88,7 +96,9 @@ async fn recover_stale_clears_an_entry_whose_write_never_landed_without_touching
 async fn recover_stale_leaves_a_fresh_entry_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
-    let sealed = cipher.seal("k", b"value", crate::cipher::CompressionStrategy::None);
+    let sealed = cipher
+        .seal("k", b"value", crate::cipher::CompressionStrategy::None)
+        .unwrap();
     begin(&backend, &cipher, "k", &sealed).await.unwrap();
 
     let resolved = recover_stale(&backend, &cipher, Duration::from_secs(3600))

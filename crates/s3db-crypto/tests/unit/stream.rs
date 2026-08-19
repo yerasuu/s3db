@@ -294,7 +294,9 @@ async fn stream_rejects_bad_magic_without_panicking() {
     assert!(c.open_stream("repo/pack", &sealed_path, &opened_path).await.is_err());
 
     // Long enough, but it's a plain `seal`-format blob (no magic at all).
-    let legacy = c.seal("repo/pack", b"test content", crate::CompressionStrategy::None);
+    let legacy = c
+        .seal("repo/pack", b"test content", crate::CompressionStrategy::None)
+        .unwrap();
     tokio::fs::write(&sealed_path, &legacy).await.unwrap();
     assert!(c.open_stream("repo/pack", &sealed_path, &opened_path).await.is_err());
 }

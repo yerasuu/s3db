@@ -11,6 +11,8 @@ use crate::kdf;
 use crate::stream;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bytes every sealed object reserves for its nonce, whichever algorithm
 /// sealed it -- see [`NONCE_FIELD_LEN`] for why it's fixed rather than
@@ -45,10 +47,40 @@ enum Inner {
         /// The algorithm [`Cipher::seal`] writes with. Never consulted on
         /// `open`: there the object's own header decides.
         active: CipherAlgorithm,
+        /// How many nonces this key has handed out so far -- see
+        /// [`AES_GCM_NONCE_BUDGET`]. `Arc` so the count is shared by every
+        /// clone of this `Cipher` rather than reset by cloning it: the
+        /// budget belongs to the *key*, and a per-clone counter would be
+        /// trivially defeated by a caller that clones per request.
+        nonces_issued: Arc<AtomicU64>,
     },
     /// [`EncryptionMode::Disabled`]: no key was ever derived.
     Plaintext,
 }
+
+/// How many nonces one key may hand out before [`Cipher::seal`] refuses to
+/// seal anything else with [`CipherAlgorithm::Aes256Gcm`].
+///
+/// AES-GCM's nonce is 96 bits and this crate picks it at random, so nonce
+/// reuse is a birthday problem rather than an impossibility. Reuse under
+/// GCM is not merely a confidentiality loss: two messages under the same
+/// key and nonce leak the authentication subkey, which lets an attacker
+/// forge tags for that key from then on. NIST SP 800-38D §8.3 caps a
+/// random-IV key at 2^32 invocations, which holds the collision probability
+/// at about 2^-32; that is the number used here.
+///
+/// [`CipherAlgorithm::XChaCha20Poly1305`] (the default) has a 192-bit
+/// nonce and needs no budget at all -- a collision there stays
+/// astronomically unlikely at any volume this crate could reach, so it is
+/// deliberately not counted against anything.
+///
+/// **This counter lives in memory and starts at zero each time the process
+/// starts.** It bounds one process's usage of one derived key, not that
+/// key's lifetime total across restarts. Bounding the lifetime total would
+/// take a durable counter alongside the key, which this crate has nowhere
+/// to put; a deployment that seals at a rate where that distinction matters
+/// should be on the default algorithm, not on AES.
+const AES_GCM_NONCE_BUDGET: u64 = 1 << 32;
 
 #[derive(Clone)]
 pub struct Cipher(Inner);
@@ -81,6 +113,7 @@ impl Cipher {
         Ok(Cipher(Inner::Encrypting {
             keyed: CipherAlgorithm::ALL.map(|a| Keyed::new(a, &key)),
             active: algorithm,
+            nonces_issued: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -106,6 +139,58 @@ impl Cipher {
         match &self.0 {
             Inner::Encrypting { active, .. } => EncryptionMode::Enabled { algorithm: *active },
             Inner::Plaintext => EncryptionMode::Disabled,
+        }
+    }
+
+    /// A fresh random nonce field, counted against this key's
+    /// [`AES_GCM_NONCE_BUDGET`].
+    ///
+    /// Every nonce this crate issues comes from here -- [`Self::seal`] for
+    /// the small-object format and [`crate::stream::seal_stream`] once per
+    /// chunk -- so the budget covers both formats rather than only the one
+    /// that happened to be written first. The field is filled end to end
+    /// even for an algorithm with a shorter nonce: the trailing bytes are
+    /// never read, and random beats zero-padding for not implying they mean
+    /// something. Under [`EncryptionMode::Disabled`] there is no nonce at
+    /// all, but the field stays so the header keeps its fixed offset --
+    /// `open` has to find it before it knows what sealed the object.
+    pub(crate) fn issue_nonce(&self) -> Result<[u8; NONCE_LEN]> {
+        if let Inner::Encrypting {
+            active: CipherAlgorithm::Aes256Gcm,
+            nonces_issued,
+            ..
+        } = &self.0
+        {
+            // `fetch_add` rather than a load-then-store: several tasks can
+            // seal concurrently through clones of this `Cipher`, and a
+            // check that isn't atomic with the increment would let them all
+            // pass the same final slot.
+            let issued = nonces_issued.fetch_add(1, Ordering::Relaxed);
+            if issued >= AES_GCM_NONCE_BUDGET {
+                // Saturate rather than let the counter wrap back under the
+                // budget after another 2^64 calls.
+                nonces_issued.store(AES_GCM_NONCE_BUDGET, Ordering::Relaxed);
+                bail!(
+                    "refusing to seal: this key has issued its full budget of {AES_GCM_NONCE_BUDGET} \
+                     AES-256-GCM nonces, past which a 96-bit random nonce is likely enough to repeat \
+                     that a repeat would leak the authentication subkey. Rotate the encryption key, \
+                     or switch this bucket to XChaCha20Poly1305, whose 192-bit nonce has no such bound."
+                );
+            }
+        }
+        let mut nonce_field = [0u8; NONCE_LEN];
+        getrandom::fill(&mut nonce_field).context("system RNG unavailable")?;
+        Ok(nonce_field)
+    }
+
+    /// Fast-forwards this key's nonce counter, so a test can reach the
+    /// budget's edge without actually issuing four billion nonces. Test-only
+    /// on purpose: nothing in a real deployment has any business moving this
+    /// counter except by sealing.
+    #[cfg(test)]
+    pub(crate) fn set_nonces_issued(&self, issued: u64) {
+        if let Inner::Encrypting { nonces_issued, .. } = &self.0 {
+            nonces_issued.store(issued, Ordering::Relaxed);
         }
     }
 
@@ -143,7 +228,7 @@ impl Cipher {
     /// both [`Self::seal`] and [`crate::stream`]'s per-chunk framing.
     pub(crate) fn seal_chunk(&self, nonce_field: &[u8; NONCE_LEN], msg: &[u8], aad: &[u8]) -> Vec<u8> {
         match &self.0 {
-            Inner::Encrypting { keyed, active } => keyed[active.index()].encrypt(nonce_field, msg, aad),
+            Inner::Encrypting { keyed, active, .. } => keyed[active.index()].encrypt(nonce_field, msg, aad),
             Inner::Plaintext => msg.to_vec(),
         }
     }
@@ -182,23 +267,20 @@ impl Cipher {
     /// the plaintext was compressed first (see [`CompressionStrategy`]); the
     /// whole byte is bound into the AEAD associated data, so neither half
     /// can be tampered with independently of the ciphertext.
-    pub fn seal(&self, aad: &str, plaintext: &[u8], compression: CompressionStrategy) -> Vec<u8> {
+    ///
+    /// Fallible only because of [`Self::issue_nonce`]'s budget (and a
+    /// system RNG that won't produce bytes): the encryption itself cannot
+    /// fail at any size this format allows.
+    pub fn seal(&self, aad: &str, plaintext: &[u8], compression: CompressionStrategy) -> Result<Vec<u8>> {
         let (compression_code, payload) = compression::compress_for_seal(plaintext, compression);
-        // Filled end to end even for an algorithm with a shorter nonce: the
-        // trailing bytes are never read, and random beats zero-padding for
-        // not implying they mean something. Under `Disabled` there's no
-        // nonce at all, but the field stays so the header keeps its fixed
-        // offset -- `open` has to find it before it knows what sealed the
-        // object.
-        let mut nonce_field = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce_field).expect("system RNG unavailable");
+        let nonce_field = self.issue_nonce()?;
         let header = algorithm::pack_header(self.sealer().code(), compression_code);
         let combined_aad = header_bound_aad(aad, header);
         let mut ciphertext = self.seal_chunk(&nonce_field, &payload, &combined_aad);
         let mut sealed = nonce_field.to_vec();
         sealed.push(header);
         sealed.append(&mut ciphertext);
-        sealed
+        Ok(sealed)
     }
 
     /// Opens what [`Self::seal`] sealed, dispatching on the algorithm its

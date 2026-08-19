@@ -12,14 +12,16 @@ fn test_cipher_with(algorithm: CipherAlgorithm) -> Cipher {
 #[test]
 fn roundtrips() {
     let c = test_cipher();
-    let sealed = c.seal("repo/config.json", b"secret content", CompressionStrategy::None);
+    let sealed = c
+        .seal("repo/config.json", b"secret content", CompressionStrategy::None)
+        .unwrap();
     let opened = c.open("repo/config.json", &sealed).unwrap();
     assert_eq!(opened, b"secret content");
 }
 
 #[test]
 fn rejects_wrong_passphrase() {
-    let sealed = test_cipher().seal("k", b"x", CompressionStrategy::None);
+    let sealed = test_cipher().seal("k", b"x", CompressionStrategy::None).unwrap();
     let other = Cipher::derive("another passphrase", &[7u8; SALT_LEN]).unwrap();
     assert!(other.open("k", &sealed).is_err());
 }
@@ -27,7 +29,7 @@ fn rejects_wrong_passphrase() {
 #[test]
 fn rejects_wrong_aad() {
     let c = test_cipher();
-    let sealed = c.seal("repo-a/config.json", b"x", CompressionStrategy::None);
+    let sealed = c.seal("repo-a/config.json", b"x", CompressionStrategy::None).unwrap();
     // Simulates a storage provider moving ciphertext to another key.
     assert!(c.open("repo-b/config.json", &sealed).is_err());
 }
@@ -35,7 +37,7 @@ fn rejects_wrong_aad() {
 #[test]
 fn rejects_truncated_or_tampered() {
     let c = test_cipher();
-    let mut sealed = c.seal("k", b"test content", CompressionStrategy::None);
+    let mut sealed = c.seal("k", b"test content", CompressionStrategy::None).unwrap();
     assert!(c.open("k", &sealed[..10]).is_err());
     let last = sealed.len() - 1;
     sealed[last] ^= 0xff;
@@ -46,7 +48,7 @@ fn rejects_truncated_or_tampered() {
 fn different_salts_give_different_keys() {
     let a = Cipher::derive("pw", &[1u8; SALT_LEN]).unwrap();
     let b = Cipher::derive("pw", &[2u8; SALT_LEN]).unwrap();
-    let sealed = a.seal("k", b"x", CompressionStrategy::None);
+    let sealed = a.seal("k", b"x", CompressionStrategy::None).unwrap();
     assert!(b.open("k", &sealed).is_err());
 }
 
@@ -54,7 +56,7 @@ fn different_salts_give_different_keys() {
 fn compression_none_roundtrips() {
     let c = test_cipher();
     let plaintext = b"repeat repeat repeat repeat repeat repeat".repeat(50);
-    let sealed = c.seal("k", &plaintext, CompressionStrategy::None);
+    let sealed = c.seal("k", &plaintext, CompressionStrategy::None).unwrap();
     assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
 }
 
@@ -62,7 +64,9 @@ fn compression_none_roundtrips() {
 fn compression_auto_shrinks_and_roundtrips_compressible_data() {
     let c = test_cipher();
     let plaintext = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
-    let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+    let sealed = c
+        .seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 })
+        .unwrap();
     assert!(
         sealed.len() < plaintext.len(),
         "highly repetitive data should compress smaller"
@@ -74,7 +78,9 @@ fn compression_auto_shrinks_and_roundtrips_compressible_data() {
 fn tampering_with_the_compression_header_is_detected() {
     let c = test_cipher();
     let plaintext = b"repeat repeat repeat repeat repeat repeat ".repeat(200);
-    let mut sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+    let mut sealed = c
+        .seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 })
+        .unwrap();
     let (algorithm_code, compression_code) = algorithm::unpack_header(sealed[NONCE_LEN]);
     assert_eq!(compression_code, compression::ZSTD);
     // Flip only the compression half, leaving the algorithm half intact.
@@ -96,7 +102,7 @@ fn every_algorithm_roundtrips() {
     for algorithm in CipherAlgorithm::ALL {
         let c = test_cipher_with(algorithm);
         assert_eq!(c.mode(), EncryptionMode::Enabled { algorithm });
-        let sealed = c.seal("k", b"secret content", CompressionStrategy::None);
+        let sealed = c.seal("k", b"secret content", CompressionStrategy::None).unwrap();
         assert_eq!(algorithm::unpack_header(sealed[NONCE_LEN]).0, algorithm.code());
         assert_eq!(c.open("k", &sealed).unwrap(), b"secret content");
     }
@@ -109,7 +115,11 @@ fn every_algorithm_roundtrips() {
 fn a_cipher_opens_objects_sealed_by_any_algorithm() {
     let sealed: Vec<Vec<u8>> = CipherAlgorithm::ALL
         .iter()
-        .map(|&a| test_cipher_with(a).seal("k", b"secret content", CompressionStrategy::None))
+        .map(|&a| {
+            test_cipher_with(a)
+                .seal("k", b"secret content", CompressionStrategy::None)
+                .unwrap()
+        })
         .collect();
     for reader_algorithm in CipherAlgorithm::ALL {
         let reader = test_cipher_with(reader_algorithm);
@@ -131,20 +141,22 @@ fn the_default_algorithm_leaves_the_header_byte_unchanged_from_the_original_form
             algorithm: CipherAlgorithm::XChaCha20Poly1305
         }
     );
-    let raw = c.seal("k", b"x", CompressionStrategy::None);
+    let raw = c.seal("k", b"x", CompressionStrategy::None).unwrap();
     assert_eq!(raw[NONCE_LEN], compression::NONE);
-    let zstd = c.seal(
-        "k",
-        &b"repeat repeat repeat repeat ".repeat(200),
-        CompressionStrategy::Auto { threshold_bytes: 16 },
-    );
+    let zstd = c
+        .seal(
+            "k",
+            &b"repeat repeat repeat repeat ".repeat(200),
+            CompressionStrategy::Auto { threshold_bytes: 16 },
+        )
+        .unwrap();
     assert_eq!(zstd[NONCE_LEN], compression::ZSTD);
 }
 
 #[test]
 fn rejects_an_unknown_algorithm_code() {
     let c = test_cipher();
-    let mut sealed = c.seal("k", b"x", CompressionStrategy::None);
+    let mut sealed = c.seal("k", b"x", CompressionStrategy::None).unwrap();
     // A code no build of this crate assigns -- an object from a future
     // version must fail loudly, not be misread as an algorithm that exists.
     sealed[NONCE_LEN] = algorithm::pack_header(0xE, compression::NONE);
@@ -156,7 +168,7 @@ fn rejects_an_unknown_algorithm_code() {
 fn disabled_roundtrips_and_marks_the_object_unencrypted() {
     let c = Cipher::disabled();
     assert_eq!(c.mode(), EncryptionMode::Disabled);
-    let sealed = c.seal("k", b"public content", CompressionStrategy::None);
+    let sealed = c.seal("k", b"public content", CompressionStrategy::None).unwrap();
     assert_eq!(
         algorithm::unpack_header(sealed[NONCE_LEN]).0,
         algorithm::UNENCRYPTED_CODE
@@ -171,7 +183,9 @@ fn disabled_roundtrips_and_marks_the_object_unencrypted() {
 fn disabled_still_compresses_when_asked() {
     let c = Cipher::disabled();
     let plaintext = b"repeat repeat repeat repeat ".repeat(200);
-    let sealed = c.seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 });
+    let sealed = c
+        .seal("k", &plaintext, CompressionStrategy::Auto { threshold_bytes: 16 })
+        .unwrap();
     assert!(sealed.len() < plaintext.len());
     assert_eq!(c.open("k", &sealed).unwrap(), plaintext);
 }
@@ -181,14 +195,18 @@ fn disabled_still_compresses_when_asked() {
 /// have an encrypting reader hand the content straight back.
 #[test]
 fn an_encrypting_cipher_refuses_an_unencrypted_object() {
-    let unencrypted = Cipher::disabled().seal("k", b"attacker content", CompressionStrategy::None);
+    let unencrypted = Cipher::disabled()
+        .seal("k", b"attacker content", CompressionStrategy::None)
+        .unwrap();
     let err = test_cipher().open("k", &unencrypted).unwrap_err().to_string();
     assert!(err.contains("encryption enabled"), "got: {err}");
 }
 
 #[test]
 fn a_disabled_cipher_refuses_an_encrypted_object() {
-    let sealed = test_cipher().seal("k", b"secret content", CompressionStrategy::None);
+    let sealed = test_cipher()
+        .seal("k", b"secret content", CompressionStrategy::None)
+        .unwrap();
     let err = Cipher::disabled().open("k", &sealed).unwrap_err().to_string();
     assert!(err.contains("encryption disabled"), "got: {err}");
 }
@@ -216,8 +234,46 @@ fn the_default_mode_is_encryption_on() {
 #[test]
 fn tampering_with_the_algorithm_header_is_detected() {
     let c = test_cipher_with(CipherAlgorithm::Aes256Gcm);
-    let mut sealed = c.seal("k", b"secret content", CompressionStrategy::None);
+    let mut sealed = c.seal("k", b"secret content", CompressionStrategy::None).unwrap();
     // Claim the object was sealed by a different (real) algorithm.
     sealed[NONCE_LEN] = algorithm::pack_header(CipherAlgorithm::XChaCha20Poly1305.code(), compression::NONE);
     assert!(c.open("k", &sealed).is_err());
+}
+
+/// AES-256-GCM's 96-bit nonce is picked at random, so past NIST's 2^32
+/// invocations per key a repeat stops being negligible -- and a repeat under
+/// GCM leaks the authentication subkey, not just one message. `seal` has to
+/// fail closed at that point rather than keep issuing nonces.
+#[test]
+fn aes_gcm_refuses_to_seal_past_its_nonce_budget() {
+    let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    c.set_nonces_issued((1 << 32) - 1);
+    // The last nonce inside the budget is still handed out.
+    assert!(c.seal("k", b"still fine", CompressionStrategy::None).is_ok());
+    let err = c
+        .seal("k", b"one too many", CompressionStrategy::None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("budget"), "{err}");
+    // And it stays refused rather than recovering on the next call.
+    assert!(c.seal("k", b"still refused", CompressionStrategy::None).is_err());
+}
+
+/// The budget belongs to the key, not to one `Cipher` value, so cloning must
+/// not hand a caller a fresh allowance.
+#[test]
+fn the_nonce_budget_is_shared_across_clones() {
+    let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    c.set_nonces_issued(1 << 32);
+    let clone = c.clone();
+    assert!(clone.seal("k", b"x", CompressionStrategy::None).is_err());
+}
+
+/// XChaCha20Poly1305's 192-bit nonce has no birthday bound worth enforcing,
+/// so the default algorithm must never be capped.
+#[test]
+fn xchacha_has_no_nonce_budget() {
+    let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::XChaCha20Poly1305).unwrap();
+    c.set_nonces_issued(u64::MAX);
+    assert!(c.seal("k", b"x", CompressionStrategy::None).is_ok());
 }

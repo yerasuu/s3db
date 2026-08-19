@@ -133,11 +133,13 @@ async fn rerun_after_partial_crash_treats_the_already_applied_op_as_ours() {
     // Simulates a crash after a previous `run` applied only this one op
     // directly, bypassing `run`'s own txn record entirely -- the exact
     // content `run` would have produced, so this must read as "ours".
-    let sealed = cipher.seal(
-        &ops[0].key,
-        &rmp_serde::to_vec_named(&ops[0].value).unwrap(),
-        CompressionStrategy::None,
-    );
+    let sealed = cipher
+        .seal(
+            &ops[0].key,
+            &rmp_serde::to_vec_named(&ops[0].value).unwrap(),
+            CompressionStrategy::None,
+        )
+        .unwrap();
     assert_eq!(backend.put_cas(&ops[0].key, sealed, None).await.unwrap(), Cas::Ok);
 
     let cas = run(&backend, &cipher, ops).await.unwrap();
@@ -165,11 +167,13 @@ async fn recover_stale_rolls_back_an_abandoned_transaction() {
         .await
         .unwrap();
     // Simulates the real partial-apply a crashed `run` would leave behind.
-    let sealed = cipher.seal(
-        &op.key,
-        &rmp_serde::to_vec_named(&op.value).unwrap(),
-        CompressionStrategy::None,
-    );
+    let sealed = cipher
+        .seal(
+            &op.key,
+            &rmp_serde::to_vec_named(&op.value).unwrap(),
+            CompressionStrategy::None,
+        )
+        .unwrap();
     assert_eq!(backend.put_cas(&op.key, sealed, None).await.unwrap(), Cas::Ok);
 
     let recovered = recover_stale(&backend, &cipher, Duration::ZERO).await.unwrap();

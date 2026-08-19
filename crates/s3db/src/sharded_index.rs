@@ -255,7 +255,7 @@ impl ShardedIndex {
                         continue; // already moved (or released) by a prior partial run
                     }
                     let plain = cipher.open(&old_key, &sealed)?;
-                    let resealed = cipher.seal(&new_key, &plain, crate::cipher::CompressionStrategy::None);
+                    let resealed = cipher.seal(&new_key, &plain, crate::cipher::CompressionStrategy::None)?;
                     // Create-only, idempotent for the same content -- same
                     // reasoning as `Collection::delete`'s own archive step.
                     backend.put_cas(&new_key, resealed, None).await?;

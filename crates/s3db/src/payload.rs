@@ -59,7 +59,7 @@ pub async fn put_json<T: Serialize>(
     // objects -- see `MAX_OBJECT_BYTES` above): the size check `Auto` would
     // otherwise run on every write essentially never trips at this scale, so
     // the branch is skipped entirely rather than evaluated per write.
-    let sealed = cipher.seal(key, &plain, CompressionStrategy::None);
+    let sealed = cipher.seal(key, &plain, CompressionStrategy::None)?;
     backend.put_cas(key, sealed, expected_etag).await
 }
 

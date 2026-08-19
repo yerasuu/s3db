@@ -154,7 +154,7 @@ async fn run_atomic(
         // through `get_json`/`Collection::get` either way, so the two
         // protocols must produce byte-identical objects.
         let plain = rmp_serde::to_vec_named(&op.value)?;
-        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
+        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None)?;
         batch.push(BatchOp::Put {
             key: op.key.clone(),
             body: sealed,
@@ -238,7 +238,7 @@ pub async fn run_with_publisher(
         // since a `Collection`/entity elsewhere in the app reads this exact
         // key back through `get_json`/`Collection::get`.
         let plain = rmp_serde::to_vec_named(&op.value)?;
-        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None);
+        let sealed = cipher.seal(&op.key, &plain, CompressionStrategy::None)?;
         match backend.put_cas(&op.key, sealed, None).await? {
             Cas::Ok => {
                 pending_events.push(ChangeEvent {

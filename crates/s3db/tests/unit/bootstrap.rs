@@ -18,7 +18,11 @@ fn wrong_passphrase_fails_verification_clearly() {
     let cipher = Cipher::derive("correct", &[3u8; SALT_LEN]).unwrap();
     let meta = EncryptionMeta {
         salt: BASE64.encode([3u8; SALT_LEN]),
-        verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
+        verifier: BASE64.encode(
+            cipher
+                .seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)
+                .unwrap(),
+        ),
     };
     assert!(derive_and_verify("correct", DEFAULT_ALGORITHM, &meta).is_ok());
     let err = derive_and_verify("incorrect", DEFAULT_ALGORITHM, &meta).unwrap_err();
@@ -41,7 +45,11 @@ fn a_verifier_sealed_by_one_algorithm_validates_under_another() {
     let cipher = Cipher::derive_with("pw", &[3u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
     let meta = EncryptionMeta {
         salt: BASE64.encode([3u8; SALT_LEN]),
-        verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
+        verifier: BASE64.encode(
+            cipher
+                .seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)
+                .unwrap(),
+        ),
     };
     let derived = derive_and_verify("pw", CipherAlgorithm::XChaCha20Poly1305, &meta).unwrap();
     assert_eq!(
@@ -61,7 +69,7 @@ async fn a_new_bucket_is_bootstrapped_with_the_configured_algorithm() {
         assert_eq!(created.mode(), mode);
         // Second call reads the salt back instead of creating a new one.
         let reopened = get_or_create_cipher_for(&backend, mode, "pw").await.unwrap();
-        let sealed = created.seal("k", b"content", CompressionStrategy::None);
+        let sealed = created.seal("k", b"content", CompressionStrategy::None).unwrap();
         assert_eq!(reopened.open("k", &sealed).unwrap(), b"content");
     }
 }

@@ -482,7 +482,7 @@ impl Collection {
             }
         };
         let history_key = format!("{}/{etag}.json", self.history_prefix(name)?);
-        let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None);
+        let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None)?;
         // Create-only, but idempotent in practice: the same etag always
         // archives the same content, so a `Cas::Conflict` here just means
         // this exact archive entry already exists (a prior delete attempt

@@ -131,8 +131,7 @@ pub(crate) async fn seal_stream(cipher: &Cipher, aad: &str, plaintext_path: &Pat
             .with_context(|| format!("reading chunk {idx} of {}", plaintext_path.display()))?;
         remaining -= chunk_len as u64;
 
-        let mut nonce_bytes = [0u8; NONCE_LEN];
-        getrandom::fill(&mut nonce_bytes).expect("system RNG unavailable");
+        let nonce_bytes = cipher.issue_nonce()?;
         let chunk_aad = format!("{aad}\0stream\0{total_len}\0{idx}");
         let ciphertext = cipher.seal_chunk(&nonce_bytes, &plain, chunk_aad.as_bytes());
 

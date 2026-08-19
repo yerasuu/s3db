@@ -194,7 +194,7 @@ fn new_key_material(passphrase: &str) -> Result<(KeyMaterial, Cipher)> {
     let material = KeyMaterial {
         key_id: key_id.clone(),
         salt: BASE64.encode(salt),
-        verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
+        verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)?),
         retired_at_ms: None,
     };
     Ok((material, cipher))

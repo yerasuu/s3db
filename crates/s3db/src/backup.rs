@@ -115,7 +115,7 @@ pub async fn backup_collection(
         }
         let plain = src_cipher.open(&key, &sealed)?;
         let dest_key = format!("{prefix}/{name}.json");
-        let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None);
+        let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None)?;
         match dest_backend.put_cas(&dest_key, resealed, None).await? {
             Cas::Ok => entity_count += 1,
             Cas::Conflict => entity_conflicts += 1,
@@ -199,7 +199,7 @@ pub async fn restore_collection(
         }
         let plain = backup_cipher.open(&key, &sealed)?;
         let dest_key = collection.key(&name)?;
-        let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None);
+        let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None)?;
         // Overwrites whatever's currently at `dest_key` -- restore is a
         // deliberate, caller-initiated overwrite, not a CAS-protected merge.
         // CAS-with-reread, not a single blind attempt: the etag read above

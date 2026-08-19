@@ -16,7 +16,7 @@ async fn fresh_bucket_bootstraps_a_single_active_key() {
     let ring = get_or_create_keyring(&b, "correct horse", &HashMap::new())
         .await
         .unwrap();
-    let sealed = ring.active().seal("k", b"hello", CompressionStrategy::None);
+    let sealed = ring.active().seal("k", b"hello", CompressionStrategy::None).unwrap();
     assert_eq!(ring.open("k", &sealed).unwrap(), b"hello");
 }
 
@@ -41,7 +41,10 @@ async fn rotate_keeps_old_objects_readable_via_dual_read() {
         .await
         .unwrap();
     let old_key_id = ring.active_key_id().to_string();
-    let sealed_under_old = ring.active().seal("k", b"old value", CompressionStrategy::None);
+    let sealed_under_old = ring
+        .active()
+        .seal("k", b"old value", CompressionStrategy::None)
+        .unwrap();
 
     let new_key_id = rotate(&b, &mut ring, "second passphrase").await.unwrap();
     assert_ne!(new_key_id, old_key_id);
@@ -49,7 +52,10 @@ async fn rotate_keeps_old_objects_readable_via_dual_read() {
 
     // Old ciphertext still opens (dual-read), new writes use the new key.
     assert_eq!(ring.open("k", &sealed_under_old).unwrap(), b"old value");
-    let sealed_under_new = ring.active().seal("k2", b"new value", CompressionStrategy::None);
+    let sealed_under_new = ring
+        .active()
+        .seal("k2", b"new value", CompressionStrategy::None)
+        .unwrap();
     assert_eq!(ring.open("k2", &sealed_under_new).unwrap(), b"new value");
 }
 
@@ -81,7 +87,7 @@ async fn forget_retired_drops_it_from_memory_only() {
     let b = backend(dir.path());
     let mut ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
     let old_key_id = ring.active_key_id().to_string();
-    let sealed_under_old = ring.active().seal("k", b"v", CompressionStrategy::None);
+    let sealed_under_old = ring.active().seal("k", b"v", CompressionStrategy::None).unwrap();
     rotate(&b, &mut ring, "second").await.unwrap();
     assert!(ring.open("k", &sealed_under_old).is_ok());
 

@@ -78,7 +78,7 @@ pub async fn get_or_create_cipher_for(backend: &dyn Backend, mode: EncryptionMod
             let cipher = Cipher::derive_with(passphrase, &salt, algorithm)?;
             let meta = EncryptionMeta {
                 salt: BASE64.encode(salt),
-                verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)),
+                verifier: BASE64.encode(cipher.seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)?),
             };
             match put_json_plain(backend, ENCRYPTION_META_KEY, &meta, None).await? {
                 Cas::Ok => return Ok(cipher),

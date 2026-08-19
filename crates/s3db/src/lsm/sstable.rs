@@ -178,7 +178,7 @@ pub fn build(
         &footer_aad(sstable_key),
         &footer_plain,
         CompressionStrategy::Auto { threshold_bytes: 4096 },
-    );
+    )?;
 
     object.extend_from_slice(&sealed_footer);
     object.extend_from_slice(&(sealed_footer.len() as u64).to_le_bytes());
@@ -219,7 +219,7 @@ fn write_block(
         &block_aad(sstable_key, block_idx),
         &plain,
         CompressionStrategy::Auto { threshold_bytes: 4096 },
-    );
+    )?;
     anyhow::ensure!(
         sealed.len() <= u32::MAX as usize,
         "sealed block is {} bytes, over the u32 length prefix's limit -- reduce rows_per_block",
