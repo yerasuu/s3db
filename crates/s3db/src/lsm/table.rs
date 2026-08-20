@@ -170,8 +170,11 @@ impl Table {
     /// replaying, so that gets recovered too, not just plain writes.
     pub async fn open(config: TableConfig) -> Result<Self> {
         super::wal::heal_rotating_wal(&config.wal_path).await?;
-        let recovered = Wal::replay(&config.wal_path).await?;
-        let wal = Wal::open(config.wal_path).await?;
+        // Every WAL frame is sealed under this table's own key — see
+        // `super::wal`'s module doc for why the log can't sit in the clear.
+        let aad = super::wal::wal_aad(&config.root);
+        let recovered = Wal::replay(&config.wal_path, &config.cipher, &aad).await?;
+        let wal = Wal::open(config.wal_path, config.cipher.clone(), aad).await?;
         let mut memtable = Memtable::default();
         for (key, value) in recovered {
             match value {
