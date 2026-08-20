@@ -30,6 +30,10 @@ commands:
   schema <collection>     a Collection's migration bookkeeping
   verify <prefix>         try to decrypt everything under a prefix, report what fails
   rm <key> --yes          delete one object
+  rebind <key> --from <old-key> [--apply]
+                          re-seal an object that was moved without being
+                          re-sealed: opens it under <old-key> as AAD and
+                          writes it back sealed under its current key
   migrate-bootstrap [--apply]
                           rewrap a bucket bootstrapped before the data key was
                           wrapped: same key, no object re-encrypted. Prints the
@@ -62,6 +66,7 @@ async fn main() -> Result<()> {
         "schema" => schema(&backend, operands).await,
         "verify" => verify(&backend, operands).await,
         "rm" => rm(&backend, operands).await,
+        "rebind" => rebind(&backend, operands).await,
         "migrate-bootstrap" => migrate_bootstrap(&backend, operands).await,
         "--help" | "-h" | "help" => {
             println!("{USAGE}");
@@ -155,6 +160,19 @@ async fn get(backend: &Arc<dyn Backend>, operands: &[String]) -> Result<()> {
     if key.ends_with("encryption.json") {
         println!("{}", String::from_utf8_lossy(&sealed));
         return Ok(());
+    }
+
+    // A large object (a release asset, a pack) is sealed chunk by chunk by
+    // `seal_stream`, a different on-disk format from the one `open` reads.
+    // Without this the tool reports it as a decrypt failure, which reads
+    // exactly like corruption or a wrong passphrase -- and sends whoever is
+    // mid-incident chasing the wrong thing.
+    if s3db::Cipher::is_stream_sealed(&sealed) {
+        bail!(
+            "{key} is stream-sealed ({} bytes): a large object written chunk by chunk, \
+             not the single-blob format this command decrypts. It is not corrupt.",
+            sealed.len()
+        );
     }
 
     let cipher = cipher_for(backend).await?;
@@ -331,6 +349,53 @@ async fn migrate_bootstrap(backend: &Arc<dyn Backend>, operands: &[String]) -> R
                 s3db::bootstrap::ENCRYPTION_META_KEY
             );
         }
+    }
+    Ok(())
+}
+
+/// Re-seals an object whose ciphertext was copied to a new key without
+/// going through decrypt-and-reseal.
+///
+/// Every object is sealed with its own S3 key as associated data, so a
+/// server-side copy or rename produces bytes that authenticate against a
+/// key they no longer live at: the object reads as corrupt, with the same
+/// error a wrong passphrase gives. This opens it under the key it *was*
+/// sealed at and writes it back sealed under the one it is at now.
+///
+/// Dry run unless `--apply`: it reports whether the object opens under the
+/// old key, which is also the check that the old key was guessed right.
+async fn rebind(backend: &Arc<dyn Backend>, operands: &[String]) -> Result<()> {
+    let key = operand(operands, 0, "<key>")?;
+    let from = operands
+        .iter()
+        .position(|a| a == "--from")
+        .and_then(|i| operands.get(i + 1))
+        .map(String::as_str)
+        .context("rebind needs --from <old-key>\n")?;
+    let apply = operands.iter().any(|a| a == "--apply");
+    let cipher = cipher_for(backend).await?;
+
+    let (sealed, etag) = backend.get(key).await?;
+    let etag = etag.with_context(|| format!("{key} doesn't exist"))?;
+    if cipher.open(key, &sealed).is_ok() {
+        println!("{key}: already sealed under its own key, nothing to do");
+        return Ok(());
+    }
+    let plaintext = cipher.open(from, &sealed).with_context(|| {
+        format!("{key} doesn't open under {from} either -- wrong --from, or the object is genuinely corrupt")
+    })?;
+    if !apply {
+        println!(
+            "{key}: opens under {from} ({} bytes) -- re-run with --apply to re-seal",
+            plaintext.len()
+        );
+        return Ok(());
+    }
+
+    let resealed = cipher.seal(key, &plaintext, s3db::CompressionStrategy::None)?;
+    match backend.put_cas(key, resealed, Some(&etag)).await? {
+        s3db::Cas::Ok => println!("{key}: re-sealed"),
+        s3db::Cas::Conflict => bail!("{key} changed while re-sealing it; nothing written"),
     }
     Ok(())
 }
