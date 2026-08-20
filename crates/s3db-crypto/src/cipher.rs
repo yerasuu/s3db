@@ -150,6 +150,15 @@ impl Cipher {
     }
 
     /// A fresh random key for [`Self::from_key`], wiped on drop.
+    /// The key material a pre-[`crate::KDF_VERSION`]-`1` bucket derived
+    /// straight from its passphrase — see [`crate::kdf::derive_legacy_v0`].
+    /// Raw bytes rather than a built [`Cipher`] because its one caller
+    /// (`s3db::bootstrap`'s migration) needs to *wrap* the key, not only
+    /// seal with it.
+    pub fn legacy_key_v0(passphrase: &str, salt: &[u8; kdf::SALT_LEN]) -> Result<Zeroizing<[u8; kdf::KEY_LEN]>> {
+        kdf::derive_legacy_v0(passphrase, salt)
+    }
+
     pub fn random_key() -> Result<Zeroizing<[u8; kdf::KEY_LEN]>> {
         kdf::random_key()
     }

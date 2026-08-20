@@ -39,7 +39,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
-const ENCRYPTION_META_KEY: &str = ".conf/encryption.json";
+/// Where a bucket's encryption config lives. Public so an operator tool can
+/// name the one object a migration rewrites (and take a copy of it first)
+/// without hardcoding the path in two places.
+pub const ENCRYPTION_META_KEY: &str = ".conf/encryption.json";
 /// Known plaintext sealed with the data key, to validate it right at startup
 /// instead of the first real decrypt error being indistinguishable from "the
 /// data is corrupt".
@@ -234,6 +237,106 @@ pub async fn change_passphrase(backend: &dyn Backend, current_passphrase: &str, 
         }
     }
     bail!("couldn't change the passphrase after several attempts (high contention)")
+}
+
+/// What [`migrate_unwrapped_meta`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// The config already carries a wrapped data key — nothing to do, and
+    /// nothing was written.
+    AlreadyWrapped,
+    /// The config was rewritten: same data key, now wrapped and
+    /// authenticated under the current KDF parameters.
+    Migrated,
+}
+
+/// Brings a bucket bootstrapped before the wrapped-data-key scheme up to
+/// the current [`EncryptionMeta`] format, **without re-encrypting a single
+/// object**.
+///
+/// Such a bucket derived its data key straight from the passphrase
+/// (`Argon2::default()`, the parameters of the time — see
+/// [`Cipher::legacy_key_v0`]) and stored only a salt and a verifier. Today's
+/// [`open_meta`] refuses it: there is no wrapped key to unwrap and no tag to
+/// authenticate the file with. The error it prints says to re-encrypt into a
+/// freshly bootstrapped bucket, which is true but enormous — every object
+/// rewritten, downtime for the duration.
+///
+/// It isn't necessary. The legacy key is deterministic, so this re-derives
+/// exactly the key those objects were sealed under and *wraps that key*
+/// rather than minting a new one. Every object stays readable, untouched;
+/// the migration is a single small object.
+///
+/// Order matters and is deliberate: the legacy key is proved against the
+/// stored verifier **before** anything is written, so a wrong passphrase (or
+/// a bucket that isn't in this format at all) fails having changed nothing.
+///
+/// The caller is expected to keep a copy of the old `.conf/encryption.json`
+/// first — this replaces it under CAS, so a concurrent writer can't be
+/// clobbered, but nothing here can undo the write afterwards.
+pub async fn migrate_unwrapped_meta(
+    backend: &dyn Backend,
+    passphrase: &str,
+    algorithm: CipherAlgorithm,
+) -> Result<MigrationOutcome> {
+    let (meta, etag) = get_json_plain::<EncryptionMeta>(backend, ENCRYPTION_META_KEY).await?;
+    let etag = etag.with_context(|| {
+        format!("this bucket has no {ENCRYPTION_META_KEY}: there is nothing to migrate (is the path right?)")
+    })?;
+    if !meta.wrapped_key.is_empty() {
+        return Ok(MigrationOutcome::AlreadyWrapped);
+    }
+    if meta.verifier.is_empty() {
+        bail!(
+            "{ENCRYPTION_META_KEY} has neither a wrapped key nor a verifier, so there is nothing to \
+             prove the passphrase against before rewriting it. Refusing to guess."
+        );
+    }
+
+    let salt_bytes = BASE64
+        .decode(&meta.salt)
+        .with_context(|| format!("{ENCRYPTION_META_KEY}: invalid salt (not base64)"))?;
+    let salt: [u8; SALT_LEN] = salt_bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!(
+            "{ENCRYPTION_META_KEY}: salt has invalid length ({} bytes, expected {SALT_LEN})",
+            bytes.len()
+        )
+    })?;
+
+    let legacy_key = Cipher::legacy_key_v0(passphrase, &salt)?;
+    let data_cipher = Cipher::from_key(&legacy_key, algorithm);
+    let verifier = BASE64
+        .decode(&meta.verifier)
+        .with_context(|| format!("{ENCRYPTION_META_KEY}: invalid verifier (not base64)"))?;
+    data_cipher.open(VERIFIER_AAD, &verifier).context(
+        "the supplied passphrase doesn't open this bucket's verifier under the pre-wrapping key \
+         derivation -- either it's the wrong passphrase, or this bucket isn't in that format. \
+         Nothing was written.",
+    )?;
+
+    let wrap_salt = random_salt()?;
+    let wrapper = Cipher::derive(passphrase, &wrap_salt)?;
+    let mut migrated = EncryptionMeta {
+        kdf_version: KDF_VERSION,
+        salt: BASE64.encode(wrap_salt),
+        wrapped_key: BASE64.encode(wrapper.seal(WRAP_AAD, legacy_key.as_slice(), CompressionStrategy::None)?),
+        // Kept as-is: it is sealed under the data key, which is exactly the
+        // key this preserves.
+        verifier: meta.verifier.clone(),
+        mac: String::new(),
+    };
+    migrated.mac = authenticator(&wrapper, &migrated.canonical()?)?;
+
+    match put_json_plain(backend, ENCRYPTION_META_KEY, &migrated, Some(&etag)).await? {
+        Cas::Ok => Ok(MigrationOutcome::Migrated),
+        // Someone rewrote the config while this ran. Re-reading and retrying
+        // would race a writer that may itself be migrating; one clear error
+        // is the honest answer for a one-off operator command.
+        Cas::Conflict => bail!(
+            "{ENCRYPTION_META_KEY} changed while migrating it (another process wrote it). \
+             Nothing was written by this attempt; re-run once the bucket is quiet."
+        ),
+    }
 }
 
 /// A brand-new config: fresh salt, fresh data key, wrapped and authenticated.

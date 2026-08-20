@@ -69,6 +69,22 @@ pub(crate) fn derive(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<Zeroizin
     Ok(key_bytes)
 }
 
+/// Re-derives the key material a bucket bootstrapped **before**
+/// [`KDF_VERSION`] `1` used: `Argon2::default()` — 19 MiB / t=2 / p=1, the
+/// crate's parameters at the time — over that bucket's stored salt.
+///
+/// Exists for exactly one caller, `s3db::bootstrap`'s migration of a bucket
+/// whose data key was derived straight from the passphrase, and which
+/// therefore has to reproduce that key byte-for-byte to wrap it. Nothing
+/// derives new keys this way: [`derive`] is what every live path uses.
+pub(crate) fn derive_legacy_v0(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    let mut key_bytes = Zeroizing::new([0u8; KEY_LEN]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, key_bytes.as_mut())
+        .map_err(|e| anyhow::anyhow!("deriving the pre-{KDF_VERSION} encryption key: {e}"))?;
+    Ok(key_bytes)
+}
+
 /// A fresh random 32-byte key, for a caller that wants a key nobody derived
 /// from a passphrase — the data key in a wrap-a-data-key-under-the-
 /// passphrase-key scheme (see `s3db::bootstrap`). Wiped on drop, same as
