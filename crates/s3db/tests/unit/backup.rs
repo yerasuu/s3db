@@ -118,9 +118,32 @@ async fn backup_reencrypts_under_a_different_destination_key() {
     // The destination backend's own manifest is only readable under
     // dest_cipher -- proves this was a real re-encryption, not a raw
     // ciphertext copy.
-    let (manifest, etag) = get_json::<BackupManifest>(&dest_backend, &manifest_key("backup1", "widgets"), &dest_cipher)
-        .await
-        .unwrap();
+    let (manifest, etag) = get_json::<BackupManifest>(
+        &dest_backend,
+        &manifest_key("backup1", "widgets").unwrap(),
+        &dest_cipher,
+    )
+    .await
+    .unwrap();
     assert!(etag.is_some());
     assert_eq!(manifest.entity_count, 1);
+}
+
+#[tokio::test]
+async fn a_backup_id_that_would_escape_its_namespace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 47);
+    let coll = Collection::new("widgets");
+
+    // Without the check these don't produce an odd-looking backup: they
+    // write under `.conf/` and into live data's own namespace.
+    for bad in ["../repos", "a/b", ".hidden", "", "with\nnewline"] {
+        let err = backup_collection(&backend, &cipher, &backend, &cipher, &coll, bad, true)
+            .await
+            .expect_err("a backup id that escapes its namespace should be refused");
+        assert!(
+            err.to_string().contains("backup id"),
+            "unexpected error for {bad:?}: {err}"
+        );
+    }
 }
