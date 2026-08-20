@@ -162,6 +162,19 @@ async fn get(backend: &Arc<dyn Backend>, operands: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    // A large object (a release asset, a pack) is sealed chunk by chunk by
+    // `seal_stream`, a different on-disk format from the one `open` reads.
+    // Without this the tool reports it as a decrypt failure, which reads
+    // exactly like corruption or a wrong passphrase -- and sends whoever is
+    // mid-incident chasing the wrong thing.
+    if s3db::Cipher::is_stream_sealed(&sealed) {
+        bail!(
+            "{key} is stream-sealed ({} bytes): a large object written chunk by chunk, \
+             not the single-blob format this command decrypts. It is not corrupt.",
+            sealed.len()
+        );
+    }
+
     let cipher = cipher_for(backend).await?;
     let plain = cipher.open(key, &sealed).with_context(|| format!("decrypting {key}"))?;
     match rmp_serde::from_slice::<serde_json::Value>(&plain) {
