@@ -83,8 +83,12 @@ impl S3Backend {
         allow_insecure_http: bool,
     ) -> Result<Self> {
         if let Some(endpoint) = endpoint_url {
+            // Case-insensitive: a URL scheme is defined case-insensitively,
+            // and `HTTP://host` reaches the same cleartext endpoint while
+            // sailing past a `starts_with("http://")` check.
+            let is_plain_http = endpoint.len() >= 7 && endpoint[..7].eq_ignore_ascii_case("http://");
             anyhow::ensure!(
-                allow_insecure_http || !endpoint.starts_with("http://"),
+                allow_insecure_http || !is_plain_http,
                 "S3 endpoint_url {endpoint:?} is plain http:// -- credentials and object bodies \
                  would ride cleartext. Use https://, or set allow_insecure_http = true to opt in \
                  (e.g. a local MinIO/dev endpoint with no TLS in front of it)."
@@ -476,3 +480,7 @@ fn tag_if<T>(permanent: bool, result: Result<T>) -> Result<T> {
 fn raw_status<E>(err: &SdkError<E, HttpResponse>) -> Option<u16> {
     err.raw_response().map(|r| r.status().as_u16())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/s3.rs"]
+mod tests;
