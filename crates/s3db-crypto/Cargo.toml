@@ -1,10 +1,10 @@
 [package]
 name = "s3db-crypto"
-version = "0.4.3"
-edition = "2024"
-rust-version = "1.97"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Pure AEAD encryption primitive (XChaCha20Poly1305 + Argon2id + optional zstd) behind s3db's mandatory encryption-at-rest, usable standalone"
-license = "AGPL-3.0-or-later"
+license.workspace = true
 
 [dependencies]
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }

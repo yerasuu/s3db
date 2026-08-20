@@ -1,3 +1,19 @@
 [workspace]
 members = ["crates/s3db", "crates/s3db-crypto", "crates/s3db-macros"]
 resolver = "2"
+
+# Everything the three members hold in common. Cargo can't read any of it
+# from a file of its own -- manifests have no include -- so this table is
+# the one place each of these lives, and every crate inherits it with
+# `.workspace = true`. Version in particular: these three ship as one unit
+# (`s3db` re-exports `s3db-crypto`'s types and depends on `s3db-macros` by
+# path), so a release where they disagree is a release nobody asked for --
+# and bumping three files by hand is three chances to forget one.
+# `description` stays per-crate, being the field that genuinely differs.
+[workspace.package]
+version = "0.4.3"
+edition = "2024"
+# Raising this is a breaking change for anyone building from source, so it
+# moves deliberately and all at once -- never one crate at a time.
+rust-version = "1.97"
+license = "AGPL-3.0-or-later"

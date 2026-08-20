@@ -1,10 +1,10 @@
 [package]
 name = "s3db"
-version = "0.4.3"
-edition = "2024"
-rust-version = "1.97"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Typed, encrypted, CAS-consistent database over S3-compatible object storage"
-license = "AGPL-3.0-or-later"
+license.workspace = true
 
 [features]
 default = []
