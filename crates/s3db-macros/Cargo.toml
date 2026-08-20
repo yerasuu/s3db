@@ -1,6 +1,6 @@
 [package]
 name = "s3db-macros"
-version = "0.4.0"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Derive macro for s3db: annotate a struct with #[entity(...)] to generate its Collection/SecondaryIndex boilerplate"
