@@ -309,7 +309,7 @@ impl Collection {
                 // exactly the write that most needs its predecessor kept.
                 // `Self::delete` already archived this way; this now matches it.
                 let plaintext = cipher.open(&key, &sealed)?;
-                let history_key = format!("{}/{etag}.json", self.history_prefix(name)?);
+                let history_key = self.history_key(name, etag)?;
                 let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None)?;
                 // Idempotent: the same etag always archives the same content,
                 // so `Cas::Conflict` here just means someone else already
@@ -361,7 +361,22 @@ impl Collection {
         Ok(etag.map(|_| record.created_at_ms))
     }
 
+    /// One archived version's key under `name`'s history namespace.
+    ///
+    /// `etag` is the one interpolated value here that comes from neither a
+    /// caller nor this crate: it is whatever the backend answered with (an
+    /// S3 `ETag` header, the local driver's counter), so it gets the same
+    /// segment check every other name gets before landing in a key. A
+    /// provider answering with a weak validator (`W/"abc"`) or anything
+    /// else carrying a `/` would otherwise relocate the archive out of this
+    /// collection's history namespace instead of failing.
+    fn history_key(&self, name: &str, etag: &str) -> Result<String> {
+        crate::naming::validate_segment(etag, "etag")?;
+        Ok(format!("{}/{etag}.json", self.history_prefix(name)?))
+    }
+
     fn history_timestamp_key(&self, name: &str, etag: &str) -> Result<String> {
+        crate::naming::validate_segment(etag, "etag")?;
         Ok(format!("{}/{etag}.meta.json", self.history_prefix(name)?))
     }
 
@@ -515,7 +530,7 @@ impl Collection {
                 return Ok(None);
             }
         };
-        let history_key = format!("{}/{etag}.json", self.history_prefix(name)?);
+        let history_key = self.history_key(name, etag)?;
         let resealed = cipher.seal(&history_key, &plaintext, CompressionStrategy::None)?;
         // Create-only, but idempotent in practice: the same etag always
         // archives the same content, so a `Cas::Conflict` here just means
@@ -656,7 +671,7 @@ impl Collection {
     /// companion timestamp -- for a maintenance sweep pruning old
     /// versions. Never touches `name`'s live object.
     pub async fn forget_history_version(&self, backend: &dyn Backend, name: &str, version: &str) -> Result<()> {
-        delete_object(backend, &format!("{}/{version}.json", self.history_prefix(name)?)).await;
+        delete_object(backend, &self.history_key(name, version)?).await;
         delete_object(backend, &self.history_timestamp_key(name, version)?).await;
         Ok(())
     }
@@ -814,8 +829,7 @@ impl Collection {
         name: &str,
         etag: &str,
     ) -> Result<Option<T>> {
-        let (value, found_etag) =
-            get_json::<T>(backend, &format!("{}/{etag}.json", self.history_prefix(name)?), cipher).await?;
+        let (value, found_etag) = get_json::<T>(backend, &self.history_key(name, etag)?, cipher).await?;
         Ok(found_etag.is_some().then_some(value))
     }
 
