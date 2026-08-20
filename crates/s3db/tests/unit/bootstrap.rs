@@ -268,3 +268,99 @@ async fn open_cipher_opens_a_bootstrapped_bucket_and_rejects_a_wrong_passphrase(
         "a wrong passphrase must fail here, not deeper in the app"
     );
 }
+
+/// Writes the exact `.conf/encryption.json` a pre-wrapping bucket had —
+/// salt + verifier, no wrapped key, no tag — with an object sealed under
+/// the key that format derived straight from the passphrase.
+async fn seed_legacy_bucket(backend: &dyn Backend, passphrase: &str) -> ([u8; SALT_LEN], Cipher) {
+    let salt = [3u8; SALT_LEN];
+    let legacy_key = Cipher::legacy_key_v0(passphrase, &salt).unwrap();
+    let data_cipher = Cipher::from_key(&legacy_key, CipherAlgorithm::default());
+    let legacy = serde_json::json!({
+        "salt": BASE64.encode(salt),
+        "verifier": BASE64.encode(
+            data_cipher
+                .seal(VERIFIER_AAD, VERIFIER_PLAINTEXT, CompressionStrategy::None)
+                .unwrap(),
+        ),
+    });
+    backend
+        .put_cas(ENCRYPTION_META_KEY, serde_json::to_vec(&legacy).unwrap(), None)
+        .await
+        .unwrap();
+    (salt, data_cipher)
+}
+
+#[tokio::test]
+async fn migrating_a_legacy_bucket_keeps_every_object_readable() {
+    let (_dir, backend) = temp_backend();
+    let (_salt, legacy_cipher) = seed_legacy_bucket(&backend, "hunter2").await;
+
+    // An object sealed the way that bucket's live data was.
+    let sealed = legacy_cipher
+        .seal("repos/acme/thing", b"payload", CompressionStrategy::None)
+        .unwrap();
+    backend.put_cas("repos/acme/thing", sealed, None).await.unwrap();
+
+    // Before: today's code refuses the bucket outright.
+    assert!(open_cipher(&backend, "hunter2").await.is_err());
+
+    assert_eq!(
+        migrate_unwrapped_meta(&backend, "hunter2", CipherAlgorithm::default())
+            .await
+            .unwrap(),
+        MigrationOutcome::Migrated
+    );
+
+    // After: it opens, and the key is the same one the old object was
+    // sealed under -- which is the whole point of wrapping the legacy key
+    // instead of minting a new one.
+    let cipher = open_cipher(&backend, "hunter2").await.unwrap();
+    let (stored, _etag) = backend.get("repos/acme/thing").await.unwrap();
+    assert_eq!(cipher.open("repos/acme/thing", &stored).unwrap(), b"payload");
+}
+
+#[tokio::test]
+async fn migrating_is_idempotent_and_leaves_a_wrapped_bucket_alone() {
+    let (_dir, backend) = temp_backend();
+    seed_legacy_bucket(&backend, "hunter2").await;
+
+    migrate_unwrapped_meta(&backend, "hunter2", CipherAlgorithm::default())
+        .await
+        .unwrap();
+    let (after_first, _) = get_json_plain::<EncryptionMeta>(&backend, ENCRYPTION_META_KEY)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        migrate_unwrapped_meta(&backend, "hunter2", CipherAlgorithm::default())
+            .await
+            .unwrap(),
+        MigrationOutcome::AlreadyWrapped
+    );
+    let (after_second, _) = get_json_plain::<EncryptionMeta>(&backend, ENCRYPTION_META_KEY)
+        .await
+        .unwrap();
+    assert_eq!(after_first.wrapped_key, after_second.wrapped_key);
+    assert_eq!(after_first.mac, after_second.mac);
+}
+
+#[tokio::test]
+async fn a_wrong_passphrase_migrates_nothing() {
+    let (_dir, backend) = temp_backend();
+    seed_legacy_bucket(&backend, "hunter2").await;
+    let (before, _) = get_json_plain::<EncryptionMeta>(&backend, ENCRYPTION_META_KEY)
+        .await
+        .unwrap();
+
+    let err = migrate_unwrapped_meta(&backend, "not-the-passphrase", CipherAlgorithm::default())
+        .await
+        .expect_err("a wrong passphrase must not rewrite the config");
+    assert!(err.to_string().contains("verifier"), "{err}");
+
+    let (after, _) = get_json_plain::<EncryptionMeta>(&backend, ENCRYPTION_META_KEY)
+        .await
+        .unwrap();
+    assert_eq!(before.salt, after.salt);
+    assert!(after.wrapped_key.is_empty());
+}

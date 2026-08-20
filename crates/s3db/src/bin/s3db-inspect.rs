@@ -5,7 +5,8 @@
 //! equivalent of opening a `psql` shell. A caller migrating off a relational
 //! database gives that up on the day of the cutover; this gives it back.
 //!
-//! Read-only apart from `rm`, which needs `--yes`. In particular it opens the
+//! Read-only apart from `rm` and `migrate-bootstrap`, both of which need
+//! `--apply`/`--yes` and neither of which touches an object's contents. In particular it opens the
 //! bucket's cipher with [`s3db::bootstrap::open_cipher`], never
 //! `get_or_create_cipher`: a mistyped path must fail, not become a freshly
 //! initialized empty bucket whose encryption config was written by a command
@@ -29,6 +30,10 @@ commands:
   schema <collection>     a Collection's migration bookkeeping
   verify <prefix>         try to decrypt everything under a prefix, report what fails
   rm <key> --yes          delete one object
+  migrate-bootstrap [--apply]
+                          rewrap a bucket bootstrapped before the data key was
+                          wrapped: same key, no object re-encrypted. Prints the
+                          current config (keep a copy) unless --apply is given
 
 backend:
   --local <dir>           the local `files` driver over a directory
@@ -57,6 +62,7 @@ async fn main() -> Result<()> {
         "schema" => schema(&backend, operands).await,
         "verify" => verify(&backend, operands).await,
         "rm" => rm(&backend, operands).await,
+        "migrate-bootstrap" => migrate_bootstrap(&backend, operands).await,
         "--help" | "-h" | "help" => {
             println!("{USAGE}");
             Ok(())
@@ -283,4 +289,48 @@ fn hex_dump(bytes: &[u8]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Rewrites a pre-wrapping `.conf/encryption.json` in place — see
+/// [`s3db::bootstrap::migrate_unwrapped_meta`] for why this re-derives and
+/// wraps the *existing* data key rather than minting a new one, and so
+/// leaves every object in the bucket untouched.
+///
+/// Without `--apply` this only prints the config as it stands, which is the
+/// copy an operator should keep before running the real thing: the write is
+/// CAS-guarded but not undoable.
+async fn migrate_bootstrap(backend: &Arc<dyn Backend>, operands: &[String]) -> Result<()> {
+    let apply = operands.iter().any(|a| a == "--apply");
+    let passphrase = std::env::var("S3DB_PASSPHRASE")
+        .context("S3DB_PASSPHRASE is not set (it is read from the environment, never from an argument)")?;
+
+    let (current, etag) = backend.get(s3db::bootstrap::ENCRYPTION_META_KEY).await?;
+    if etag.is_none() {
+        bail!(
+            "{} doesn't exist: this bucket was never bootstrapped",
+            s3db::bootstrap::ENCRYPTION_META_KEY
+        );
+    }
+    if !apply {
+        println!("{}", String::from_utf8_lossy(&current));
+        println!(
+            "\n(dry run -- keep the JSON above, then re-run with --apply. \
+             Objects are not re-encrypted either way.)"
+        );
+        return Ok(());
+    }
+
+    match s3db::bootstrap::migrate_unwrapped_meta(backend.as_ref(), &passphrase, Default::default()).await? {
+        s3db::bootstrap::MigrationOutcome::AlreadyWrapped => {
+            println!("already wrapped -- nothing written");
+        }
+        s3db::bootstrap::MigrationOutcome::Migrated => {
+            println!(
+                "{} rewritten: same data key, now wrapped and authenticated. \
+                 Every object stays readable.",
+                s3db::bootstrap::ENCRYPTION_META_KEY
+            );
+        }
+    }
+    Ok(())
 }
