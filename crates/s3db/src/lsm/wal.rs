@@ -13,13 +13,26 @@
 //! file would corrupt it, so exactly one process should own a given
 //! [`super::Table`] at a time.
 //!
-//! Format: a flat sequence of `[tag: u8][key_len: u32 LE][key][value_len:
-//! u32 LE][value]` records (`value_len`/`value` omitted for a delete tag).
-//! [`Wal::replay`] stops at the first record it can't fully parse rather
-//! than erroring -- the one way a crash can corrupt this file is a
-//! truncated write in progress at the moment of the crash, always at the
-//! very end, and stopping there recovers everything before it instead of
-//! losing the whole log over its last, incomplete record.
+//! Format: a flat sequence of `[frame_len: u32 LE][sealed frame]` frames.
+//! Each frame is one AEAD-sealed record, and the record inside it is
+//! `[tag: u8][key_len: u32 LE][key][value_len: u32 LE][value]`
+//! (`value_len`/`value` omitted for a delete tag).
+//!
+//! Sealed, not raw: this file holds every acknowledged write until the next
+//! flush, so writing it in the clear would put the same rows on local disk
+//! that the bucket only ever sees encrypted -- and a `.rotating` leftover
+//! from a crashed flush can sit there indefinitely. The AAD binds the
+//! table's own root prefix, so a WAL file moved to another table's path
+//! fails to open rather than replaying someone else's rows.
+//!
+//! [`Wal::replay`] stops at the first *incomplete* frame rather than
+//! erroring -- the one way a crash can corrupt this file is a truncated
+//! write in progress at the moment of the crash, always at the very end,
+//! and stopping there recovers everything before it instead of losing the
+//! whole log over its last, incomplete record. A frame that is complete but
+//! doesn't open is a different thing entirely (a WAL from another table, a
+//! different key, or tampering) and is a hard error: silently continuing
+//! would drop acknowledged writes.
 //!
 //! [`Wal::rotate`] lets [`super::Table::flush`] hand off the current file to
 //! a sibling `<path>.rotating` name and keep appending new writes to a
@@ -33,7 +46,8 @@
 
 use super::LsmKey;
 use super::memtable::MemValue;
-use anyhow::{Context, Result};
+use crate::cipher::{Cipher, CompressionStrategy};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -103,9 +117,24 @@ pub async fn heal_rotating_wal(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ceiling on one frame's sealed length, so a corrupt or hostile length
+/// prefix can't make replay allocate before anything has been
+/// authenticated. Generous next to any real record: a memtable row that
+/// approached this would never have fit the flush threshold either.
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 pub struct Wal {
     path: PathBuf,
     file: fs::File,
+    cipher: Cipher,
+    /// What every frame's AEAD binds -- see this module's doc comment.
+    aad: String,
+}
+
+/// The AAD every frame of the WAL for the table rooted at `root` is sealed
+/// under. A free function so [`Wal::replay`] can build it without a `Wal`.
+pub fn wal_aad(root: &str) -> String {
+    format!("{root}\0lsm-wal")
 }
 
 impl Wal {
@@ -113,19 +142,29 @@ impl Wal {
     /// `path` for appending. Doesn't replay it -- see [`Self::replay`],
     /// called separately so [`super::Table::open`] can build its memtable
     /// from the result before this handle even exists.
-    pub async fn open(path: PathBuf) -> Result<Self> {
+    pub async fn open(path: PathBuf, cipher: Cipher, aad: String) -> Result<Self> {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .await
                 .with_context(|| format!("creating {}", dir.display()))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // Owner-only: the frames are sealed, but the file's existence and
+        // size still describe this table's write activity, and there is no
+        // reason for any other account on the machine to read it.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
             .open(&path)
             .await
             .with_context(|| format!("opening WAL {}", path.display()))?;
-        Ok(Wal { path, file })
+        Ok(Wal {
+            path,
+            file,
+            cipher,
+            aad,
+        })
     }
 
     pub async fn append_put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -147,8 +186,22 @@ impl Wal {
     }
 
     async fn append_record(&mut self, record: &[u8]) -> Result<()> {
+        let sealed = self
+            .cipher
+            .seal(&self.aad, record, CompressionStrategy::None)
+            .with_context(|| format!("sealing a WAL record for {}", self.path.display()))?;
+        if sealed.len() > MAX_FRAME_LEN {
+            bail!(
+                "WAL record for {} is {} bytes sealed, over the {MAX_FRAME_LEN}-byte frame ceiling",
+                self.path.display(),
+                sealed.len()
+            );
+        }
+        let mut frame = Vec::with_capacity(4 + sealed.len());
+        frame.extend_from_slice(&(sealed.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&sealed);
         self.file
-            .write_all(record)
+            .write_all(&frame)
             .await
             .with_context(|| format!("appending to WAL {}", self.path.display()))?;
         // Durability before this call returns is the entire point of a
@@ -193,7 +246,7 @@ impl Wal {
     /// Replays `path` into an ordered map of the state it describes — a
     /// missing file (nothing was ever written, or a prior `reset` already
     /// cleared it) replays to empty, not an error.
-    pub async fn replay(path: &Path) -> Result<BTreeMap<LsmKey, MemValue>> {
+    pub async fn replay(path: &Path, cipher: &Cipher, aad: &str) -> Result<BTreeMap<LsmKey, MemValue>> {
         let bytes = match fs::read(path).await {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(BTreeMap::new()),
@@ -202,19 +255,54 @@ impl Wal {
         let mut out = BTreeMap::new();
         let mut pos = 0usize;
         while pos < bytes.len() {
-            match parse_record(&bytes[pos..]) {
-                Some((consumed, key, value)) => {
+            let Some(frame) = next_frame(&bytes[pos..]) else {
+                // Incomplete trailing frame: the crash case, see the module
+                // doc. Everything before it is already recovered.
+                break;
+            };
+            let record = cipher.open(aad, frame.sealed).with_context(|| {
+                format!(
+                    "WAL {} has a frame this table's key can't open -- a log from another table, \
+                     a different encryption key, or tampering. Refusing to replay past it rather \
+                     than silently dropping acknowledged writes.",
+                    path.display()
+                )
+            })?;
+            pos += frame.consumed;
+            match parse_record(&record) {
+                Some((_consumed, key, value)) => {
                     out.insert(key, value);
-                    pos += consumed;
                 }
-                // Truncated (or, in principle, corrupted) trailing bytes --
-                // per the module doc, stop here rather than fail the whole
-                // replay over a write that was never fully durable anyway.
-                None => break,
+                // A frame that opened but doesn't parse can't come from a
+                // partial write (the AEAD tag covers the whole record), so
+                // this is a real inconsistency rather than the crash case.
+                None => bail!("WAL {} holds a sealed frame that isn't a valid record", path.display()),
             }
         }
         Ok(out)
     }
+}
+
+/// One complete frame at the start of `buf`.
+struct Frame<'a> {
+    sealed: &'a [u8],
+    consumed: usize,
+}
+
+/// Reads the frame at the start of `buf` — `None` when `buf` doesn't hold
+/// a complete one (the truncated-tail case [`Wal::replay`] tolerates). The
+/// declared length is bounded before any slice is taken: it is the one
+/// number here that is read before anything is authenticated.
+fn next_frame(buf: &[u8]) -> Option<Frame<'_>> {
+    let len = u32::from_le_bytes(buf.get(0..4)?.try_into().ok()?) as usize;
+    if len == 0 || len > MAX_FRAME_LEN {
+        return None;
+    }
+    let sealed = buf.get(4..4 + len)?;
+    Some(Frame {
+        sealed,
+        consumed: 4 + len,
+    })
 }
 
 /// Parses one record from the start of `buf`, returning `(bytes consumed,

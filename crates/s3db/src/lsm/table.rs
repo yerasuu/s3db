@@ -8,6 +8,7 @@
 //! object.
 
 use super::compactor::{self, CompactionReport};
+use super::lease::WriterLease;
 use super::manifest::{self, ManifestEntry};
 use super::memtable::MemValue;
 use super::value::{Schema, Value};
@@ -58,6 +59,15 @@ pub struct TableConfig {
     /// exist under it, any more than there's one for retroactively
     /// re-encoding old blocks.
     pub schema: Option<Schema>,
+    /// The writer lease this table holds, if the caller took one.
+    ///
+    /// `None` (the default) keeps the historical behaviour: this process
+    /// writes, and nothing checks whether another one is doing the same. That
+    /// is safe for a single-process deployment and silently corrupting for any
+    /// other — see [`super::lease`] for what two writers actually do to a
+    /// table's history, and why the answer is a lease rather than a
+    /// coordination protocol.
+    pub lease: Option<WriterLease>,
 }
 
 impl TableConfig {
@@ -70,6 +80,7 @@ impl TableConfig {
             flush_threshold_bytes: DEFAULT_FLUSH_THRESHOLD_BYTES,
             rows_per_block: DEFAULT_ROWS_PER_BLOCK,
             schema: None,
+            lease: None,
         }
     }
 
@@ -85,6 +96,16 @@ impl TableConfig {
 
     pub fn with_schema(mut self, schema: Schema) -> Self {
         self.schema = Some(schema);
+        self
+    }
+
+    /// Gates this table's writes on a [`WriterLease`] — see
+    /// [`super::lease`]. The caller still has to renew it
+    /// ([`Table::renew_lease`]); a lease that stops being renewed makes this
+    /// table refuse writes rather than keep them coming from a process another
+    /// one has taken over from.
+    pub fn with_writer_lease(mut self, lease: WriterLease) -> Self {
+        self.lease = Some(lease);
         self
     }
 }
@@ -103,7 +124,10 @@ pub struct FlushedSSTable {
 }
 
 struct State {
-    wal: Wal,
+    /// `None` in a read-only table: there is nothing to log, and creating a
+    /// WAL file in a reader would be the first step towards it accidentally
+    /// becoming a second writer.
+    wal: Option<Wal>,
     memtable: Memtable,
 }
 
@@ -115,6 +139,26 @@ pub struct Table {
     rows_per_block: usize,
     schema: Option<Schema>,
     state: Mutex<State>,
+    /// Set by [`Table::open_read_only`]. Every write path checks it.
+    read_only: bool,
+    /// Behind a `Mutex` rather than plain, so [`Table::release_lease`] and
+    /// [`Table::renew_lease`] can move the lease through a `&self` — which is
+    /// how every other method here is called.
+    lease: Mutex<LeaseState>,
+}
+
+/// This handle's relationship to a [`WriterLease`].
+///
+/// `Unleased` and `Released` are deliberately different states, not one
+/// `Option::None`: the first means nobody ever asked for a lease, so writes go
+/// unguarded exactly as they always did, and the second means this handle gave
+/// up the right to write. Collapsing them would make `release_lease` *restore*
+/// permission instead of revoking it.
+#[derive(Debug)]
+enum LeaseState {
+    Unleased,
+    Held(WriterLease),
+    Released,
 }
 
 impl Table {
@@ -126,8 +170,11 @@ impl Table {
     /// replaying, so that gets recovered too, not just plain writes.
     pub async fn open(config: TableConfig) -> Result<Self> {
         super::wal::heal_rotating_wal(&config.wal_path).await?;
-        let recovered = Wal::replay(&config.wal_path).await?;
-        let wal = Wal::open(config.wal_path).await?;
+        // Every WAL frame is sealed under this table's own key — see
+        // `super::wal`'s module doc for why the log can't sit in the clear.
+        let aad = super::wal::wal_aad(&config.root);
+        let recovered = Wal::replay(&config.wal_path, &config.cipher, &aad).await?;
+        let wal = Wal::open(config.wal_path, config.cipher.clone(), aad).await?;
         let mut memtable = Memtable::default();
         for (key, value) in recovered {
             match value {
@@ -142,23 +189,131 @@ impl Table {
             flush_threshold_bytes: config.flush_threshold_bytes,
             rows_per_block: config.rows_per_block,
             schema: config.schema,
-            state: Mutex::new(State { wal, memtable }),
+            state: Mutex::new(State {
+                wal: Some(wal),
+                memtable,
+            }),
+            read_only: false,
+            lease: Mutex::new(match config.lease {
+                Some(lease) => LeaseState::Held(lease),
+                None => LeaseState::Unleased,
+            }),
         })
+    }
+
+    /// Opens the table for reading only: no WAL is created or replayed, the
+    /// memtable stays empty, and every write path refuses.
+    ///
+    /// This is how a process that isn't the writer reads an LSM table. Opening
+    /// it with [`Self::open`] instead would create a WAL, accept writes, and
+    /// eventually flush them — becoming exactly the second writer that
+    /// [`super::lease`] exists to prevent, only without having asked anyone.
+    ///
+    /// A reader sees everything flushed and nothing that isn't, so how stale it
+    /// can be is decided entirely by how often the writer flushes — see
+    /// [`super::LsmMaintenanceConfig::flush_even_if_small`].
+    pub async fn open_read_only(config: TableConfig) -> Result<Self> {
+        Ok(Table {
+            backend: config.backend,
+            cipher: config.cipher,
+            root: config.root,
+            flush_threshold_bytes: config.flush_threshold_bytes,
+            rows_per_block: config.rows_per_block,
+            schema: config.schema,
+            state: Mutex::new(State {
+                wal: None,
+                memtable: Memtable::default(),
+            }),
+            read_only: true,
+            lease: Mutex::new(LeaseState::Unleased),
+        })
+    }
+
+    /// `true` if this handle refuses writes.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Errors unless this handle may write: it isn't read-only, and its lease
+    /// (if it has one) still looks valid by the local clock.
+    ///
+    /// The lease check is deliberately local — asking the bucket whether the
+    /// lease still holds, on every write, would cost exactly the round trip
+    /// that acking into a local WAL exists to avoid. See [`super::lease`] on
+    /// why that makes this a guard against the accidental second writer rather
+    /// than a fence.
+    async fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            anyhow::bail!("{}: this table was opened read-only", self.root);
+        }
+        match &*self.lease.lock().await {
+            LeaseState::Unleased => Ok(()),
+            LeaseState::Held(lease) if lease.looks_valid() => Ok(()),
+            LeaseState::Held(lease) => anyhow::bail!(
+                "{}: writer lease held by {:?} has expired locally -- renew it before writing again",
+                self.root,
+                lease.holder_id()
+            ),
+            LeaseState::Released => anyhow::bail!(
+                "{}: this handle released its writer lease and may no longer write",
+                self.root
+            ),
+        }
+    }
+
+    /// Extends this table's writer lease, if it has one. No-op otherwise, so a
+    /// caller's renewal timer doesn't have to know whether a lease is in play.
+    ///
+    /// Errors if the lease was taken over, which is the signal to stop writing:
+    /// another process now believes it owns this table.
+    pub async fn renew_lease(&self) -> Result<()> {
+        match &mut *self.lease.lock().await {
+            LeaseState::Held(lease) => lease.renew(self.backend.as_ref(), &self.cipher).await,
+            LeaseState::Unleased => Ok(()),
+            LeaseState::Released => {
+                anyhow::bail!(
+                    "{}: this handle released its writer lease, there is nothing to renew",
+                    self.root
+                )
+            }
+        }
+    }
+
+    /// Gives up this table's writer lease so the next writer doesn't have to
+    /// wait out its TTL. Writes are refused afterwards — the handle keeps its
+    /// data, it just no longer holds the right to publish it.
+    pub async fn release_lease(&self) {
+        let mut state = self.lease.lock().await;
+        if let LeaseState::Held(lease) = std::mem::replace(&mut *state, LeaseState::Released) {
+            lease.release(self.backend.as_ref(), &self.cipher).await;
+        }
+    }
+
+    /// Who currently holds this table's writer lease, per the bucket. `None`
+    /// if nobody does.
+    pub async fn lease_holder(&self) -> Result<Option<String>> {
+        Ok(WriterLease::current(self.backend.as_ref(), &self.cipher, &self.root)
+            .await?
+            .map(|record| record.holder_id))
     }
 
     /// Acks once the WAL append is durable on local disk — no request to
     /// `backend` on this path at all, which is the entire reason a WAL
     /// exists here (see the module doc).
     pub async fn put(&self, key: LsmKey, value: Vec<u8>) -> Result<()> {
+        self.ensure_writable().await?;
         let mut state = self.state.lock().await;
-        state.wal.append_put(&key, &value).await?;
+        let wal = state.wal.as_mut().expect("a writable table always has a WAL");
+        wal.append_put(&key, &value).await?;
         state.memtable.put(key, value);
         Ok(())
     }
 
     pub async fn delete(&self, key: LsmKey) -> Result<()> {
+        self.ensure_writable().await?;
         let mut state = self.state.lock().await;
-        state.wal.append_delete(&key).await?;
+        let wal = state.wal.as_mut().expect("a writable table always has a WAL");
+        wal.append_delete(&key).await?;
         state.memtable.delete(key);
         Ok(())
     }
@@ -443,13 +598,19 @@ impl Table {
     /// restart, so `get`/`scan` would silently stop seeing them for as long
     /// as the process keeps running.
     pub async fn flush(&self) -> Result<Option<FlushedSSTable>> {
+        self.ensure_writable().await?;
         let (drained, rotating_path) = {
             let mut state = self.state.lock().await;
             if state.memtable.is_empty() {
                 return Ok(None);
             }
             let drained = state.memtable.drain_sorted();
-            let rotating_path = state.wal.rotate().await?;
+            let rotating_path = state
+                .wal
+                .as_mut()
+                .expect("a writable table always has a WAL")
+                .rotate()
+                .await?;
             (drained, rotating_path)
         };
 
@@ -533,10 +694,15 @@ impl Table {
     ) -> Result<Option<FlushedSSTable>> {
         let mut state = self.state.lock().await;
         let restored = state.memtable.merge_older(drained);
+        let Some(wal) = state.wal.as_mut() else {
+            // Only a writable table ever gets here (`flush` refuses on a
+            // read-only one), so there is nothing to restore into.
+            return Err(err);
+        };
         for (key, value) in &restored {
             let appended = match value {
-                MemValue::Put(bytes) => state.wal.append_put(key, bytes).await,
-                MemValue::Tombstone => state.wal.append_delete(key).await,
+                MemValue::Put(bytes) => wal.append_put(key, bytes).await,
+                MemValue::Tombstone => wal.append_delete(key).await,
             };
             if appended.is_err() {
                 // Couldn't re-persist to the new WAL generation -- leave
@@ -570,6 +736,7 @@ impl Table {
     /// run from a separate maintenance process that never writes through
     /// this `Table` handle at all.
     pub async fn compact(&self) -> Result<CompactionReport> {
+        self.ensure_writable().await?;
         compactor::compact(
             self.backend.as_ref(),
             &self.cipher,

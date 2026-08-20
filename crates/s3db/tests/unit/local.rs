@@ -286,3 +286,39 @@ async fn a_cursor_survives_the_deletion_of_the_key_it_names() {
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_local_bucket_keeps_its_directories_and_locks_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("bucket");
+    let backend = LocalBackend::new(&LocalParams {
+        bucket: root.to_string_lossy().to_string(),
+        engine: LocalEngine::Files,
+    });
+    backend
+        .put_cas("repos/acme/secret-thing", b"x".to_vec(), None)
+        .await
+        .unwrap();
+
+    // Key names describe what a deployment holds; the default 0755 hands
+    // that map to every account on the machine.
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+            .permissions()
+            .mode()
+    };
+    for created in [root.join("repos"), root.join("repos/acme")] {
+        assert_eq!(
+            mode(&created) & 0o077,
+            0,
+            "{} is group/world readable",
+            created.display()
+        );
+    }
+    let lock = root.join("repos/acme/secret-thing.s3dblock");
+    assert_eq!(mode(&lock) & 0o077, 0, "the lock sidecar is group/world readable");
+}

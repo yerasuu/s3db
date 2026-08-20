@@ -45,11 +45,13 @@ pub mod payload;
 pub mod range;
 pub mod request_cache;
 pub mod resilience;
+mod serde_duration;
 mod shard;
 pub mod sharded_index;
 pub mod snapshot;
 pub mod ttl;
 pub mod txn;
+pub mod txn_update;
 pub mod wal;
 
 mod azure;
@@ -91,6 +93,7 @@ pub use resilience::{
 pub use sharded_index::{ShardEpoch, ShardedIndex};
 pub use snapshot::{ReadSnapshot, SnapshotLease};
 pub use ttl::{ExpiryAt, ExpiryConfig, ExpiryReport};
+pub use txn_update::{UpdateOp, UpdateReport, recover_stale_updates, run_update};
 
 /// ORM-style shortcut: `#[derive(Entity)]` generates the `Collection`/
 /// `SecondaryIndex` boilerplate a hand-written entity would otherwise repeat

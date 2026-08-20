@@ -41,8 +41,32 @@ Five drivers, selected via `BackendConfig` (a `#[serde(tag = "driver")]` enum) a
 
 ```rust
 let cfg: BackendConfig = toml::from_str(&config_text)?; // { driver = "s3", bucket = "...", ... }
-let backend: Arc<dyn Backend> = build_backend(&cfg);
+let backend: Arc<dyn Backend> = build_backend(&cfg)?;
 ```
+
+Every tuning type is loadable from that same file: `ResilienceConfig` (and its nested `CircuitBreakerConfig`/`CacheConfig`), `GcConfig`, `ExpiryConfig`, `LsmMaintenanceConfig`, `MemoryBudget`, plus `EncryptionMode`/`CipherAlgorithm`/`CompressionStrategy`. Each carries a container-level `#[serde(default)]`, so a config file spells out only what it changes and everything else comes from `Default`. `Duration` fields are **milliseconds** — serde's own `Duration` is a `{ secs, nanos }` struct, which is unwritable by hand for what are all timeouts, ages and backoffs.
+
+```toml
+driver = "s3"
+bucket = "novels"
+access_key_id = "..."
+secret_access_key = "..."
+
+[encryption]
+mode = "enabled"          # "disabled" has to be spelled out; algorithm optional
+
+[resilience]
+max_concurrent_get = 128
+base_backoff = 250        # ms
+
+[resilience.cache]
+ttl = 5000                # ms
+
+[gc]
+history_max_age = 86400000
+```
+
+**A serialized config is secret material.** These types derive `Serialize`, and serializing one writes every credential in the clear — deliberately not papered over with `skip_serializing`, which would produce a config that can't authenticate. Give the file permissions to match.
 
 ## Encryption
 
@@ -301,6 +325,27 @@ The record holds the highest version applied, an audit trail of each migration, 
 
 Entries are rewritten under CAS, so a concurrent writer is never silently clobbered; it lands in `MigrationReport::conflicted` instead, and re-running picks those up. `Rewrite::Keep` skips an entry without a write. `migrate::baseline` adopts the mechanism on data that already predates it, and refuses to lower a recorded version.
 
+### Transactions that update, not only create
+
+`txn::run`'s create-only restriction is what makes it simple: when every write is a create, the object *is* its own lock. Updates remove that, because an `expected_etag` observed in one phase can move before the write that depends on it. `txn_update::run_update` closes the gap on the drivers with no native transaction:
+
+```rust
+let report = s3db::txn_update::run_update(backend, &cipher, vec![
+    UpdateOp::update(USERS.key("alice")?, &alice, &alice_etag)?,
+    UpdateOp::create(NAMESPACE_INDEX.key("acme")?, &reservation)?,   // creates mix in freely
+]).await?;
+if !report.applied { /* a key was locked, or an expected etag had moved — nothing was written */ }
+
+// at startup and periodically:
+s3db::txn_update::recover_stale_updates(backend, &cipher, Duration::from_secs(60)).await?;
+```
+
+Record `Preparing` → lock every key (create-only, so the lock object is its own mutex) → re-verify every expected etag, now that no other transaction can invalidate it → CAS the record to `Committed`, the point of no return → apply, release, delete. Ops are sorted by key so two overlapping transactions meet at their first shared key in the same order and one deterministically loses instead of each holding what the other needs.
+
+**Atomic against other transactions, not isolated against plain writes.** A `Collection::put` doesn't consult these locks — making every read and write in the crate check a lock object would double the cost of both, forever, for an operation most callers never use. So an unlocked writer can touch a key mid-transaction; since the alternative is a half-applied transaction, the transaction wins and names those keys in `UpdateReport::overwrote_unlocked`. **Liveness needs the sweep**: nothing steals a stale lock, because a lock whose owner already committed must not be taken by someone who would then race that owner's roll-forward. `recover_stale_updates` resolves the owner instead — rolling a `Preparing` record back, a `Committed` one *forward* (undoing a committed transaction is the one outcome the commit point exists to rule out) — and releases the locks as part of it.
+
+On `AtomicBackend` (`redb`) all of that is skipped for the native transaction, same as `txn::run`.
+
 ## Point-in-time reads (opt-in)
 
 `snapshot::ReadSnapshot` gives a best-effort, time-bounded view over a `Collection`'s `.history/` archive — **not** real MVCC, no cross-entity atomicity, same honesty `backup::BackupConsistency::FuzzySnapshot` already commits to for a full-bucket backup, just at single-entity scale:
@@ -361,6 +406,27 @@ let reports = scanner.run(backend, &cipher, &[&USERS, &GROUPS]).await?;  // per 
 ```
 
 `MaintenanceScanner` is narrower than a single-scan-many-conditions design might suggest: there's no schema-migration or key-rotation rescan in this crate to fuse in (see `maintenance`'s own module doc for why neither applies today), so what it actually consolidates is running `gc::sweep` over every registered collection from one call and one config, not fusing separate scans into a single read per object.
+
+### One writer, many readers
+
+A `Table` acks into a **local** WAL and holds rows in an **in-process** memtable. Both words are load-bearing: they are why a write is cheap, and why a second process writing the same table is not a supported configuration. Two writers do not merely see stale data — they corrupt history, because a row's age is decided by the order its SSTable was appended to the manifest. If A writes `k=1`, B later writes `k=2`, and A flushes second, A's older value wins permanently, and nothing in the format records when either row was written, so nothing downstream can resolve it.
+
+Making concurrent writers safe for real means a timestamp or sequence number on **every row**, carried through the WAL, the memtable, the SSTable blocks, and every merge in `Table::get`, `Table::scan` and the compactor — a change to the storage format, not a coordination layer on top. That is not implemented. What is, is making the supported topology explicit and enforced instead of documented and hoped for:
+
+```rust
+// the writer
+let lease = WriterLease::acquire(backend, &cipher, "rows", "worker-1", Duration::from_secs(30)).await?;
+let table = Table::open(TableConfig::new(..).with_writer_lease(lease)).await?;
+table.renew_lease().await?;     // from your own timer; errors if it was taken over
+table.release_lease().await;    // on shutdown, so the next writer needn't wait out the TTL
+
+// every other process
+let reader = Table::open_read_only(TableConfig::new(..)).await?;   // no WAL, writes refused
+```
+
+A second `acquire` is refused while the first lease is live; an unrenewed one is taken over after its TTL, which is how a crashed writer's table becomes writable again. `open_read_only` creates no WAL and refuses every write, so a reader can't drift into being an accidental second writer — which is what would happen if it used `open`, whose table would happily accept writes and eventually flush them. A reader sees everything flushed and nothing that isn't, so its staleness is bounded by the writer's flush interval (`flush_even_if_small`).
+
+**The lease is not a fence.** Between a lease expiring and its holder noticing, that holder can still write, and S3 cannot reject the write on the lease's behalf — a real fence needs the storage layer to check a token, meaning a CAS against the lease on every single write. So it prevents the failure that actually happens (two instances of a service started against the same table), and a taken-over lease should be read as "the old writer may still be finishing", never "the old writer is definitely gone".
 
 ### Driving an LSM table's maintenance
 

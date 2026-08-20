@@ -749,3 +749,24 @@ async fn put_versioned_archives_across_a_shape_change() {
         "and it must read back in its own shape"
     );
 }
+
+#[tokio::test]
+async fn an_etag_that_would_escape_the_history_namespace_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+
+    // An `ETag` is whatever the storage provider answered with -- a weak
+    // validator, or a hostile endpoint's own invention. It must not be able
+    // to steer where the archive object lands.
+    for bad in ["W/\"abc\"", "../../.conf/encryption", "a/b", ""] {
+        assert!(
+            coll.history_key("thing", bad).is_err(),
+            "etag {bad:?} should not be usable as a key segment"
+        );
+        assert!(coll.history_timestamp_key("thing", bad).is_err());
+    }
+    // A normal quoted S3 etag stays exactly as valid as it was.
+    assert!(coll.history_key("thing", "\"d41d8cd98f00b204\"").is_ok());
+    let _ = (&backend, &cipher);
+}

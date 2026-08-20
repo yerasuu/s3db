@@ -877,3 +877,154 @@ async fn flush_failure_does_not_clobber_a_write_that_landed_during_it() {
         "the write that landed during the failed flush must win over the value it restores"
     );
 }
+
+/// How a non-writer process reads an LSM table. Opening it with `open` instead
+/// would create a WAL, accept writes and eventually flush them, becoming the
+/// second writer the lease exists to prevent — without anyone having asked.
+#[tokio::test]
+async fn a_read_only_table_reads_flushed_rows_and_refuses_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = open_table(dir.path()).await;
+    writer.put(LsmKey::from(b"k".to_vec()), b"v".to_vec()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let reader_config = TableConfig::new(
+        test_backend(dir.path()),
+        test_cipher(),
+        "audit_log",
+        dir.path().join("reader.wal"),
+    );
+    let reader = Table::open_read_only(reader_config).await.unwrap();
+
+    assert!(reader.is_read_only());
+    assert_eq!(
+        reader.get(b"k").await.unwrap().as_deref(),
+        Some(b"v".as_slice()),
+        "a reader sees everything that was flushed"
+    );
+    assert!(
+        !dir.path().join("reader.wal").exists(),
+        "a read-only table must not create a WAL at all"
+    );
+
+    for result in [
+        reader.put(LsmKey::from(b"x".to_vec()), b"1".to_vec()).await,
+        reader.delete(LsmKey::from(b"k".to_vec())).await,
+        reader.flush().await.map(|_| ()),
+        reader.compact().await.map(|_| ()),
+    ] {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+}
+
+/// A reader sees flushed rows and nothing else, which is what bounds its
+/// staleness to the writer's flush interval.
+#[tokio::test]
+async fn a_read_only_table_does_not_see_unflushed_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = open_table(dir.path()).await;
+    writer.put(LsmKey::from(b"held".to_vec()), b"v".to_vec()).await.unwrap();
+
+    let reader = Table::open_read_only(TableConfig::new(
+        test_backend(dir.path()),
+        test_cipher(),
+        "audit_log",
+        dir.path().join("reader.wal"),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(reader.get(b"held").await.unwrap(), None, "not published yet");
+
+    writer.flush().await.unwrap();
+    assert_eq!(
+        reader.get(b"held").await.unwrap().as_deref(),
+        Some(b"v".as_slice()),
+        "and visible right after the flush"
+    );
+}
+
+#[tokio::test]
+async fn a_table_holding_a_lease_writes_normally_and_reports_its_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let lease = crate::lsm::WriterLease::acquire(
+        backend.as_ref(),
+        &test_cipher(),
+        "audit_log",
+        "writer-a",
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
+    let table = Table::open(
+        TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("t.wal")).with_writer_lease(lease),
+    )
+    .await
+    .unwrap();
+
+    table.put(LsmKey::from(b"k".to_vec()), b"v".to_vec()).await.unwrap();
+    table.flush().await.unwrap();
+    assert_eq!(table.get(b"k").await.unwrap().as_deref(), Some(b"v".as_slice()));
+    assert_eq!(table.lease_holder().await.unwrap().as_deref(), Some("writer-a"));
+
+    table.renew_lease().await.unwrap();
+    table.release_lease().await;
+    assert_eq!(table.lease_holder().await.unwrap(), None);
+
+    let err = table.put(LsmKey::from(b"x".to_vec()), b"1".to_vec()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("released its writer lease"),
+        "giving up the lease must revoke this handle's right to write, not restore it: {err}"
+    );
+    assert!(table.renew_lease().await.is_err(), "and there is nothing left to renew");
+}
+
+/// A lease that stopped being renewed makes this handle refuse writes, rather
+/// than keep them coming from a process another one has taken over from.
+#[tokio::test]
+async fn a_locally_expired_lease_stops_the_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = test_backend(dir.path());
+    let lease = crate::lsm::WriterLease::acquire(
+        backend.as_ref(),
+        &test_cipher(),
+        "audit_log",
+        "writer-a",
+        // Short enough to lapse during the test, long enough that a renewal
+        // then leaves comfortable room to write.
+        Duration::from_millis(200),
+    )
+    .await
+    .unwrap();
+    let table = Table::open(
+        TableConfig::new(backend, test_cipher(), "audit_log", dir.path().join("t.wal")).with_writer_lease(lease),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let err = table.put(LsmKey::from(b"k".to_vec()), b"v".to_vec()).await.unwrap_err();
+
+    assert!(err.to_string().contains("expired locally"), "{err}");
+    assert!(err.to_string().contains("writer-a"), "{err}");
+    // Renewing brings it back, which is what a renewal timer is for.
+    table.renew_lease().await.unwrap();
+    assert!(
+        table.put(LsmKey::from(b"k".to_vec()), b"v".to_vec()).await.is_ok(),
+        "a renewed lease must accept writes again"
+    );
+}
+
+#[tokio::test]
+async fn a_table_without_a_lease_behaves_exactly_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let table = open_table(dir.path()).await;
+
+    table.put(LsmKey::from(b"k".to_vec()), b"v".to_vec()).await.unwrap();
+
+    assert!(!table.is_read_only());
+    assert_eq!(table.lease_holder().await.unwrap(), None);
+    table.renew_lease().await.unwrap(); // no-op, so a renewal timer needs no branch
+    assert_eq!(table.get(b"k").await.unwrap().as_deref(), Some(b"v".as_slice()));
+}

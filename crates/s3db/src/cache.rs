@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 /// summing/subtracting a byte count on every insert/evict. `max_bytes` is an
 /// optional safety net on top, checked only once `max_entries` is already at
 /// capacity -- not the primary accounting.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CacheConfig {
     pub max_entries: usize,
     pub max_bytes: Option<usize>,
+    /// Milliseconds in a config file — see [`crate::serde_duration`].
+    #[serde(with = "crate::serde_duration")]
     pub ttl: Duration,
 }
 

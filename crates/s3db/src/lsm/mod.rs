@@ -41,6 +41,7 @@
 
 mod bloom;
 pub mod compactor;
+pub mod lease;
 mod location;
 pub mod maintenance;
 pub mod manifest;
@@ -54,6 +55,7 @@ pub mod value;
 mod wal;
 
 pub use compactor::{CompactionReport, compact, should_compact};
+pub use lease::{LeaseRecord, WriterLease};
 pub use location::{BackendRegistry, DEFAULT_BACKEND_ID, TableLocation};
 pub use maintenance::{LsmMaintenanceConfig, LsmMaintenanceReport, tick};
 pub use manifest::{Manifest, ManifestEntry};

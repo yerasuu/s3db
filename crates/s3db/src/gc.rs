@@ -26,17 +26,21 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct GcConfig {
     /// How long a tombstone can sit `Pending` before a sweep retries the
     /// underlying delete.
+    #[serde(with = "crate::serde_duration")]
     pub tombstone_retry_age: Duration,
     /// How long a tombstone can sit `Purged` before a sweep removes the
     /// record entirely (the audit trail's own retention window).
+    #[serde(with = "crate::serde_duration")]
     pub tombstone_purge_age: Duration,
     /// If `Some`, prunes `.history/` entries older than this -- `None`
     /// (the default) leaves history pruning to whatever else already
     /// manages it (or never, if nothing does).
+    #[serde(with = "crate::serde_duration::optional")]
     pub history_max_age: Option<Duration>,
 }
 

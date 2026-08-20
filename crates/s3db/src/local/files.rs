@@ -60,6 +60,33 @@ impl FilesBackend {
     }
 }
 
+/// `create_dir_all`, but owner-only on unix.
+///
+/// Object *keys* are not secret in the way object bodies are, but they are
+/// not nothing either: this crate's callers put real names in them
+/// (`repos/acme/private-thing`), and the default `0755` hands that map to
+/// every account on the machine. The bodies stay sealed regardless; this
+/// closes the one part of a local bucket that was readable without the
+/// passphrase.
+///
+/// Applies to directories this driver creates from here on — a bucket
+/// directory that already exists keeps whatever mode it was made with.
+async fn create_dir_private(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        return builder
+            .create(dir)
+            .await
+            .with_context(|| format!("creating {}", dir.display()));
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))
+}
+
 /// Rejects a key/prefix that could escape `root` once joined onto it — an
 /// absolute path or any `..` component would otherwise let a caller-
 /// controlled key read/write/delete/list arbitrary paths on disk.
@@ -103,9 +130,7 @@ async fn fsync_dir(dir: &Path) -> Result<()> {
 /// sees a half-written file.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
-    fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("creating {}", dir.display()))?;
+    create_dir_private(dir).await?;
     let tmp = tempfile::Builder::new()
         .prefix(".s3db-tmp-")
         .tempfile_in(dir)
@@ -135,9 +160,7 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(feature = "streaming")]
 async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     let dir = path.parent().context("local storage path has no parent directory")?;
-    fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("creating {}", dir.display()))?;
+    create_dir_private(dir).await?;
     let tmp = tempfile::Builder::new()
         .prefix(".s3db-tmp-")
         .tempfile_in(dir)
@@ -185,14 +208,13 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
 /// the same one, so the returned handle still owns it.
 async fn lock_key(lock_path: &Path) -> Result<File> {
     if let Some(dir) = lock_path.parent() {
-        fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("creating {}", dir.display()))?;
+        create_dir_private(dir).await?;
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
         .open(lock_path)
         .await
         .with_context(|| format!("opening {}", lock_path.display()))?;

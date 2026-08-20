@@ -19,6 +19,7 @@
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::collection::{Collection, Tombstone};
+use crate::naming::validate_segment;
 use crate::payload::{get_json, put_json};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -72,8 +73,13 @@ pub struct BackupManifest {
     pub tombstone_conflicts: usize,
 }
 
-fn backup_prefix(backup_id: &str, collection_prefix: &str) -> String {
-    format!(".conf/backups/{backup_id}/{collection_prefix}")
+/// `backup_id` is interpolated straight into an object key, so it goes
+/// through the same check every other caller-supplied name does — without
+/// it an id like `"../repos"` doesn't produce an odd-looking backup, it
+/// writes into live data's namespace (see [`crate::naming`]).
+fn backup_prefix(backup_id: &str, collection_prefix: &str) -> Result<String> {
+    validate_segment(backup_id, "backup id")?;
+    Ok(format!(".conf/backups/{backup_id}/{collection_prefix}"))
 }
 
 /// Deliberately a sibling of, not nested inside, `backup_prefix`'s own
@@ -82,8 +88,9 @@ fn backup_prefix(backup_id: &str, collection_prefix: &str) -> String {
 /// entity apart from a same-shaped `{name}.json` sitting in the same
 /// directory -- this stays out of that namespace entirely instead of being
 /// filtered out of it.
-fn manifest_key(backup_id: &str, collection_prefix: &str) -> String {
-    format!(".conf/backups/{backup_id}/{collection_prefix}.manifest.json")
+fn manifest_key(backup_id: &str, collection_prefix: &str) -> Result<String> {
+    validate_segment(backup_id, "backup id")?;
+    Ok(format!(".conf/backups/{backup_id}/{collection_prefix}.manifest.json"))
 }
 
 /// Backs up every live entity (and, by default, every tombstone) in
@@ -103,7 +110,7 @@ pub async fn backup_collection(
     include_tombstones: bool,
 ) -> Result<BackupManifest> {
     let started_at_ms = now_ms();
-    let prefix = backup_prefix(backup_id, &collection.prefix);
+    let prefix = backup_prefix(backup_id, &collection.prefix)?;
 
     let mut entity_count = 0;
     let mut entity_conflicts = 0;
@@ -148,7 +155,7 @@ pub async fn backup_collection(
     };
     put_json(
         dest_backend,
-        &manifest_key(backup_id, &collection.prefix),
+        &manifest_key(backup_id, &collection.prefix)?,
         &manifest,
         None,
         dest_cipher,
@@ -174,12 +181,12 @@ pub async fn restore_collection(
 ) -> Result<BackupManifest> {
     let (manifest, etag) = get_json::<BackupManifest>(
         backup_backend,
-        &manifest_key(backup_id, &collection.prefix),
+        &manifest_key(backup_id, &collection.prefix)?,
         backup_cipher,
     )
     .await?;
     etag.with_context(|| format!("no backup {backup_id} found for collection {}", collection.prefix))?;
-    let prefix = backup_prefix(backup_id, &collection.prefix);
+    let prefix = backup_prefix(backup_id, &collection.prefix)?;
     // A `Collection` over the backup's own nested prefix -- the backup
     // lives at the same relative shape (`{prefix}/{name}{suffix}`) as the
     // live collection, just under `.conf/backups/<id>/` instead of at the
