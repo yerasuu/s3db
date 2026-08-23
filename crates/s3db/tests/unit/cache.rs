@@ -67,7 +67,7 @@ async fn a_second_get_is_served_from_cache() {
 }
 
 #[tokio::test]
-async fn put_cas_invalidates_the_cached_entry() {
+async fn put_cas_refreshes_the_cache_with_confirmed_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let counting = Arc::new(CountingBackend {
         inner: local(dir.path()),
@@ -78,9 +78,75 @@ async fn put_cas_invalidates_the_cached_entry() {
     let (_, etag) = cached.get("k").await.unwrap();
 
     cached.put_cas("k", b"v2".to_vec(), etag.as_deref()).await.unwrap();
-    let (bytes, _) = cached.get("k").await.unwrap();
-    assert_eq!(bytes, b"v2");
+    // The confirmed write-through refresh is the driver's only other hit --
+    // not yet a fresh read after this point.
     assert_eq!(counting.gets.load(Ordering::SeqCst), 2);
+
+    let (bytes, _) = cached.get("k").await.unwrap();
+    let (bytes_again, _) = cached.get("k").await.unwrap();
+    assert_eq!(bytes, b"v2");
+    assert_eq!(bytes_again, b"v2");
+    // Both served from the cache the write-through refresh populated: no
+    // further driver hits.
+    assert_eq!(counting.gets.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn put_cas_conflict_invalidates_instead_of_caching() {
+    let dir = tempfile::tempdir().unwrap();
+    let counting = Arc::new(CountingBackend {
+        inner: local(dir.path()),
+        gets: AtomicUsize::new(0),
+    });
+    counting.put_cas("k", b"v1".to_vec(), None).await.unwrap();
+    let cached = CachedBackend::new(counting.clone(), CacheConfig::default());
+    cached.get("k").await.unwrap(); // cache: {k: v1}, gets=1
+
+    // Wrong expected_etag -> Conflict, nothing confirmed to cache.
+    let cas = cached.put_cas("k", b"v2".to_vec(), None).await.unwrap();
+    assert_eq!(cas, Cas::Conflict);
+
+    // Must re-fetch: the stale entry was invalidated, not refreshed with
+    // the rejected body.
+    let (bytes, _) = cached.get("k").await.unwrap();
+    assert_eq!(bytes, b"v1");
+    assert_eq!(counting.gets.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn disk_backing_survives_the_memory_cache_never_seeing_it() {
+    let backend_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let counting = Arc::new(CountingBackend {
+        inner: local(backend_dir.path()),
+        gets: AtomicUsize::new(0),
+    });
+    counting.put_cas("a/b/k", b"v1".to_vec(), None).await.unwrap();
+    let cached = CachedBackend::new(
+        counting.clone(),
+        CacheConfig {
+            max_entries: 10,
+            max_bytes: None,
+            ttl: Duration::from_secs(60),
+            backing: CacheBacking::Disk {
+                dir: cache_dir.path().to_path_buf(),
+            },
+        },
+    );
+
+    let (bytes, _) = cached.get("a/b/k").await.unwrap();
+    assert_eq!(bytes, b"v1");
+    assert!(
+        cache_dir.path().join("a/b/k").is_file(),
+        "expected one real file per key under the cache dir"
+    );
+
+    cached.get("a/b/k").await.unwrap();
+    assert_eq!(
+        counting.gets.load(Ordering::SeqCst),
+        1,
+        "second get must be served from the disk cache"
+    );
 }
 
 #[tokio::test]
@@ -97,6 +163,7 @@ async fn entries_over_ttl_are_treated_as_a_miss() {
             max_entries: 10,
             max_bytes: None,
             ttl: Duration::from_millis(0),
+            backing: CacheBacking::Memory,
         },
     );
 
@@ -126,6 +193,7 @@ async fn max_entries_evicts_the_least_recently_used() {
             max_entries: 1,
             max_bytes: None,
             ttl: Duration::from_secs(60),
+            backing: CacheBacking::Memory,
         },
     );
 

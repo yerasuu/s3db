@@ -79,7 +79,7 @@ pub fn build_resilient_backend(
     config: ResilienceConfig,
     metrics: SharedMetrics,
 ) -> Arc<dyn Backend> {
-    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(inner, config.cache));
+    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(inner, config.cache.clone()));
     let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(cached, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
     Arc::new(MeteredBackend::new(retried, metrics))

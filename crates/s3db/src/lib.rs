@@ -64,7 +64,7 @@ pub use backend::{Backend, Cas, DeleteOutcome, ListPage, build_backend};
 pub use backup::{BackupConsistency, BackupManifest};
 pub use batch_loader::{BatchLoader, MemoryBudget};
 pub use blob::{Blob, BlobManifest, DEFAULT_MAX_BLOB_BYTES, DEFAULT_PART_BYTES};
-pub use cache::{CacheConfig, CachedBackend, TypedCache};
+pub use cache::{CacheBacking, CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, MAX_UPDATE_ATTEMPTS, PurgeState, Singleton, Tombstone, Update};
