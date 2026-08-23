@@ -205,6 +205,51 @@ async fn metered_backend_records_a_counter_per_call() {
     );
 }
 
+/// The cache sits above the throttle/breaker, so a key this process already
+/// holds is served from it even once the backend is failing hard enough to
+/// have tripped the breaker -- the moment a local copy is most worth having.
+/// With the cache underneath (where this stack used to put it) the cached
+/// read went through the breaker too and failed along with everything else.
+#[tokio::test]
+async fn a_cached_read_is_served_while_the_circuit_breaker_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let flaky = Arc::new(FlakyBackend {
+        inner: local(dir.path()),
+        fail_next: AtomicUsize::new(0),
+    });
+    let config = ResilienceConfig {
+        // One attempt per call, so each failed call is exactly one strike
+        // against the breaker.
+        max_retries: 0,
+        circuit_breaker: CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration: Duration::from_secs(60),
+        },
+        ..ResilienceConfig::default()
+    };
+    let stack = build_resilient_backend(flaky.clone(), config, Arc::new(RecordingMetrics::default()));
+
+    // Write-through populates the cache with the confirmed bytes.
+    stack.put_cas("cached", b"v1".to_vec(), None).await.unwrap();
+
+    // From here the driver fails every read.
+    flaky.fail_next.store(usize::MAX, Ordering::SeqCst);
+
+    // Two misses to trip the breaker.
+    for _ in 0..2 {
+        assert!(stack.get("uncached").await.is_err());
+    }
+    let err = stack.get("uncached").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("circuit breaker open"),
+        "expected the breaker to be open: {err:#}"
+    );
+
+    // The cached key still reads, from the cache, without touching the driver.
+    let (bytes, _etag) = stack.get("cached").await.unwrap();
+    assert_eq!(bytes, b"v1");
+}
+
 #[tokio::test]
 async fn build_resilient_backend_roundtrips_through_the_whole_stack() {
     let dir = tempfile::tempdir().unwrap();

@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! MeteredBackend       (records what happened)
-//!   -> RetryBackend      (orchestrates retries, backoff between attempts)
-//!     -> ThrottledBackend  (permit + circuit breaker, held only during
-//!                           the actual network call)
-//!       -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
+//!   -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
+//!     -> RetryBackend      (orchestrates retries, backoff between attempts)
+//!       -> ThrottledBackend  (permit + circuit breaker, held only during
+//!                             the actual network call)
 //!         -> the real driver
 //! ```
 //!
@@ -18,6 +18,22 @@
 //! concurrency budget everything else is competing for, which is exactly
 //! the pressure that pushes the circuit breaker to open on load it
 //! generated itself.
+//!
+//! The cache sits *outside* both of them, which is what makes a hit a hit:
+//! a key this process already holds is served straight from memory/disk,
+//! ahead of everything below. Underneath the throttle -- where this stack
+//! used to put it -- a cache hit still had to queue for a concurrency
+//! permit it was never going to use, waiting behind in-flight network calls
+//! for data that needed no network at all; and worse, it went through the
+//! circuit breaker, so once the breaker opened every cached read started
+//! failing too, at exactly the moment a local copy was most worth having.
+//! Above them, a hit costs nothing and stays available while the backend
+//! is down; a miss still goes through retry and throttle to the driver,
+//! unchanged.
+//!
+//! Metering stays outermost so what it counts is still every logical call
+//! the caller made -- hits included -- rather than only the ones that
+//! missed and reached the network.
 //!
 //! [`crate::request_cache::RequestCache`] is not part of this stack: it
 //! belongs *outside* all of it, at the application layer, wrapping whatever
@@ -79,10 +95,10 @@ pub fn build_resilient_backend(
     config: ResilienceConfig,
     metrics: SharedMetrics,
 ) -> Arc<dyn Backend> {
-    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(inner, config.cache.clone()));
-    let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(cached, &config));
+    let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(inner, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
-    Arc::new(MeteredBackend::new(retried, metrics))
+    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(retried, config.cache.clone()));
+    Arc::new(MeteredBackend::new(cached, metrics))
 }
 
 /// Records a counter per call (`s3db_backend_<op>_total`) and per outcome
