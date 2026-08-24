@@ -11,7 +11,7 @@ resolver = "2"
 # and bumping three files by hand is three chances to forget one.
 # `description` stays per-crate, being the field that genuinely differs.
 [workspace.package]
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 # Raising this is a breaking change for anyone building from source, so it
 # moves deliberately and all at once -- never one crate at a time.
