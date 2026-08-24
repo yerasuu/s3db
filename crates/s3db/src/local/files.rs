@@ -1,7 +1,10 @@
 //! [`Backend`] over a plain local filesystem directory, one real file per
 //! key — the original `local` driver, still the default
 //! ([`LocalEngine::Files`][crate::config::LocalEngine::Files]) and the only
-//! format any pre-existing deployment has on disk.
+//! format any pre-existing deployment has on disk. **Deprecated**: migrate
+//! an existing directory with `s3db-local-migrate` and point new
+//! deployments at [`crate::local::redb_backend`] instead — see that
+//! module's doc for what it replaces this with.
 //!
 //! Unlike every other driver, a local filesystem has no native
 //! compare-and-swap primitive to build [`Backend::put_cas`] on. This
@@ -14,8 +17,15 @@
 //! shared/clustered setup. Don't point two separate machines at the same
 //! NFS-mounted root and expect the same safety S3/R2/Azure/GCS give.
 //!
-//! See [`crate::local::redb_backend`] for the alternative that replaces all
-//! of this hand-rolled CAS with a real embedded transaction engine.
+//! The version counter is also its own crash hazard: `put_cas` writes the
+//! body and the counter as two *separate* atomic files
+//! ([`FilesBackend::put_cas`], not one transaction), so a crash between
+//! them leaves the new body readable under the old etag until the next
+//! successful write on that key happens to resync them. `RedbBackend`
+//! doesn't have this window — body and version commit together, one
+//! transaction, always. See [`crate::local::redb_backend`] for the
+//! alternative that replaces all of this hand-rolled CAS with a real
+//! embedded transaction engine.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use crate::config::LocalParams;
@@ -38,6 +48,12 @@ pub struct FilesBackend {
 
 impl FilesBackend {
     pub fn new(cfg: &LocalParams) -> Self {
+        eprintln!(
+            "warning: local storage at {} is using the deprecated `files` engine \
+             (one file plus two CAS sidecars per key) -- migrate with \
+             `s3db-local-migrate` to `redb` (a single file, real ACID CAS)",
+            cfg.bucket
+        );
         FilesBackend {
             root: PathBuf::from(&cfg.bucket),
         }
@@ -402,4 +418,5 @@ fn walk_dir<'a>(
 
 #[cfg(test)]
 #[path = "../../tests/unit/local/files.rs"]
+#[allow(deprecated)] // this is FilesBackend's own dedicated test file
 mod tests;

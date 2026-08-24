@@ -1,12 +1,8 @@
 use super::*;
-use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
 
 fn test_backend_and_cipher(root: &std::path::Path, salt: u8) -> (LocalBackend, Cipher) {
-    let backend = LocalBackend::new(&LocalParams {
-        bucket: root.to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(root);
     let cipher = Cipher::derive("test passphrase", &[salt; crate::cipher::SALT_LEN]).unwrap();
     (backend, cipher)
 }

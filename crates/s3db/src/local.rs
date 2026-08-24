@@ -40,6 +40,7 @@ pub enum LocalBackend {
 }
 
 impl LocalBackend {
+    #[allow(deprecated)] // still has to construct the deprecated engine until it's removed
     pub fn new(cfg: &LocalParams) -> Self {
         match cfg.engine {
             LocalEngine::Files => LocalBackend::Files(FilesBackend::new(cfg)),
@@ -114,4 +115,23 @@ impl Backend for LocalBackend {
 
 #[cfg(test)]
 #[path = "../tests/unit/local.rs"]
+#[allow(deprecated)] // this is the file that deliberately tests both engines side by side
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::config::LocalParams;
+
+    /// Every test that just needs *a* working local backend uses this --
+    /// still on the deprecated `Files` engine until a test file has a real
+    /// reason to run on `Redb` instead. One `#[allow(deprecated)]` here
+    /// instead of one at every call site.
+    #[allow(deprecated)]
+    pub(crate) fn files_backend(root: &std::path::Path) -> LocalBackend {
+        LocalBackend::new(&LocalParams {
+            bucket: root.to_string_lossy().to_string(),
+            engine: LocalEngine::Files,
+        })
+    }
+}

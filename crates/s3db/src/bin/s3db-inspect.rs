@@ -81,6 +81,10 @@ fn parse_backend(args: &[String]) -> Result<(Arc<dyn Backend>, &[String])> {
     match args.split_first().map(|(head, tail)| (head.as_str(), tail)) {
         Some(("--local", tail)) => {
             let (dir, rest) = tail.split_first().context("--local needs a directory\n")?;
+            // Defaults to the deprecated engine for back-compat with existing
+            // directories -- inspecting a `Redb`-engine bucket needs `--config`
+            // with an explicit `engine = "redb"` instead.
+            #[allow(deprecated)]
             let config = BackendConfig::Local(s3db::LocalParams {
                 bucket: dir.clone(),
                 engine: s3db::LocalEngine::Files,

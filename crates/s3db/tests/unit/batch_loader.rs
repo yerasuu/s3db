@@ -1,6 +1,4 @@
 use super::*;
-use crate::config::{LocalEngine, LocalParams};
-use crate::local::LocalBackend;
 
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Widget {
@@ -10,10 +8,7 @@ struct Widget {
 #[tokio::test]
 async fn load_many_reports_found_and_missing_keys_distinctly() {
     let dir = tempfile::tempdir().unwrap();
-    let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    }));
+    let backend: Arc<dyn Backend> = Arc::new(crate::local::test_support::files_backend(dir.path()));
     let cipher = Arc::new(Cipher::derive("test passphrase", &[53u8; crate::cipher::SALT_LEN]).unwrap());
     crate::payload::put_json(backend.as_ref(), "a.json", &Widget { count: 1 }, None, &cipher)
         .await

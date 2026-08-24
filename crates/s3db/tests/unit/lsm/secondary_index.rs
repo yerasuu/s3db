@@ -1,15 +1,10 @@
 use super::*;
 use crate::backend::Backend;
 use crate::cipher::Cipher;
-use crate::config::{LocalEngine, LocalParams};
-use crate::local::LocalBackend;
 use std::sync::Arc;
 
 fn test_backend(root: &std::path::Path) -> Arc<dyn Backend> {
-    Arc::new(LocalBackend::new(&LocalParams {
-        bucket: root.to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    }))
+    Arc::new(crate::local::test_support::files_backend(root))
 }
 
 fn test_cipher() -> Cipher {

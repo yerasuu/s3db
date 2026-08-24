@@ -1,14 +1,10 @@
 use super::*;
 use crate::cipher::SALT_LEN;
-use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
 
 fn temp_backend() -> (tempfile::TempDir, LocalBackend) {
     let dir = tempfile::tempdir().unwrap();
-    let backend = LocalBackend::new(&LocalParams {
-        bucket: dir.path().to_string_lossy().into_owned(),
-        engine: LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(dir.path());
     (dir, backend)
 }
 

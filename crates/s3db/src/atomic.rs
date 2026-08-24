@@ -145,4 +145,5 @@ pub async fn put_with_index<T: Serialize, P: Serialize>(
 
 #[cfg(test)]
 #[path = "../tests/unit/atomic.rs"]
+#[allow(deprecated)] // exercises both engines deliberately (as_atomic differs between them)
 mod tests;

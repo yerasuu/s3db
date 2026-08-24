@@ -362,4 +362,5 @@ pub async fn recover_stale(backend: &dyn Backend, cipher: &Cipher, max_age: Dura
 
 #[cfg(test)]
 #[path = "../tests/unit/txn.rs"]
+#[allow(deprecated)] // test_backend_and_cipher_with is parameterized over both engines
 mod tests;

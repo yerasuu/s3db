@@ -1,6 +1,11 @@
 //! End-to-end check that `#[derive(Entity)]` produces the same
 //! `Collection`/`SecondaryIndex` behavior a hand-written entity implements
 //! by hand.
+//!
+//! Just needs *a* working backend, still on the deprecated `Files` engine --
+//! this is an integration test crate, outside the library, so it only has
+//! the public API to work with (no internal test helper to reuse).
+#![allow(deprecated)]
 
 use s3db::{Cipher, Entity, LocalBackend, LocalEngine, LocalParams};
 

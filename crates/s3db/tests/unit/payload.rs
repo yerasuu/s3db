@@ -1,12 +1,8 @@
 use super::*;
-use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
 
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-    let backend = LocalBackend::new(&LocalParams {
-        bucket: root.to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(root);
     let cipher = Cipher::derive("test passphrase", &[9u8; crate::cipher::SALT_LEN]).unwrap();
     (backend, cipher)
 }
@@ -58,10 +54,7 @@ async fn put_json_rejects_an_object_over_the_size_limit() {
 #[tokio::test]
 async fn get_json_plain_stays_readable_as_plain_json() {
     let dir = tempfile::tempdir().unwrap();
-    let backend = LocalBackend::new(&LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(dir.path());
     put_json_plain(
         &backend,
         "k",

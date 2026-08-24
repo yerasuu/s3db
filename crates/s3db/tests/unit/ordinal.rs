@@ -38,7 +38,6 @@ fn decode_rejects_anything_it_did_not_write() {
 #[tokio::test]
 async fn collection_list_names_comes_back_in_numeric_order() {
     use crate::collection::Collection;
-    use crate::local::LocalBackend;
 
     #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
     struct Chapter {
@@ -46,10 +45,7 @@ async fn collection_list_names_comes_back_in_numeric_order() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let backend = LocalBackend::new(&crate::config::LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: crate::config::LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(dir.path());
     let cipher = crate::cipher::Cipher::derive("test passphrase", &[7u8; crate::cipher::SALT_LEN]).unwrap();
     let chapters = Collection::new("chapters");
 

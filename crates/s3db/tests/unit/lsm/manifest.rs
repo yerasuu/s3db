@@ -1,12 +1,8 @@
 use super::*;
-use crate::config::{LocalEngine, LocalParams};
 use crate::local::LocalBackend;
 
 fn test_backend(root: &std::path::Path) -> LocalBackend {
-    LocalBackend::new(&LocalParams {
-        bucket: root.to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    })
+    crate::local::test_support::files_backend(root)
 }
 
 fn test_cipher() -> Cipher {

@@ -2,10 +2,7 @@ use super::*;
 use crate::local::LocalBackend;
 
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
-    let backend = LocalBackend::new(&crate::config::LocalParams {
-        bucket: root.to_string_lossy().to_string(),
-        engine: crate::config::LocalEngine::Files,
-    });
+    let backend = crate::local::test_support::files_backend(root);
     let cipher = Cipher::derive("test passphrase", &[5u8; crate::cipher::SALT_LEN]).unwrap();
     (backend, cipher)
 }
@@ -238,13 +235,21 @@ async fn list_names_page_skips_past_a_bookkeeping_only_page_instead_of_reporting
     let coll = Collection::new("widgets");
 
     for name in ["a", "b", "c"] {
-        coll.put(&backend, &cipher, name, &Widget { count: 1 }, None).await.unwrap();
+        coll.put(&backend, &cipher, name, &Widget { count: 1 }, None)
+            .await
+            .unwrap();
         coll.delete(&backend, &cipher, name).await.unwrap();
     }
-    coll.put(&backend, &cipher, "z", &Widget { count: 9 }, None).await.unwrap();
+    coll.put(&backend, &cipher, "z", &Widget { count: 9 }, None)
+        .await
+        .unwrap();
 
     let (names, next_after) = coll.list_names_page(&backend, None, 1).await.unwrap();
-    assert_eq!(names, vec!["z"], "el nombre real no debería perderse detrás del bookkeeping");
+    assert_eq!(
+        names,
+        vec!["z"],
+        "el nombre real no debería perderse detrás del bookkeeping"
+    );
     assert_eq!(next_after, None, "z es el último nombre real: no debería quedar cursor");
 }
 

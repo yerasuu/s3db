@@ -119,11 +119,20 @@ pub struct LocalParams {
 /// field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(deprecated)] // the `#[default]` variant below is itself deprecated
 pub enum LocalEngine {
     /// One real file per key plus its CAS sidecars (`<key>.s3dbrev`,
     /// `<key>.s3dblock`) — see [`crate::local::files`]. The long-standing
     /// default; every directory that predates this field is one of these.
+    /// Still the default for that reason (a config that omits `engine` must
+    /// keep meaning "this existing Files-format directory," never silently
+    /// reinterpret it as `Redb`), but deprecated: migrate an existing
+    /// directory with `s3db-local-migrate` and point new deployments at
+    /// [`LocalEngine::Redb`] instead.
     #[default]
+    #[deprecated(
+        note = "one real file plus two CAS sidecars per key -- migrate with `s3db-local-migrate` to `LocalEngine::Redb` (a single file, real ACID CAS)"
+    )]
     Files,
     /// A single `redb` database file — see [`crate::local::redb_backend`].
     /// Real ACID transactions, native range scans, no CAS emulation.

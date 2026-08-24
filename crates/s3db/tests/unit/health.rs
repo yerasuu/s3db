@@ -1,14 +1,9 @@
 use super::*;
-use crate::config::{LocalEngine, LocalParams};
-use crate::local::LocalBackend;
 
 #[tokio::test]
 async fn ready_is_true_for_a_reachable_backend_even_without_the_key_existing() {
     let dir = tempfile::tempdir().unwrap();
-    let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    }));
+    let backend: Arc<dyn Backend> = Arc::new(crate::local::test_support::files_backend(dir.path()));
     let probe = HealthProbe::new(backend);
     assert!(probe.ready().await);
     assert!(probe.last_ready());
@@ -66,10 +61,7 @@ async fn ready_is_false_when_the_backend_is_unreachable() {
 #[tokio::test]
 async fn last_ready_is_false_before_the_first_probe() {
     let dir = tempfile::tempdir().unwrap();
-    let backend: Arc<dyn Backend> = Arc::new(LocalBackend::new(&LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: LocalEngine::Files,
-    }));
+    let backend: Arc<dyn Backend> = Arc::new(crate::local::test_support::files_backend(dir.path()));
     let probe = HealthProbe::new(backend);
     assert!(!probe.last_ready());
 }

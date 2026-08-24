@@ -88,10 +88,7 @@ async fn a_metered_backend_reports_into_it() {
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
-    let raw: Arc<dyn Backend> = Arc::new(crate::local::LocalBackend::new(&crate::config::LocalParams {
-        bucket: dir.path().to_string_lossy().to_string(),
-        engine: crate::config::LocalEngine::Files,
-    }));
+    let raw: Arc<dyn Backend> = Arc::new(crate::local::test_support::files_backend(dir.path()));
     let metrics = Arc::new(InMemoryMetrics::default());
     let metered = crate::resilience::MeteredBackend::new(raw, metrics.clone());
 

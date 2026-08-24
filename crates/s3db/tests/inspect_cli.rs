@@ -2,6 +2,11 @@
 //! against a real encrypted bucket on disk. A library-level test of the same
 //! functions would miss what actually matters about a CLI — that the argument
 //! parsing, the passphrase-from-environment rule, and the exit codes behave.
+//!
+//! Matches the CLI's own `--local` default (`LocalEngine::Files`, deprecated)
+//! rather than an internal test helper — this is an integration test crate,
+//! outside the library, so it only has the public API to work with.
+#![allow(deprecated)]
 
 use s3db::{Backend, Collection, LocalBackend, LocalEngine, LocalParams};
 use std::process::Command;

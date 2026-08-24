@@ -375,4 +375,5 @@ impl SecondaryIndex {
 
 #[cfg(test)]
 #[path = "../tests/unit/index.rs"]
+#[allow(deprecated)] // test_backend_and_cipher_with is parameterized over both engines
 mod tests;

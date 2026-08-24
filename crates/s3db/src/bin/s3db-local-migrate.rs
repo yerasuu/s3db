@@ -31,6 +31,8 @@ async fn main() -> Result<()> {
         Some(other) => bail!("unrecognized argument {other:?}\n{USAGE}"),
     };
 
+    // This tool's whole job is reading the deprecated format to migrate off it.
+    #[allow(deprecated)]
     let files = FilesBackend::new(&LocalParams {
         bucket: root.clone(),
         engine: LocalEngine::Files,

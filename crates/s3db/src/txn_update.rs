@@ -405,4 +405,5 @@ pub async fn recover_stale_updates(backend: &dyn Backend, cipher: &Cipher, max_a
 
 #[cfg(test)]
 #[path = "../tests/unit/txn_update.rs"]
+#[allow(deprecated)] // exercises both engines deliberately throughout
 mod tests;
