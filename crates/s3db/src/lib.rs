@@ -45,6 +45,8 @@ pub mod payload;
 pub mod range;
 pub mod request_cache;
 pub mod resilience;
+#[cfg(feature = "rest")]
+pub mod rest;
 mod serde_duration;
 mod shard;
 pub mod sharded_index;

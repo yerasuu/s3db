@@ -16,9 +16,18 @@ default = []
 # under that profile -- less surface to audit. A caller that does need it
 # just enables the feature.
 streaming = []
+# Opt-in read-only JSON REST server (`rest::serve`) for browsing collections
+# by hand -- off by default: a storage library has no business linking a
+# web framework unless a caller actually asks for it. `tokio/net` is pulled
+# in alongside axum since the base `tokio` dependency above has no need for
+# `TcpListener` without this.
+rest = ["dep:axum", "tokio/net"]
 
 [dependencies]
 async-trait = "0.1.91"
+# Version pinned to match gitquarry-webui, the crate's own real consumer of
+# this feature, so the two don't drift onto incompatible axum majors.
+axum = { version = "0.8.9", optional = true }
 futures = "0.3.33"
 s3db-crypto = { path = "../s3db-crypto" }
 s3db-macros = { path = "../s3db-macros" }
@@ -87,3 +96,7 @@ all = { level = "warn", priority = -1 }
 # Only the config-file test needs a TOML parser: this crate takes `serde` and
 # lets the application choose its own format.
 toml = "0.9"
+# `rest`'s tests drive the router directly with `oneshot` instead of binding
+# a real socket -- no need to race a port, no flakiness from one.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

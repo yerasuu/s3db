@@ -506,6 +506,27 @@ $ s3db-inspect --local /srv/bucket verify ""        # decrypt everything, exit 1
 
 It opens the bucket with `bootstrap::open_cipher`, never `get_or_create_cipher`: for a server, whichever instance starts first initializing the bucket is correct, but for anything pointed at a path by hand a typo must fail rather than quietly become a newly initialized empty bucket whose encryption config was written by the command that was only supposed to look at it.
 
+## REST data browser (opt-in)
+
+`rest::serve(backend, cipher, addr)` is a read-only JSON API for looking at what a bucket holds — collections as tables, entries as rows, over HTTP instead of `s3db-inspect`'s argv. Behind the `rest` cargo feature (off by default, pulls in `axum`):
+
+```rust
+s3db::rest::serve(backend, cipher, "127.0.0.1:8787".parse()?).await?;
+```
+
+```console
+$ curl localhost:8787/collections
+{"collections":["widgets"]}
+$ curl localhost:8787/collections/widgets
+{"entries":["alice"],"next_after":null}
+$ curl localhost:8787/collections/widgets/alice
+{"count":1}
+```
+
+Collections are discovered, not registered: every top-level key segment that doesn't start with `.` counts as one, found by walking the bucket once per `/collections` call — fine for an admin page, not for a hot path. A collection or entry name arriving over HTTP goes through the same path validation every entity name gets internally, so `/collections/.conf` or `/collections/widgets/.deleted` come back `400`, not a peek at this crate's own bookkeeping.
+
+**No authentication.** This serves decrypted plaintext on whatever socket it's given, with nothing else in front of it — binding `127.0.0.1` is what keeps it off the network; anything else is a deliberate choice to expose that data, made by the caller, not this crate.
+
 ## Raw primitive
 
 `Backend::list_page(prefix, after, limit)` is `list_prefix` with a ceiling: ascending key order, `limit` entries at most, and `ListPage::next_after` carrying the key to resume from (`None` when exhausted). The cursor is a **key**, not an opaque provider token, so it is portable and stateless — persist one, resume in another process, and it keeps working even if the key it names was deleted in between, which is what a sweep that deletes as it pages needs. `s3` pushes it into the request (`start_after`/`max_keys`) and `redb` into its B-tree range; the other drivers inherit a default that lists, sorts, and slices — correct and consistently ordered, bounding the caller rather than the fetch. `delete_prefix` and `count_prefix` both page, so neither holds more than one page of keys regardless of prefix size.
