@@ -423,6 +423,42 @@ impl Blob {
         }
         Ok(report)
     }
+
+    /// Sweeps orphan parts across every blob under this `Blob`'s prefix in
+    /// one pass, instead of requiring the caller to already know and loop
+    /// over every `name` individually. Derives names directly from the
+    /// `.parts/` key structure rather than [`Self::list_names`] (which reads
+    /// every manifest) -- cheaper, and it's the shape a large corpus
+    /// actually needs: hundreds of thousands of blobs, where enumerating
+    /// names first would be its own expensive scan before the real one
+    /// starts.
+    pub async fn sweep_all_orphan_parts(
+        &self,
+        backend: &dyn Backend,
+        cipher: &Cipher,
+        min_age_ms: u64,
+    ) -> Result<SweepReport> {
+        let parts_root = format!("{}/.parts/", self.prefix);
+        let mut names: Vec<String> = list_all_keys(backend, &parts_root)
+            .await?
+            .into_iter()
+            .filter_map(|key| {
+                let rest = key.strip_prefix(&parts_root)?;
+                rest.split_once('/').map(|(name, _rest)| name.to_string())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+
+        let mut report = SweepReport::default();
+        for name in names {
+            let swept = self.sweep_orphan_parts(backend, cipher, &name, min_age_ms).await?;
+            report.attempted += swept.attempted;
+            report.confirmed += swept.confirmed;
+            report.remaining += swept.remaining;
+        }
+        Ok(report)
+    }
 }
 
 #[cfg(test)]

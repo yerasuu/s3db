@@ -329,6 +329,59 @@ async fn sweep_orphan_parts_spares_a_generation_younger_than_the_guard() {
     );
 }
 
+#[tokio::test]
+async fn sweep_all_orphan_parts_covers_every_blob_under_the_prefix_in_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let blob = blob();
+    for name in ["k1", "k2"] {
+        blob.put(backend.as_ref(), &cipher, name, &body_of(3000), None)
+            .await
+            .unwrap();
+    }
+    let live_generation_of = |name: &str| {
+        let backend = backend.clone();
+        let cipher = cipher.clone();
+        let blob = blob.clone();
+        let name = name.to_string();
+        async move {
+            blob.head(backend.as_ref(), &cipher, &name)
+                .await
+                .unwrap()
+                .0
+                .unwrap()
+                .generation
+        }
+    };
+    let live_k1 = live_generation_of("k1").await;
+    let live_k2 = live_generation_of("k2").await;
+
+    // An abandoned write under each of the two blobs.
+    for name in ["k1", "k2"] {
+        let key = format!("pages/.parts/{name}/0000000000001-deadbeef/0000");
+        let sealed = cipher
+            .seal(&key, b"orphan", crate::cipher::CompressionStrategy::None)
+            .unwrap();
+        backend.put_cas(&key, sealed, None).await.unwrap();
+    }
+
+    let report = blob
+        .sweep_all_orphan_parts(backend.as_ref(), &cipher, 60_000)
+        .await
+        .unwrap();
+
+    assert_eq!(report.confirmed, 2, "{report:?}");
+    for (name, live) in [("k1", &live_k1), ("k2", &live_k2)] {
+        let left = crate::payload::list_all_keys(backend.as_ref(), &format!("pages/.parts/{name}/"))
+            .await
+            .unwrap();
+        assert!(
+            left.iter().all(|key| key.contains(live.as_str())),
+            "the live generation of {name} must survive: {left:?}"
+        );
+    }
+}
+
 #[test]
 fn generation_age_comes_from_the_id_itself() {
     assert_eq!(Blob::generation_age_ms("0000000001000-abc", 1_500), Some(500));
