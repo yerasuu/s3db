@@ -4,12 +4,23 @@
 //!
 //! ```text
 //! MeteredBackend       (records what happened)
-//!   -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
-//!     -> RetryBackend      (orchestrates retries, backoff between attempts)
-//!       -> ThrottledBackend  (per-lane permit + circuit breaker, held only
-//!                             during the actual network call)
-//!         -> the real driver
+//!   -> SpooledBackend     (optional: durable local write-intent, see `crate::spool`)
+//!     -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
+//!       -> RetryBackend      (orchestrates retries, backoff between attempts)
+//!         -> ThrottledBackend  (per-lane permit + circuit breaker, held only
+//!                               during the actual network call)
+//!           -> the real driver
 //! ```
+//!
+//! [`crate::spool::SpooledBackend`] sits above the cache and wraps
+//! retry+throttle: recording intent before *any* attempt (including
+//! retries) is what closes the actual crash window, and going through the
+//! cache layer (rather than being wrapped by it) means a
+//! [`crate::spool::SpooledBackend::recover_pending`] replay still gets
+//! `CachedBackend`'s invalidate-on-write behavior, instead of leaving a
+//! stale cached miss behind after silently fixing a write in the
+//! background. Only present when [`ResilienceConfig::spool_path`] is
+//! configured — `None` (the default) reproduces today's stack exactly.
 //!
 //! Reads, writes and listings travel independent lanes through the throttle
 //! (see [`Lane`]): each has its own concurrency budget *and* its own circuit
@@ -50,6 +61,7 @@ use crate::metrics::SharedMetrics;
 use anyhow::Result;
 #[cfg(feature = "streaming")]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -77,6 +89,13 @@ pub struct ResilienceConfig {
     pub base_backoff: Duration,
     pub circuit_breaker: CircuitBreakerConfig,
     pub cache: CacheConfig,
+    /// Local directory for [`crate::spool::SpooledBackend`]'s durable
+    /// write-intent record — `None` (the default) skips that layer
+    /// entirely, reproducing the stack as it was before this field existed.
+    /// Not derived from any other config here (same reasoning as
+    /// [`crate::lsm::TableConfig`]'s `wal_path`): an embedding application
+    /// picks the local path, this crate never guesses one.
+    pub spool_path: Option<PathBuf>,
 }
 
 impl Default for ResilienceConfig {
@@ -89,6 +108,7 @@ impl Default for ResilienceConfig {
             base_backoff: Duration::from_millis(100),
             circuit_breaker: CircuitBreakerConfig::default(),
             cache: CacheConfig::default(),
+            spool_path: None,
         }
     }
 }
@@ -102,7 +122,11 @@ pub fn build_resilient_backend(
     let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(inner, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
     let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(retried, config.cache.clone()));
-    Arc::new(MeteredBackend::new(cached, metrics))
+    let spooled: Arc<dyn Backend> = match config.spool_path {
+        Some(path) => Arc::new(crate::spool::SpooledBackend::new(cached, path)),
+        None => cached,
+    };
+    Arc::new(MeteredBackend::new(spooled, metrics))
 }
 
 /// Records a counter per call (`s3db_backend_<op>_total`) and per outcome

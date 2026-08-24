@@ -51,6 +51,7 @@ mod serde_duration;
 mod shard;
 pub mod sharded_index;
 pub mod snapshot;
+pub mod spool;
 pub mod ttl;
 pub mod txn;
 pub mod txn_update;
@@ -94,6 +95,7 @@ pub use resilience::{
 };
 pub use sharded_index::{ShardEpoch, ShardedIndex};
 pub use snapshot::{ReadSnapshot, SnapshotLease};
+pub use spool::{RecoveryReport, SpooledBackend};
 pub use ttl::{ExpiryAt, ExpiryConfig, ExpiryReport};
 pub use txn_update::{UpdateOp, UpdateReport, recover_stale_updates, run_update};
 
