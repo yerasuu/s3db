@@ -25,8 +25,6 @@ rest = ["dep:axum", "tokio/net"]
 
 [dependencies]
 async-trait = "0.1.91"
-# Version pinned to match gitquarry-webui, the crate's own real consumer of
-# this feature, so the two don't drift onto incompatible axum majors.
 axum = { version = "0.8.9", optional = true }
 futures = "0.3.33"
 s3db-crypto = { path = "../s3db-crypto" }
