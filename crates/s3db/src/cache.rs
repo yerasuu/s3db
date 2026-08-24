@@ -19,9 +19,13 @@
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use anyhow::{Context, Result};
+use redb::{Database, ReadableDatabase, TableDefinition};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+const CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache");
+const CACHE_DB_FILENAME: &str = "s3db-cache.redb";
 
 /// Where [`CachedBackend`] keeps its bytes. Both are size-capped the same
 /// way (see [`CacheConfig`]); the only difference is what an eviction/miss
@@ -43,6 +47,16 @@ pub enum CacheBacking {
     /// instead of staying under `max_bytes` -- safe to discard outright
     /// since this is a cache, never the source of truth.
     Disk { dir: PathBuf },
+    /// Same eviction/TTL bookkeeping as `Disk` -- the in-memory LRU index
+    /// (order, size accounting, TTL) is identical -- but the bytes live as
+    /// rows in one `s3db-cache.redb` file instead of one file per key. The
+    /// option once a cache is sized past a few thousand entries, where
+    /// `Disk`'s per-key file (and the `remove_dir_all` wipe on every
+    /// restart that comes with it) stops being free: wiping this backing
+    /// is one `remove_file` regardless of how many entries were in it. No
+    /// CAS/version logic -- a cache has nothing to compare-and-swap
+    /// against, unlike [`crate::local::redb_backend::RedbBackend`].
+    Redb { dir: PathBuf },
 }
 
 /// Sizing for either cache. `max_entries` is the primary, O(1)-per-op
@@ -142,6 +156,14 @@ enum Store {
         index: Mutex<lru::LruCache<String, DiskEntry>>,
         total_bytes: Mutex<usize>,
     },
+    Redb {
+        /// `None` when opening the db failed -- degrades to "never
+        /// populates", same as `Disk`'s own failure handling, rather than
+        /// making cache construction fallible.
+        db: Option<Arc<Database>>,
+        index: Mutex<lru::LruCache<String, DiskEntry>>,
+        total_bytes: Mutex<usize>,
+    },
 }
 
 impl Store {
@@ -167,6 +189,32 @@ impl Store {
                 }
                 Store::Disk {
                     dir: dir.clone(),
+                    index: Mutex::new(lru::LruCache::new(capacity)),
+                    total_bytes: Mutex::new(0),
+                }
+            }
+            CacheBacking::Redb { dir } => {
+                // Same "always starts empty" reasoning as `Disk`, but
+                // removing one file is O(1) regardless of how many rows it
+                // held -- unlike `remove_dir_all` walking every one of a
+                // large `Disk` cache's per-key files.
+                let path = dir.join(CACHE_DB_FILENAME);
+                let _ = std::fs::remove_file(&path);
+                let opened = std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))
+                    .and_then(|()| Database::create(&path).with_context(|| format!("opening {}", path.display())));
+                let db = match opened {
+                    Ok(db) => Some(Arc::new(db)),
+                    Err(e) => {
+                        eprintln!(
+                            "s3db: warning: cache: failed to open redb cache db {}: {e:#}",
+                            path.display()
+                        );
+                        None
+                    }
+                };
+                Store::Redb {
+                    db,
                     index: Mutex::new(lru::LruCache::new(capacity)),
                     total_bytes: Mutex::new(0),
                 }
@@ -212,6 +260,35 @@ impl Store {
                         // Evicted/lost out from under the index somehow
                         // (disk cleared by hand, filesystem issue) -- treat
                         // as a miss and drop the now-stale index entry.
+                        self.remove(key).await;
+                        None
+                    }
+                }
+            }
+            Store::Redb { db, index, .. } => {
+                let db = db.clone()?;
+                let (etag, expired) = {
+                    let mut idx = index.lock().unwrap();
+                    let hit = idx.get(key)?;
+                    (hit.etag.clone(), hit.inserted_at.elapsed() > ttl)
+                };
+                if expired {
+                    self.remove(key).await;
+                    return None;
+                }
+                let key_owned = key.to_string();
+                let bytes = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+                    let read_txn = db.begin_read().ok()?;
+                    let table = read_txn.open_table(CACHE_TABLE).ok()?;
+                    Some(table.get(key_owned.as_str()).ok()??.value().to_vec())
+                })
+                .await
+                .ok()?;
+                match bytes {
+                    Some(bytes) => Some((bytes, etag)),
+                    None => {
+                        // Same "lost out from under the index" tolerance as
+                        // `Disk` -- treat as a miss and drop the stale entry.
                         self.remove(key).await;
                         None
                     }
@@ -293,6 +370,64 @@ impl Store {
                     let _ = tokio::fs::remove_file(p).await;
                 }
             }
+            Store::Redb { db, index, total_bytes } => {
+                let Some(db) = db.clone() else { return };
+                let new_len = bytes.len();
+                let mut evicted_keys = Vec::new();
+                {
+                    let mut idx = index.lock().unwrap();
+                    let mut total = total_bytes.lock().unwrap();
+                    if let Some((evicted_key, evicted)) = idx.push(
+                        key.to_string(),
+                        DiskEntry {
+                            etag,
+                            size: new_len,
+                            inserted_at: Instant::now(),
+                        },
+                    ) {
+                        *total = total.saturating_sub(evicted.size);
+                        evicted_keys.push(evicted_key);
+                    }
+                    *total += new_len;
+                    if let Some(max_bytes) = max_bytes {
+                        while *total > max_bytes {
+                            let Some((evicted_key, evicted)) = idx.pop_lru() else {
+                                break;
+                            };
+                            *total = total.saturating_sub(evicted.size);
+                            evicted_keys.push(evicted_key);
+                        }
+                    }
+                }
+                let key_owned = key.to_string();
+                // The new row and every eviction land in one write
+                // transaction -- not one transaction per file removal like
+                // `Disk` -- so a churny cache doesn't serialize insert and
+                // eviction as separate redb transactions against each other.
+                let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let write_txn = db.begin_write().context("beginning cache write transaction")?;
+                    {
+                        let mut table = write_txn.open_table(CACHE_TABLE).context("opening cache table")?;
+                        table
+                            .insert(key_owned.as_str(), bytes.as_slice())
+                            .context("writing cache entry")?;
+                        for evicted_key in &evicted_keys {
+                            table
+                                .remove(evicted_key.as_str())
+                                .context("removing evicted cache entry")?;
+                        }
+                    }
+                    write_txn.commit().context("committing cache write")
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("s3db: warning: cache: failed to write redb cache entry for {key:?}: {e:#}");
+                    }
+                    Err(e) => eprintln!("s3db: warning: cache: redb insert task panicked: {e}"),
+                }
+            }
         }
     }
 
@@ -322,6 +457,31 @@ impl Store {
                     if let Ok(path) = disk_path(dir, key) {
                         let _ = tokio::fs::remove_file(path).await;
                     }
+                }
+            }
+            Store::Redb { db, index, total_bytes } => {
+                let removed_size = {
+                    let mut idx = index.lock().unwrap();
+                    idx.pop(key).map(|e| e.size)
+                };
+                let Some(size) = removed_size else { return };
+                {
+                    let mut total = total_bytes.lock().unwrap();
+                    *total = total.saturating_sub(size);
+                }
+                let Some(db) = db.clone() else { return };
+                let key_owned = key.to_string();
+                let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let write_txn = db.begin_write().context("beginning cache write transaction")?;
+                    {
+                        let mut table = write_txn.open_table(CACHE_TABLE).context("opening cache table")?;
+                        table.remove(key_owned.as_str()).context("removing cache entry")?;
+                    }
+                    write_txn.commit().context("committing cache removal")
+                })
+                .await;
+                if let Ok(Err(e)) = result {
+                    eprintln!("s3db: warning: cache: failed to remove redb cache entry for {key:?}: {e:#}");
                 }
             }
         }

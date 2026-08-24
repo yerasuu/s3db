@@ -146,6 +146,75 @@ async fn disk_backing_survives_the_memory_cache_never_seeing_it() {
 }
 
 #[tokio::test]
+async fn redb_backing_survives_the_memory_cache_never_seeing_it() {
+    let backend_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let counting = Arc::new(CountingBackend {
+        inner: local(backend_dir.path()),
+        gets: AtomicUsize::new(0),
+    });
+    counting.put_cas("a/b/k", b"v1".to_vec(), None).await.unwrap();
+    let cached = CachedBackend::new(
+        counting.clone(),
+        CacheConfig {
+            max_entries: 10,
+            max_bytes: None,
+            ttl: Duration::from_secs(60),
+            backing: CacheBacking::Redb {
+                dir: cache_dir.path().to_path_buf(),
+            },
+        },
+    );
+
+    let (bytes, _) = cached.get("a/b/k").await.unwrap();
+    assert_eq!(bytes, b"v1");
+    assert!(
+        cache_dir.path().join("s3db-cache.redb").is_file(),
+        "expected a single db file, not one file per key"
+    );
+    assert!(
+        !cache_dir.path().join("a/b/k").exists(),
+        "the key must not become a real path component on disk"
+    );
+
+    cached.get("a/b/k").await.unwrap();
+    assert_eq!(
+        counting.gets.load(Ordering::SeqCst),
+        1,
+        "second get must be served from the redb cache"
+    );
+}
+
+#[tokio::test]
+async fn redb_backing_evicts_the_least_recently_used() {
+    let backend_dir = tempfile::tempdir().unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let counting = Arc::new(CountingBackend {
+        inner: local(backend_dir.path()),
+        gets: AtomicUsize::new(0),
+    });
+    for (k, v) in [("a", "1"), ("b", "2")] {
+        counting.put_cas(k, v.as_bytes().to_vec(), None).await.unwrap();
+    }
+    let cached = CachedBackend::new(
+        counting.clone(),
+        CacheConfig {
+            max_entries: 1,
+            max_bytes: None,
+            ttl: Duration::from_secs(60),
+            backing: CacheBacking::Redb {
+                dir: cache_dir.path().to_path_buf(),
+            },
+        },
+    );
+
+    cached.get("a").await.unwrap(); // cache: {a}
+    cached.get("b").await.unwrap(); // cache: {b}, a evicted (capacity 1)
+    cached.get("a").await.unwrap(); // miss again, a's row must be gone too
+    assert_eq!(counting.gets.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
 async fn entries_over_ttl_are_treated_as_a_miss() {
     let dir = tempfile::tempdir().unwrap();
     let counting = Arc::new(CountingBackend {
