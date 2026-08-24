@@ -30,6 +30,8 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -168,10 +170,70 @@ async fn get_entry(
         .open(&key, &sealed)
         .with_context(|| format!("decrypting {key}"))
         .map_err(ApiError::Internal)?;
-    let value: serde_json::Value = rmp_serde::from_slice(&plain)
-        .with_context(|| format!("{key} is not JSON-representable"))
+    // `rmpv::Value`, no `serde_json::Value`, directo: MessagePack tiene un
+    // tipo binario que JSON no tiene, y bastante entidad de uso real trae uno
+    // sin que el caller lo haya pedido -- `Uuid`, por ejemplo, serializa como
+    // string en JSON pero como bytes crudos en cualquier formato
+    // no-human-readable (ver `Serializer::is_human_readable`), MessagePack
+    // entre ellos. Decodificar directo a `serde_json::Value` hacía fallar la
+    // lectura de CUALQUIER entidad con un campo así con "not
+    // JSON-representable" — precisión correcta, pero inútil para el caso de
+    // uso real de este endpoint (mirar los datos), así que se convierte
+    // (`rmpv_to_json`) en vez de exigir que todo el valor ya sea JSON puro.
+    let raw: rmpv::Value = rmp_serde::from_slice(&plain)
+        .with_context(|| format!("{key} is not a valid MessagePack value"))
         .map_err(ApiError::Internal)?;
-    Ok(Json(value))
+    Ok(Json(rmpv_to_json(raw)))
+}
+
+/// Convierte cualquier `rmpv::Value` a `serde_json::Value`. Los dos tipos que
+/// JSON no tiene se codifican como string en vez de hacer fallar la
+/// conversión entera:
+/// - `Binary` → `"base64:<...>"` (el caso real: un `Uuid` u otro campo que
+///   serializa como bytes crudos en MessagePack).
+/// - `Ext` (tipo, bytes) → `"ext:<tipo>:base64:<...>"` — este crate no
+///   escribe extensiones msgpack hoy, pero un lector genérico no debería
+///   asumirlo para siempre.
+/// Un entero fuera del rango de `i64`/`u64` (posible en teoría, msgpack
+/// soporta hasta u64 completo y esto ya lo cubre) cae a su representación en
+/// texto antes que perder precisión silenciosamente redondeando a `f64`.
+fn rmpv_to_json(value: rmpv::Value) -> serde_json::Value {
+    use rmpv::Value as V;
+    use serde_json::Value as J;
+
+    match value {
+        V::Nil => J::Null,
+        V::Boolean(b) => J::Bool(b),
+        V::Integer(i) => i
+            .as_i64()
+            .map(J::from)
+            .or_else(|| i.as_u64().map(J::from))
+            .unwrap_or_else(|| J::String(i.to_string())),
+        V::F32(f) => serde_json::Number::from_f64(f as f64).map(J::Number).unwrap_or(J::Null),
+        V::F64(f) => serde_json::Number::from_f64(f).map(J::Number).unwrap_or(J::Null),
+        // Bytes que se declararon "string" en el msgpack pero no son UTF-8
+        // válido: no hay representación de texto razonable, así que se
+        // tratan como binario (mismo prefijo que `Binary`). `is_str()` (que
+        // solo pide un `&self`) decide la rama ANTES de mover `s` con
+        // `into_str`/`into_bytes` -- pedir las dos por valor a la vez no
+        // compila (`Utf8String` no es `Copy`).
+        V::String(s) if s.is_str() => J::String(s.into_str().expect("is_str() ya lo confirmó")),
+        V::String(s) => J::String(format!("base64:{}", BASE64.encode(s.into_bytes()))),
+        V::Binary(bytes) => J::String(format!("base64:{}", BASE64.encode(bytes))),
+        V::Array(items) => J::Array(items.into_iter().map(rmpv_to_json).collect()),
+        V::Map(entries) => {
+            let mut map = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                let key = match k {
+                    V::String(s) => s.into_str().unwrap_or_else(|| "<non-utf8 key>".to_string()),
+                    other => rmpv_to_json(other).to_string(),
+                };
+                map.insert(key, rmpv_to_json(v));
+            }
+            J::Object(map)
+        }
+        V::Ext(tag, bytes) => J::String(format!("ext:{tag}:base64:{}", BASE64.encode(bytes))),
+    }
 }
 
 #[cfg(test)]
