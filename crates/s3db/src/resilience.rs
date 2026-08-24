@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! MeteredBackend       (records what happened)
-//!   -> SpooledBackend     (optional: durable local write-intent, see `crate::spool`)
+//!   -> SpooledBackend     (durable local write-intent, see `crate::spool`)
 //!     -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
 //!       -> RetryBackend      (orchestrates retries, backoff between attempts)
 //!         -> ThrottledBackend  (per-lane permit + circuit breaker, held only
@@ -19,8 +19,11 @@
 //! [`crate::spool::SpooledBackend::recover_pending`] replay still gets
 //! `CachedBackend`'s invalidate-on-write behavior, instead of leaving a
 //! stale cached miss behind after silently fixing a write in the
-//! background. Only present when [`ResilienceConfig::spool_path`] is
-//! configured — `None` (the default) reproduces today's stack exactly.
+//! background. Unconditional for any `inner` that isn't already a
+//! [`crate::local::LocalBackend`] — not an opt-in layer an app can leave
+//! unset: a local filesystem call is synchronous (it either landed or it
+//! didn't), so only a driver reachable over a network needs the journal at
+//! all, and every one of those gets it.
 //!
 //! Reads, writes and listings travel independent lanes through the throttle
 //! (see [`Lane`]): each has its own concurrency budget *and* its own circuit
@@ -80,6 +83,17 @@ use tokio::sync::Semaphore;
 /// [`Default`], so a config only ever spells out what it actually changes.
 #[serde(default)]
 pub struct ResilienceConfig {
+    /// Local directory this stack's on-disk state lives under — today just
+    /// `local_dir/spool` for [`crate::spool::SpooledBackend`]'s durable
+    /// write-intent journal, always wired in for a non-local `inner` (see
+    /// [`build_resilient_backend`]) — there's no flag left to turn that off.
+    /// Defaults to `./local` rather than staying unset like the old
+    /// `spool_path: Option<PathBuf>` did: a relative, conventional location
+    /// beats forcing every caller to spell out a path just to get the
+    /// protection this crate now always provides for a remote driver. Still
+    /// fully configurable — a config file overrides it like any other field
+    /// here, this just removes the option to end up with nothing set.
+    pub local_dir: PathBuf,
     pub max_concurrent_get: usize,
     pub max_concurrent_put: usize,
     pub max_concurrent_list: usize,
@@ -89,18 +103,12 @@ pub struct ResilienceConfig {
     pub base_backoff: Duration,
     pub circuit_breaker: CircuitBreakerConfig,
     pub cache: CacheConfig,
-    /// Local directory for [`crate::spool::SpooledBackend`]'s durable
-    /// write-intent record — `None` (the default) skips that layer
-    /// entirely, reproducing the stack as it was before this field existed.
-    /// Not derived from any other config here (same reasoning as
-    /// [`crate::lsm::TableConfig`]'s `wal_path`): an embedding application
-    /// picks the local path, this crate never guesses one.
-    pub spool_path: Option<PathBuf>,
 }
 
 impl Default for ResilienceConfig {
     fn default() -> Self {
         ResilienceConfig {
+            local_dir: PathBuf::from("./local"),
             max_concurrent_get: 64,
             max_concurrent_put: 32,
             max_concurrent_list: 16,
@@ -108,23 +116,32 @@ impl Default for ResilienceConfig {
             base_backoff: Duration::from_millis(100),
             circuit_breaker: CircuitBreakerConfig::default(),
             cache: CacheConfig::default(),
-            spool_path: None,
         }
     }
 }
 
 /// Builds the fixed composition order this module's doc comment describes.
+///
+/// [`crate::spool::SpooledBackend`] wraps every `inner` except one that's
+/// already a [`crate::local::LocalBackend`] — see this module's doc comment
+/// for why a local driver has no ambiguous-failure window for the journal
+/// to close, so wrapping it would only cost a second redb file per write.
 pub fn build_resilient_backend(
     inner: Arc<dyn Backend>,
     config: ResilienceConfig,
     metrics: SharedMetrics,
 ) -> Arc<dyn Backend> {
+    let is_local = inner.as_any().downcast_ref::<crate::local::LocalBackend>().is_some();
     let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(inner, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
     let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(retried, config.cache.clone()));
-    let spooled: Arc<dyn Backend> = match config.spool_path {
-        Some(path) => Arc::new(crate::spool::SpooledBackend::new(cached, path)),
-        None => cached,
+    let spooled: Arc<dyn Backend> = if is_local {
+        cached
+    } else {
+        Arc::new(crate::spool::SpooledBackend::new(
+            cached,
+            config.local_dir.join("spool"),
+        ))
     };
     Arc::new(MeteredBackend::new(spooled, metrics))
 }

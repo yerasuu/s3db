@@ -337,3 +337,84 @@ async fn build_resilient_backend_roundtrips_through_the_whole_stack() {
     assert_eq!(bytes, b"v1");
     assert!(etag.is_some());
 }
+
+/// Forwards every method to `inner` -- stands in for "a real remote driver"
+/// without needing network access: it isn't the `LocalBackend` type, so
+/// `build_resilient_backend`'s local-detection can't mistake it for one.
+#[derive(Debug)]
+struct PassThroughBackend {
+    inner: Arc<dyn Backend>,
+}
+
+#[async_trait::async_trait]
+impl Backend for PassThroughBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+#[tokio::test]
+async fn a_local_inner_never_gets_spooled() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = local(&dir.path().join("data"));
+    let local_dir = dir.path().join("state");
+    let config = ResilienceConfig {
+        local_dir: local_dir.clone(),
+        ..ResilienceConfig::default()
+    };
+    let stack = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+
+    stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
+
+    assert!(
+        !local_dir.join("spool").join("spool.redb").exists(),
+        "a local inner must never be wrapped in SpooledBackend"
+    );
+}
+
+#[tokio::test]
+async fn a_non_local_inner_is_always_spooled() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn Backend> = Arc::new(PassThroughBackend {
+        inner: local(&dir.path().join("data")),
+    });
+    let local_dir = dir.path().join("state");
+    let config = ResilienceConfig {
+        local_dir: local_dir.clone(),
+        ..ResilienceConfig::default()
+    };
+    let stack = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+
+    stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
+
+    assert!(
+        local_dir.join("spool").join("spool.redb").exists(),
+        "spooling must be unconditional for anything that isn't actually local"
+    );
+}
