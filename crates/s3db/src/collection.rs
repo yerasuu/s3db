@@ -769,10 +769,23 @@ impl Collection {
         // bookkeeping-only pages instead of stopping at the first one keeps
         // the cursor honest: it always names a real entry, never a raw key
         // that doesn't have one.
+        // How many entries EACH backend round-trip inside the loop asks for
+        // — deliberately NOT `limit`. A collection whose bookkeeping-shaped
+        // run is genuinely large (`Blob`'s `.parts/` holds one entry per
+        // *chunk* of every blob, not one per blob, so it can outnumber real
+        // names by orders of magnitude) would need `run_length / limit`
+        // round-trips to skip past it if each one only asked for `limit`
+        // keys — thousands of them for a `limit` in the tens. Asking for a
+        // full page every time bounds that to `run_length / SCAN_BATCH`
+        // regardless of what the caller wants back; `SCAN_BATCH` is S3's own
+        // real `max-keys` ceiling ([`crate::s3::S3Backend::list_page`]
+        // clamps to it already), so this never asks for more than a single
+        // provider round-trip can return anyway.
+        const SCAN_BATCH: usize = 1000;
         let mut names: Vec<String> = Vec::new();
         let mut backend_exhausted = false;
         loop {
-            let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit.max(1)).await?;
+            let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit.max(SCAN_BATCH)).await?;
             for (key, _size) in &page.entries {
                 if let Some(name) = self.name_from_key(key, &scan_prefix) {
                     names.push(name);
