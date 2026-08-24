@@ -5,13 +5,45 @@
 //! `Collection` can choose instead, caching the decrypted, deserialized `T`
 //! itself (faster, but only reusable by that one collection). See each
 //! type's own doc comment for when to reach for which.
+//!
+//! [`CachedBackend`] is a **write-through** cache: a confirmed `put_cas`
+//! populates it with the bytes the driver just accepted (see
+//! [`CachedBackend::put_cas`]) instead of merely invalidating, so the very
+//! next read doesn't have to round-trip the driver again. There is
+//! deliberately no write-*back* mode -- `put_cas` is this crate's only write
+//! primitive and its whole point is a real compare-and-swap outcome
+//! (`Cas::Ok`/`Cas::Conflict`) that WAL/lease/manifest code elsewhere
+//! depends on being true; a cache that answered `Ok` before the driver
+//! confirmed it would hand out a fake CAS result and let two concurrent
+//! writers both believe they won.
 
 use crate::backend::{Backend, Cas, DeleteOutcome};
 use anyhow::{Context, Result};
-#[cfg(feature = "streaming")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Where [`CachedBackend`] keeps its bytes. Both are size-capped the same
+/// way (see [`CacheConfig`]); the only difference is what an eviction/miss
+/// costs and whether the cache survives a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CacheBacking {
+    /// In memory, gone on restart, no filesystem I/O of its own.
+    #[default]
+    Memory,
+    /// One file per key under `dir`, so `max_bytes` can be sized well past
+    /// what's comfortable to hold in the process's own RAM (a "cache local
+    /// hasta 1GB" in front of a remote driver is the motivating case) --
+    /// survives a restart, at the cost of a local disk write/read per
+    /// miss/insert instead of a `Vec<u8>` clone. Wiped and recreated at
+    /// [`CachedBackend::new`] every start: entries left over from a
+    /// previous run aren't in the fresh in-memory LRU index, so leaving
+    /// them on disk would grow the directory unbounded across restarts
+    /// instead of staying under `max_bytes` -- safe to discard outright
+    /// since this is a cache, never the source of truth.
+    Disk { dir: PathBuf },
+}
 
 /// Sizing for either cache. `max_entries` is the primary, O(1)-per-op
 /// budget -- this crate's own default profile assumes small, uniformly-sized
@@ -20,7 +52,7 @@ use std::time::{Duration, Instant};
 /// summing/subtracting a byte count on every insert/evict. `max_bytes` is an
 /// optional safety net on top, checked only once `max_entries` is already at
 /// capacity -- not the primary accounting.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct CacheConfig {
     pub max_entries: usize,
@@ -28,6 +60,7 @@ pub struct CacheConfig {
     /// Milliseconds in a config file — see [`crate::serde_duration`].
     #[serde(with = "crate::serde_duration")]
     pub ttl: Duration,
+    pub backing: CacheBacking,
 }
 
 impl Default for CacheConfig {
@@ -36,6 +69,7 @@ impl Default for CacheConfig {
             max_entries: 10_000,
             max_bytes: None,
             ttl: Duration::from_secs(30),
+            backing: CacheBacking::default(),
         }
     }
 }
@@ -44,6 +78,254 @@ struct Entry {
     bytes: Vec<u8>,
     etag: Option<String>,
     inserted_at: Instant,
+}
+
+/// [`CacheBacking::Disk`]'s index entry: the bytes themselves live in the
+/// file at [`disk_path`]`(dir, key)`, this only tracks what's needed to
+/// serve a hit without reading the file (`etag`, TTL) and to account the
+/// byte budget without stat-ing it (`size`).
+struct DiskEntry {
+    etag: Option<String>,
+    size: usize,
+    inserted_at: Instant,
+}
+
+/// Builds `dir/key`, rejecting a key that would escape `dir` -- an absolute
+/// path or a `..` component would otherwise let a caller-controlled key
+/// read/write outside the cache directory (same concern
+/// [`crate::local::files`]'s own key validation exists for).
+fn disk_path(dir: &Path, key: &str) -> Result<PathBuf> {
+    let rel = Path::new(key);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        anyhow::bail!("invalid cache key {key:?}: must be a relative path with no \"..\" segments");
+    }
+    Ok(dir.join(rel))
+}
+
+/// Writes `bytes` to `path` via a temp-file-then-rename so a concurrent
+/// reader never sees a half-written cache file. Deliberately no fsync,
+/// unlike [`crate::local::files::write_atomic`]'s stricter discipline: that
+/// driver IS the source of truth, this is a cache -- an entry lost to a
+/// power cut before it would have hit disk is just a miss on the next read,
+/// never a correctness problem, so it's not worth paying a sync on every
+/// write-through.
+async fn write_cache_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("cache path has no parent directory")?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix(".s3db-cache-tmp-")
+        .tempfile_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    let tmp_path = tmp.into_temp_path();
+    tokio::fs::write(&tmp_path, bytes)
+        .await
+        .with_context(|| format!("writing {}", tmp_path.display()))?;
+    tmp_path
+        .persist(path)
+        .with_context(|| format!("moving temp file -> {}", path.display()))?;
+    Ok(())
+}
+
+/// The actual storage behind [`CachedBackend`] -- see [`CacheBacking`] for
+/// the choice between the two. Every method takes what it needs from
+/// [`CacheConfig`] as a parameter rather than holding one, so the config
+/// stays a single copy on [`CachedBackend`] itself.
+enum Store {
+    Memory {
+        entries: Mutex<lru::LruCache<String, Entry>>,
+        total_bytes: Mutex<usize>,
+    },
+    Disk {
+        dir: PathBuf,
+        index: Mutex<lru::LruCache<String, DiskEntry>>,
+        total_bytes: Mutex<usize>,
+    },
+}
+
+impl Store {
+    fn new(config: &CacheConfig) -> Self {
+        let capacity = std::num::NonZeroUsize::new(config.max_entries.max(1)).expect("max(1) is never zero");
+        match &config.backing {
+            CacheBacking::Memory => Store::Memory {
+                entries: Mutex::new(lru::LruCache::new(capacity)),
+                total_bytes: Mutex::new(0),
+            },
+            CacheBacking::Disk { dir } => {
+                // Best-effort wipe+recreate -- see `CacheBacking::Disk`'s doc
+                // for why starting empty matters. A failure here just means
+                // every subsequent insert fails too (logged there, not
+                // fatal): the cache degrades to "never populates", writes
+                // still land on the real driver same as always.
+                let _ = std::fs::remove_dir_all(dir);
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    eprintln!(
+                        "s3db: warning: cache: failed to create disk cache dir {}: {e}",
+                        dir.display()
+                    );
+                }
+                Store::Disk {
+                    dir: dir.clone(),
+                    index: Mutex::new(lru::LruCache::new(capacity)),
+                    total_bytes: Mutex::new(0),
+                }
+            }
+        }
+    }
+
+    async fn get_fresh(&self, key: &str, ttl: Duration) -> Option<(Vec<u8>, Option<String>)> {
+        match self {
+            Store::Memory { entries, total_bytes } => {
+                let expired_bytes = {
+                    let mut entries = entries.lock().unwrap();
+                    let hit = entries.get(key)?;
+                    if hit.inserted_at.elapsed() > ttl {
+                        Some(entries.pop(key)?.bytes.len())
+                    } else {
+                        return Some((hit.bytes.clone(), hit.etag.clone()));
+                    }
+                };
+                if let Some(len) = expired_bytes {
+                    let mut total = total_bytes.lock().unwrap();
+                    *total = total.saturating_sub(len);
+                }
+                None
+            }
+            Store::Disk { dir, index, .. } => {
+                let (path, etag, expired) = {
+                    let mut idx = index.lock().unwrap();
+                    let hit = idx.get(key)?;
+                    (
+                        disk_path(dir, key).ok()?,
+                        hit.etag.clone(),
+                        hit.inserted_at.elapsed() > ttl,
+                    )
+                };
+                if expired {
+                    self.remove(key).await;
+                    return None;
+                }
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => Some((bytes, etag)),
+                    Err(_) => {
+                        // Evicted/lost out from under the index somehow
+                        // (disk cleared by hand, filesystem issue) -- treat
+                        // as a miss and drop the now-stale index entry.
+                        self.remove(key).await;
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    async fn insert(&self, key: &str, bytes: Vec<u8>, etag: Option<String>, max_bytes: Option<usize>) {
+        match self {
+            Store::Memory { entries, total_bytes } => {
+                let new_len = bytes.len();
+                let mut entries = entries.lock().unwrap();
+                let mut total = total_bytes.lock().unwrap();
+                if let Some((_, evicted)) = entries.push(
+                    key.to_string(),
+                    Entry {
+                        bytes,
+                        etag,
+                        inserted_at: Instant::now(),
+                    },
+                ) {
+                    *total = total.saturating_sub(evicted.bytes.len());
+                }
+                *total += new_len;
+                if let Some(max_bytes) = max_bytes {
+                    while *total > max_bytes {
+                        let Some((_, evicted)) = entries.pop_lru() else { break };
+                        *total = total.saturating_sub(evicted.bytes.len());
+                    }
+                }
+            }
+            Store::Disk {
+                dir,
+                index,
+                total_bytes,
+            } => {
+                let Ok(path) = disk_path(dir, key) else { return };
+                let new_len = bytes.len();
+                if let Err(e) = write_cache_file(&path, &bytes).await {
+                    // Best-effort: the real write already landed on the
+                    // driver (this only ever runs after that succeeded) --
+                    // a disk-cache write failure just means this key stays
+                    // cold, not a failed request.
+                    eprintln!("s3db: warning: cache: failed to write disk cache entry for {key:?}: {e}");
+                    return;
+                }
+                let mut evict_paths = Vec::new();
+                {
+                    let mut idx = index.lock().unwrap();
+                    let mut total = total_bytes.lock().unwrap();
+                    if let Some((evicted_key, evicted)) = idx.push(
+                        key.to_string(),
+                        DiskEntry {
+                            etag,
+                            size: new_len,
+                            inserted_at: Instant::now(),
+                        },
+                    ) {
+                        *total = total.saturating_sub(evicted.size);
+                        if let Ok(p) = disk_path(dir, &evicted_key) {
+                            evict_paths.push(p);
+                        }
+                    }
+                    *total += new_len;
+                    if let Some(max_bytes) = max_bytes {
+                        while *total > max_bytes {
+                            let Some((evicted_key, evicted)) = idx.pop_lru() else {
+                                break;
+                            };
+                            *total = total.saturating_sub(evicted.size);
+                            if let Ok(p) = disk_path(dir, &evicted_key) {
+                                evict_paths.push(p);
+                            }
+                        }
+                    }
+                }
+                for p in evict_paths {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
+            }
+        }
+    }
+
+    async fn remove(&self, key: &str) {
+        match self {
+            Store::Memory { entries, total_bytes } => {
+                let mut entries = entries.lock().unwrap();
+                if let Some(evicted) = entries.pop(key) {
+                    let mut total = total_bytes.lock().unwrap();
+                    *total = total.saturating_sub(evicted.bytes.len());
+                }
+            }
+            Store::Disk {
+                dir,
+                index,
+                total_bytes,
+            } => {
+                let removed_size = {
+                    let mut idx = index.lock().unwrap();
+                    idx.pop(key).map(|e| e.size)
+                };
+                if let Some(size) = removed_size {
+                    {
+                        let mut total = total_bytes.lock().unwrap();
+                        *total = total.saturating_sub(size);
+                    }
+                    if let Ok(path) = disk_path(dir, key) {
+                        let _ = tokio::fs::remove_file(path).await;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A [`Backend`] decorator caching raw `get()` results (bytes + etag) across
@@ -62,8 +344,7 @@ struct Entry {
 pub struct CachedBackend {
     inner: Arc<dyn Backend>,
     config: CacheConfig,
-    entries: Mutex<lru::LruCache<String, Entry>>,
-    total_bytes: Mutex<usize>,
+    store: Store,
 }
 
 #[async_trait::async_trait]
@@ -72,7 +353,8 @@ impl crate::atomic::AtomicBackend for CachedBackend {
     /// cache's entry for every key the batch touched -- regardless of
     /// outcome, exactly as [`Backend::put_cas`] already does here, since a
     /// `BatchOutcome::Conflict` still means the stored value may have moved
-    /// underneath us.
+    /// underneath us. Plain invalidation, not write-through: a batch has no
+    /// single confirmed body per key to refresh the cache with.
     async fn commit_batch(&self, ops: Vec<crate::atomic::BatchOp>) -> Result<crate::atomic::BatchOutcome> {
         let touched: Vec<String> = ops.iter().map(|op| op.key().to_string()).collect();
         // `as_atomic` only claims this capability when the inner backend has
@@ -84,7 +366,7 @@ impl crate::atomic::AtomicBackend for CachedBackend {
             .context("CachedBackend::commit_batch: the wrapped backend has no native transaction")?;
         let result = inner.commit_batch(ops).await;
         for key in touched {
-            self.remove(&key);
+            self.remove(&key).await;
         }
         result
     }
@@ -101,60 +383,20 @@ impl std::fmt::Debug for CachedBackend {
 
 impl CachedBackend {
     pub fn new(inner: Arc<dyn Backend>, config: CacheConfig) -> Self {
-        let capacity = std::num::NonZeroUsize::new(config.max_entries.max(1)).expect("max(1) is never zero");
-        CachedBackend {
-            inner,
-            config,
-            entries: Mutex::new(lru::LruCache::new(capacity)),
-            total_bytes: Mutex::new(0),
-        }
+        let store = Store::new(&config);
+        CachedBackend { inner, config, store }
     }
 
-    fn get_fresh(&self, key: &str) -> Option<(Vec<u8>, Option<String>)> {
-        let mut entries = self.entries.lock().unwrap();
-        let hit = entries.get(key)?;
-        if hit.inserted_at.elapsed() > self.config.ttl {
-            drop(entries);
-            self.remove(key);
-            return None;
-        }
-        Some((hit.bytes.clone(), hit.etag.clone()))
+    async fn get_fresh(&self, key: &str) -> Option<(Vec<u8>, Option<String>)> {
+        self.store.get_fresh(key, self.config.ttl).await
     }
 
-    fn insert(&self, key: &str, bytes: Vec<u8>, etag: Option<String>) {
-        let new_len = bytes.len();
-        let mut entries = self.entries.lock().unwrap();
-        let mut total = self.total_bytes.lock().unwrap();
-        if let Some((_, evicted)) = entries.push(
-            key.to_string(),
-            Entry {
-                bytes,
-                etag,
-                inserted_at: Instant::now(),
-            },
-        ) {
-            *total = total.saturating_sub(evicted.bytes.len());
-        }
-        *total += new_len;
-        // `max_bytes` safety net: once `max_entries`' own LRU eviction isn't
-        // enough (a handful of oversized entries blew the byte budget
-        // before entry-count capacity was reached), evict oldest until back
-        // under budget -- secondary to `max_entries`, never the primary
-        // per-operation accounting.
-        if let Some(max_bytes) = self.config.max_bytes {
-            while *total > max_bytes {
-                let Some((_, evicted)) = entries.pop_lru() else { break };
-                *total = total.saturating_sub(evicted.bytes.len());
-            }
-        }
+    async fn insert(&self, key: &str, bytes: Vec<u8>, etag: Option<String>) {
+        self.store.insert(key, bytes, etag, self.config.max_bytes).await;
     }
 
-    fn remove(&self, key: &str) {
-        let mut entries = self.entries.lock().unwrap();
-        if let Some(evicted) = entries.pop(key) {
-            let mut total = self.total_bytes.lock().unwrap();
-            *total = total.saturating_sub(evicted.bytes.len());
-        }
+    async fn remove(&self, key: &str) {
+        self.store.remove(key).await;
     }
 }
 
@@ -183,34 +425,45 @@ impl Backend for CachedBackend {
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
-        if let Some(hit) = self.get_fresh(key) {
+        if let Some(hit) = self.get_fresh(key).await {
             return Ok(hit);
         }
         let (bytes, etag) = self.inner.get(key).await?;
-        self.insert(key, bytes.clone(), etag.clone());
+        self.insert(key, bytes.clone(), etag.clone()).await;
         Ok((bytes, etag))
     }
 
+    /// Write-through: once the driver actually confirms the write
+    /// (`Cas::Ok`), a follow-up `get` refreshes the cache with the
+    /// authoritative bytes+etag -- `Cas` itself carries neither (see the
+    /// module doc for why guessing them isn't an option), so this costs one
+    /// extra round trip on a write, in exchange for every read until the
+    /// next eviction/TTL/write serving from the cache instead of hitting
+    /// the driver again. `Conflict`/`Err` invalidate instead, same
+    /// reasoning `RequestCache` uses: there's no confirmed body to cache,
+    /// so a forced re-fetch on the next `get` is the only correct fallback.
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         let result = self.inner.put_cas(key, body, expected_etag).await;
-        // Invalidate regardless of outcome, same reasoning as
-        // `RequestCache`: guessing the post-write etag isn't worth the risk
-        // of getting it wrong, a forced re-fetch on the next `get` is cheap
-        // and always correct.
-        self.remove(key);
+        match &result {
+            Ok(Cas::Ok) => match self.inner.get(key).await {
+                Ok((bytes, etag)) => self.insert(key, bytes, etag).await,
+                Err(_) => self.remove(key).await,
+            },
+            _ => self.remove(key).await,
+        }
         result
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         let result = self.inner.delete(key).await;
-        self.remove(key);
+        self.remove(key).await;
         result
     }
 
     async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
         let result = self.inner.delete_many(keys).await;
         for key in keys {
-            self.remove(key);
+            self.remove(key).await;
         }
         result
     }

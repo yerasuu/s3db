@@ -4,12 +4,16 @@
 //!
 //! ```text
 //! MeteredBackend       (records what happened)
-//!   -> RetryBackend      (orchestrates retries, backoff between attempts)
-//!     -> ThrottledBackend  (permit + circuit breaker, held only during
-//!                           the actual network call)
-//!       -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
+//!   -> CachedBackend     (cross-request LRU of raw bytes, see `cache`)
+//!     -> RetryBackend      (orchestrates retries, backoff between attempts)
+//!       -> ThrottledBackend  (per-lane permit + circuit breaker, held only
+//!                             during the actual network call)
 //!         -> the real driver
 //! ```
+//!
+//! Reads, writes and listings travel independent lanes through the throttle
+//! (see [`Lane`]): each has its own concurrency budget *and* its own circuit
+//! breaker, so one of them going bad can't fail-fast the others.
 //!
 //! Retry sits *outside* throttle deliberately: each individual attempt
 //! (including retries) acquires and releases its own permit around just
@@ -18,6 +22,22 @@
 //! concurrency budget everything else is competing for, which is exactly
 //! the pressure that pushes the circuit breaker to open on load it
 //! generated itself.
+//!
+//! The cache sits *outside* both of them, which is what makes a hit a hit:
+//! a key this process already holds is served straight from memory/disk,
+//! ahead of everything below. Underneath the throttle -- where this stack
+//! used to put it -- a cache hit still had to queue for a concurrency
+//! permit it was never going to use, waiting behind in-flight network calls
+//! for data that needed no network at all; and worse, it went through the
+//! circuit breaker, so once the breaker opened every cached read started
+//! failing too, at exactly the moment a local copy was most worth having.
+//! Above them, a hit costs nothing and stays available while the backend
+//! is down; a miss still goes through retry and throttle to the driver,
+//! unchanged.
+//!
+//! Metering stays outermost so what it counts is still every logical call
+//! the caller made -- hits included -- rather than only the ones that
+//! missed and reached the network.
 //!
 //! [`crate::request_cache::RequestCache`] is not part of this stack: it
 //! belongs *outside* all of it, at the application layer, wrapping whatever
@@ -79,10 +99,10 @@ pub fn build_resilient_backend(
     config: ResilienceConfig,
     metrics: SharedMetrics,
 ) -> Arc<dyn Backend> {
-    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(inner, config.cache));
-    let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(cached, &config));
+    let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(inner, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
-    Arc::new(MeteredBackend::new(retried, metrics))
+    let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(retried, config.cache.clone()));
+    Arc::new(MeteredBackend::new(cached, metrics))
 }
 
 /// Records a counter per call (`s3db_backend_<op>_total`) and per outcome
@@ -448,18 +468,45 @@ impl CircuitBreaker {
     }
 }
 
-/// Bounds real network concurrency (separate semaphores for reads, writes,
-/// and listings) and hosts the circuit breaker that measures their error
-/// rate. The permit for one call is held only for the duration of that one
+/// One independent path through [`ThrottledBackend`]: its own concurrency
+/// budget *and* its own circuit breaker.
+///
+/// The breaker belongs to the lane, not to the layer, because reads and
+/// writes fail for different reasons and must not take each other down: a
+/// storage backend refusing writes (quota, a read-only window, a bad
+/// credential on the write path) is still perfectly able to serve reads, and
+/// a shared breaker turned those write failures into fail-fast errors on
+/// every read -- and vice versa. Per-lane, a sick write path opens only the
+/// write breaker and reads keep flowing.
+struct Lane {
+    /// Names the lane in the fail-fast error, so an open breaker says which
+    /// path is actually down instead of just "the backend".
+    name: &'static str,
+    permits: Semaphore,
+    breaker: CircuitBreaker,
+}
+
+impl Lane {
+    fn new(name: &'static str, max_concurrent: usize, breaker: CircuitBreakerConfig) -> Self {
+        Lane {
+            name,
+            permits: Semaphore::new(max_concurrent),
+            breaker: CircuitBreaker::new(breaker),
+        }
+    }
+}
+
+/// Bounds real network concurrency and measures the error rate, both split
+/// per [`Lane`] (reads, writes, listings) so the three don't block each
+/// other. The permit for one call is held only for the duration of that one
 /// call -- acquired after entering this layer, released before returning --
 /// so it's `RetryBackend`'s job (outside this layer) to decide whether to
 /// call again, not this layer's.
 pub struct ThrottledBackend {
     inner: Arc<dyn Backend>,
-    get_permits: Semaphore,
-    put_permits: Semaphore,
-    list_permits: Semaphore,
-    breaker: CircuitBreaker,
+    reads: Lane,
+    writes: Lane,
+    lists: Lane,
 }
 
 impl std::fmt::Debug for ThrottledBackend {
@@ -470,24 +517,28 @@ impl std::fmt::Debug for ThrottledBackend {
 
 impl ThrottledBackend {
     pub fn new(inner: Arc<dyn Backend>, config: &ResilienceConfig) -> Self {
+        // Each lane gets its own breaker built from the same config: the
+        // thresholds are shared policy, the failure counting is not.
         ThrottledBackend {
             inner,
-            get_permits: Semaphore::new(config.max_concurrent_get),
-            put_permits: Semaphore::new(config.max_concurrent_put),
-            list_permits: Semaphore::new(config.max_concurrent_list),
-            breaker: CircuitBreaker::new(config.circuit_breaker),
+            reads: Lane::new("reads", config.max_concurrent_get, config.circuit_breaker),
+            writes: Lane::new("writes", config.max_concurrent_put, config.circuit_breaker),
+            lists: Lane::new("listings", config.max_concurrent_list, config.circuit_breaker),
         }
     }
 
-    async fn guarded<T>(&self, semaphore: &Semaphore, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        if !self.breaker.allow() {
-            anyhow::bail!("circuit breaker open: too many recent failures, failing fast");
+    async fn guarded<T>(&self, lane: &Lane, call: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        if !lane.breaker.allow() {
+            anyhow::bail!(
+                "circuit breaker open for {}: too many recent failures, failing fast",
+                lane.name
+            );
         }
-        let _permit = semaphore.acquire().await.expect("semaphore is never closed");
+        let _permit = lane.permits.acquire().await.expect("semaphore is never closed");
         let result = call.await;
         match &result {
-            Ok(_) => self.breaker.record_success(),
-            Err(_) => self.breaker.record_failure(),
+            Ok(_) => lane.breaker.record_success(),
+            Err(_) => lane.breaker.record_failure(),
         }
         result
     }
@@ -512,44 +563,42 @@ impl Backend for ThrottledBackend {
     }
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
-        self.guarded(&self.get_permits, self.inner.get(key)).await
+        self.guarded(&self.reads, self.inner.get(key)).await
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
-        self.guarded(&self.put_permits, self.inner.put_cas(key, body, expected_etag))
+        self.guarded(&self.writes, self.inner.put_cas(key, body, expected_etag))
             .await
     }
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
-        self.guarded(&self.put_permits, self.inner.delete(key)).await
+        self.guarded(&self.writes, self.inner.delete(key)).await
     }
 
     async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
-        self.guarded(&self.put_permits, self.inner.delete_many(keys)).await
+        self.guarded(&self.writes, self.inner.delete_many(keys)).await
     }
 
     async fn list_page(&self, prefix: &str, after: Option<&str>, limit: usize) -> Result<crate::backend::ListPage> {
-        self.guarded(&self.list_permits, self.inner.list_page(prefix, after, limit))
+        self.guarded(&self.lists, self.inner.list_page(prefix, after, limit))
             .await
     }
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
-        self.guarded(&self.list_permits, self.inner.list_prefix(prefix)).await
+        self.guarded(&self.lists, self.inner.list_prefix(prefix)).await
     }
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
-        self.guarded(&self.get_permits, self.inner.get_range(key, offset, len))
-            .await
+        self.guarded(&self.reads, self.inner.get_range(key, offset, len)).await
     }
 
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
-        self.guarded(&self.put_permits, self.inner.put_stream(key, source))
-            .await
+        self.guarded(&self.writes, self.inner.put_stream(key, source)).await
     }
 
     #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
-        self.guarded(&self.get_permits, self.inner.get_stream(key, dest)).await
+        self.guarded(&self.reads, self.inner.get_stream(key, dest)).await
     }
 }
 

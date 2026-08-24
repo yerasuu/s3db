@@ -155,7 +155,7 @@ async fn throttled_backend_limits_concurrency() {
         ..ResilienceConfig::default()
     };
     let throttled = ThrottledBackend::new(inner, &config);
-    assert_eq!(throttled.get_permits.available_permits(), 2);
+    assert_eq!(throttled.reads.permits.available_permits(), 2);
 }
 
 #[tokio::test]
@@ -185,6 +185,81 @@ async fn circuit_breaker_opens_after_consecutive_failures_and_fails_fast() {
     assert!(format!("{err3:#}").contains("circuit breaker open"));
 }
 
+/// Fails every write, serves every read -- a real shape for a backend with
+/// a quota exhausted, a read-only window, or a credential that only lost
+/// write permission.
+#[derive(Debug)]
+struct WriteFailingBackend {
+    inner: Arc<dyn Backend>,
+}
+
+#[async_trait::async_trait]
+impl Backend for WriteFailingBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, _key: &str, _body: Vec<u8>, _expected_etag: Option<&str>) -> Result<Cas> {
+        anyhow::bail!("simulated write failure")
+    }
+    async fn delete(&self, _key: &str) -> Result<DeleteOutcome> {
+        anyhow::bail!("simulated write failure")
+    }
+    async fn delete_many(&self, _keys: &[String]) -> Result<DeleteOutcome> {
+        anyhow::bail!("simulated write failure")
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, _key: &str, _source: &Path) -> Result<()> {
+        anyhow::bail!("simulated write failure")
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+/// Each lane carries its own breaker, so a write path failing hard enough to
+/// trip its own breaker leaves the read lane untouched. With one breaker
+/// shared across the layer, these write failures fail-fast every read too --
+/// even though reads were never the thing that was broken.
+#[tokio::test]
+async fn a_failing_write_lane_does_not_trip_the_read_lane() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = local(dir.path());
+    inner.put_cas("k", b"v".to_vec(), None).await.unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(WriteFailingBackend { inner });
+    let config = ResilienceConfig {
+        circuit_breaker: CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration: Duration::from_secs(60),
+        },
+        ..ResilienceConfig::default()
+    };
+    let throttled = ThrottledBackend::new(backend, &config);
+
+    // Trip the write lane's breaker.
+    for _ in 0..2 {
+        assert!(throttled.put_cas("k", b"v2".to_vec(), None).await.is_err());
+    }
+    let err = throttled.put_cas("k", b"v2".to_vec(), None).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("circuit breaker open for writes"),
+        "the write lane's breaker should be open: {err:#}"
+    );
+
+    // The read lane never failed, so it is still closed and serving.
+    let (bytes, _etag) = throttled.get("k").await.unwrap();
+    assert_eq!(bytes, b"v");
+}
+
 #[tokio::test]
 async fn metered_backend_records_a_counter_per_call() {
     let dir = tempfile::tempdir().unwrap();
@@ -203,6 +278,51 @@ async fn metered_backend_records_a_counter_per_call() {
             .count(),
         2
     );
+}
+
+/// The cache sits above the throttle/breaker, so a key this process already
+/// holds is served from it even once the backend is failing hard enough to
+/// have tripped the breaker -- the moment a local copy is most worth having.
+/// With the cache underneath (where this stack used to put it) the cached
+/// read went through the breaker too and failed along with everything else.
+#[tokio::test]
+async fn a_cached_read_is_served_while_the_circuit_breaker_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let flaky = Arc::new(FlakyBackend {
+        inner: local(dir.path()),
+        fail_next: AtomicUsize::new(0),
+    });
+    let config = ResilienceConfig {
+        // One attempt per call, so each failed call is exactly one strike
+        // against the breaker.
+        max_retries: 0,
+        circuit_breaker: CircuitBreakerConfig {
+            failure_threshold: 2,
+            open_duration: Duration::from_secs(60),
+        },
+        ..ResilienceConfig::default()
+    };
+    let stack = build_resilient_backend(flaky.clone(), config, Arc::new(RecordingMetrics::default()));
+
+    // Write-through populates the cache with the confirmed bytes.
+    stack.put_cas("cached", b"v1".to_vec(), None).await.unwrap();
+
+    // From here the driver fails every read.
+    flaky.fail_next.store(usize::MAX, Ordering::SeqCst);
+
+    // Two misses to trip the breaker.
+    for _ in 0..2 {
+        assert!(stack.get("uncached").await.is_err());
+    }
+    let err = stack.get("uncached").await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("circuit breaker open"),
+        "expected the breaker to be open: {err:#}"
+    );
+
+    // The cached key still reads, from the cache, without touching the driver.
+    let (bytes, _etag) = stack.get("cached").await.unwrap();
+    assert_eq!(bytes, b"v1");
 }
 
 #[tokio::test]
