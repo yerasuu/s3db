@@ -750,24 +750,56 @@ impl Collection {
     ) -> Result<(Vec<String>, Option<String>)> {
         let scan_prefix = format!("{}/", self.prefix);
         // The cursor a caller hands back is a name; the backend wants a key.
-        let after_key = match after {
+        let mut after_key = match after {
             Some(name) => Some(self.key(name)?),
             None => None,
         };
-        let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit).await?;
-        let mut names = Vec::with_capacity(page.entries.len());
-        for (key, _size) in &page.entries {
-            if let Some(name) = self.name_from_key(key, &scan_prefix) {
-                names.push(name);
+
+        // A single backend page can be ENTIRELY bookkeeping (`.history/`,
+        // `.deleted/`, ...) — a collection with as many tombstones as (or
+        // more than) one page's worth of entries makes this the common
+        // case, not an edge one, since every name in the raw keyspace sorts
+        // before any of them (`.` < alphanumeric). That page still has a
+        // real `next_after` from the backend's point of view; translating
+        // *that* key through `name_from_key` (as an earlier version of this
+        // function did) hits the exact same "starts with `.`" filter and
+        // collapses it to `None`, which reports "no more entries" while
+        // real ones sit just past this page — silently truncating the
+        // collection from every caller's point of view. Looping past
+        // bookkeeping-only pages instead of stopping at the first one keeps
+        // the cursor honest: it always names a real entry, never a raw key
+        // that doesn't have one.
+        let mut names: Vec<String> = Vec::new();
+        let mut backend_exhausted = false;
+        loop {
+            let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit.max(1)).await?;
+            for (key, _size) in &page.entries {
+                if let Some(name) = self.name_from_key(key, &scan_prefix) {
+                    names.push(name);
+                }
+            }
+            match page.next_after {
+                Some(next_key) => after_key = Some(next_key),
+                None => backend_exhausted = true,
+            }
+            if names.len() >= limit || backend_exhausted {
+                break;
             }
         }
-        let next_after = match page.next_after {
-            // Translate the backend's key cursor back into a name cursor. A
-            // page whose last key is bookkeeping (so it produced no name)
-            // still has to advance, hence the cursor comes from the key, not
-            // from `names.last()`.
-            Some(key) => self.name_from_key(&key, &scan_prefix),
-            None => None,
+
+        // A page can contribute up to `limit` names on top of what earlier
+        // loop iterations already had, so the total can overshoot `limit`
+        // by the time the loop above breaks — trim back to it and hand
+        // back the name AT that boundary as the resume point, not whatever
+        // extra names came along with it.
+        let next_after = if names.len() > limit {
+            let cursor = names[limit - 1].clone();
+            names.truncate(limit);
+            Some(cursor)
+        } else if backend_exhausted {
+            None
+        } else {
+            names.last().cloned()
         };
         Ok((names, next_after))
     }

@@ -223,6 +223,31 @@ async fn list_names_and_list_all_see_every_put_item() {
     assert_eq!(all, vec![Widget { count: 1 }, Widget { count: 2 }, Widget { count: 3 }]);
 }
 
+/// Reproduce el bug real: una tanda de tombstones (`.deleted/`) más grande
+/// que `limit` ordena entera ANTES que cualquier nombre real (`.` < resto de
+/// ASCII), así que la primera página de `list_names_page` es bookkeeping
+/// puro. Antes de este fix, esa página traducía su `next_after` crudo con
+/// `name_from_key` -- que también lo filtra por ser bookkeeping -- y
+/// devolvía `(vec![], None)`: "no hay más" con un nombre real esperando
+/// justo después. `limit=1` fuerza el peor caso (cada página trae como
+/// mucho un tombstone) sin necesitar cientos de entradas para probarlo.
+#[tokio::test]
+async fn list_names_page_skips_past_a_bookkeeping_only_page_instead_of_reporting_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+
+    for name in ["a", "b", "c"] {
+        coll.put(&backend, &cipher, name, &Widget { count: 1 }, None).await.unwrap();
+        coll.delete(&backend, &cipher, name).await.unwrap();
+    }
+    coll.put(&backend, &cipher, "z", &Widget { count: 9 }, None).await.unwrap();
+
+    let (names, next_after) = coll.list_names_page(&backend, None, 1).await.unwrap();
+    assert_eq!(names, vec!["z"], "el nombre real no debería perderse detrás del bookkeeping");
+    assert_eq!(next_after, None, "z es el último nombre real: no debería quedar cursor");
+}
+
 #[tokio::test]
 async fn nested_suffix_roundtrips_and_lists_by_name() {
     let dir = tempfile::tempdir().unwrap();
