@@ -2,3 +2,9 @@
 # Library-only workspace: consumers resolve against their own lockfile, so a
 # lockfile committed here would only ever go stale.
 /Cargo.lock
+
+# ResilienceConfig::local_dir's default ("./local") and CacheBacking::Disk's
+# example dir -- land here when a test builds one without overriding the
+# path, since cargo test's cwd is each crate's own manifest directory.
+/crates/s3db/local/
+/crates/s3db/data/
