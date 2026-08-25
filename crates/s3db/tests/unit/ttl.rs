@@ -455,6 +455,50 @@ async fn expire_due_does_not_destroy_a_renewal_that_races_the_sweep() {
 }
 
 #[tokio::test]
+async fn set_expiry_refuses_to_overwrite_a_sweep_s_purge_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    put(&backend, &cipher, "a").await;
+    crate::ttl::set_expiry(&backend, &cipher, &SESSIONS, "a", 1_000)
+        .await
+        .unwrap();
+
+    // Simulates `expire_due`'s claim landing right before a renewal's own
+    // CAS attempt reaches the reverse marker -- whether that renewal's own
+    // read happened before or after the claim, its write must not be able
+    // to land on top of the sentinel.
+    let reverse_key = expiry_at_key(&SESSIONS, "a").unwrap();
+    let (_, etag) = get_json::<ExpiryAt>(&backend, &reverse_key, &cipher).await.unwrap();
+    assert_eq!(
+        put_json(
+            &backend,
+            &reverse_key,
+            &ExpiryAt {
+                expires_at_ms: CLAIMED_FOR_PURGE_MS,
+            },
+            etag.as_deref(),
+            &cipher,
+        )
+        .await
+        .unwrap(),
+        Cas::Ok
+    );
+
+    let err = crate::ttl::set_expiry(&backend, &cipher, &SESSIONS, "a", 9_000)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("purging"), "unexpected error: {err}");
+
+    assert_eq!(
+        get_json::<ExpiryAt>(&backend, &reverse_key, &cipher).await.unwrap().0,
+        ExpiryAt {
+            expires_at_ms: CLAIMED_FOR_PURGE_MS
+        },
+        "the claim must survive a renewal attempt that lost to it"
+    );
+}
+
+#[tokio::test]
 async fn a_foreign_key_under_the_expiry_namespace_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());

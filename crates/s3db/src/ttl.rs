@@ -48,7 +48,11 @@ const EXPIRY_PAGE: usize = 500;
 /// [`clear_expiry`]) touched that marker since. [`Backend`] has no
 /// conditional *delete*, only a conditional write, so this is what turns
 /// "read, then three unconditioned deletes" into something that can't
-/// destroy a renewal that raced it.
+/// destroy a renewal that raced it -- but only because [`set_expiry`]'s own
+/// retry loop refuses to write straight over this value: without that,
+/// a rename racing just after the claim lands would win its retry, and
+/// `expire_due` would still delete the entry and then wipe out the
+/// "successful" rename along with it.
 const CLAIMED_FOR_PURGE_MS: u64 = u64::MAX;
 
 pub fn now_ms() -> u64 {
@@ -137,6 +141,18 @@ pub async fn set_expiry(
     // would leave the caller believing its deadline is now live when the
     // real one is whoever else's won.
     for _ in 0..3 {
+        // `expire_due` has already committed to deleting this entry and is
+        // partway through doing so -- writing over the sentinel (whether
+        // that's this call's very first attempt, or a retry after losing a
+        // CAS to it) would make this call report `Ok(())` for a reschedule
+        // that the sweep's still-in-flight deletes are about to undo anyway,
+        // exactly the false success this marker exists to prevent (see
+        // `CLAIMED_FOR_PURGE_MS`'s own doc). The caller finds out now,
+        // honestly, instead of later discovering the entry is gone despite
+        // this "success".
+        if previous_value.expires_at_ms == CLAIMED_FOR_PURGE_MS {
+            anyhow::bail!("{name}: an expiry sweep is currently purging this entry; retry once it's gone");
+        }
         match put_json(
             backend,
             &reverse_key,
