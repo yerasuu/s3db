@@ -447,10 +447,76 @@ pub async fn rotate(backend: &dyn Backend, ring: &mut KeyRing, new_passphrase: &
     bail!("couldn't rotate the encryption key after several attempts (high contention)")
 }
 
+/// One [`scan_key_usage`] result: how many of the objects it actually
+/// checked under a given prefix still open under the key being scanned for
+/// -- i.e. still need re-encryption before [`forget_key`] would be safe
+/// for *that prefix*.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyUsageReport {
+    pub checked: u64,
+    pub still_encrypted_under_this_key: u64,
+}
+
+/// Scans every object under `prefix`, reporting how many still open under
+/// `key_id` -- this module's answer to "how do I know it's safe to call
+/// [`forget_key`]", since forgetting a key that objects still need is
+/// permanent, unrecoverable data loss, and this crate has no way to check
+/// that automatically (see [`forget_key`]'s own doc comment). It's on the
+/// caller to point this at every prefix that key could ever have sealed
+/// something under -- every collection, every blob namespace, everything
+/// [`crate::snapshot`]/[`crate::ttl`] wrote for it -- so a `0` here is only
+/// as trustworthy as the prefixes actually scanned.
+///
+/// **Does not cover LSM SSTable data.** This checks each object by trying
+/// to open it with the object's own key/path as AAD -- the convention
+/// every [`crate::payload::put_json`]-based object in this crate follows
+/// (`Collection` entries and tombstones, TTL markers, snapshot leases,
+/// secondary index entries, blob metadata, ...). An LSM SSTable's blocks
+/// and footer are sealed under a different, structured AAD (see
+/// `crate::lsm::sstable`'s module doc), so this scan will get a spurious
+/// "doesn't open" for them regardless of which key actually sealed them --
+/// a false negative, not a true "not this key". Never point this at an LSM
+/// table's root expecting a trustworthy answer; that data needs its own,
+/// format-aware check.
+///
+/// Genuinely expensive: unlike a metadata lookup, there is no stored
+/// marker of which key sealed a given object (AEAD ciphertext carries no
+/// such signal by design), so the only way to know is to try opening each
+/// one -- one extra `get` per object, on top of whatever this backend's
+/// own listing costs. Meant for an occasional, deliberate check before a
+/// `forget_key` call, not a hot path.
+pub async fn scan_key_usage(
+    backend: &dyn Backend,
+    ring: &KeyRing,
+    key_id: &str,
+    prefix: &str,
+) -> Result<KeyUsageReport> {
+    let cipher = ring
+        .retired
+        .iter()
+        .find(|(id, _)| id == key_id)
+        .map(|(_, cipher)| cipher)
+        .with_context(|| format!("{key_id} isn't a retired key this KeyRing knows about"))?;
+
+    let mut report = KeyUsageReport::default();
+    for (key, _size) in backend.list_prefix(prefix).await? {
+        let (sealed, etag) = backend.get(&key).await?;
+        if etag.is_none() {
+            continue; // vanished between listing and reading
+        }
+        report.checked += 1;
+        if cipher.open(&key, &sealed).is_ok() {
+            report.still_encrypted_under_this_key += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// Removes a retired key from `EncryptionConfig` for good -- call only once
-/// a caller's own accounting (a GC/maintenance sweep) has confirmed zero
-/// objects in the bucket still reference `key_id`; this crate has no way to
-/// verify that itself. Doesn't touch the in-memory `KeyRing`
+/// a caller's own accounting (a GC/maintenance sweep, informed by
+/// [`scan_key_usage`] over every prefix that could matter) has confirmed
+/// zero objects in the bucket still reference `key_id`; this crate has no
+/// way to verify that itself. Doesn't touch the in-memory `KeyRing`
 /// ([`KeyRing::forget_retired`] is separate, and should usually run first,
 /// well before this on-disk cleanup -- see this module's doc comment). A
 /// no-op (`Ok(())`) if `key_id` is already gone or was never retired.

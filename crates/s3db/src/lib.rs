@@ -75,7 +75,7 @@ pub use config::{AzureParams, BackendConfig, GcsParams, LocalEngine, LocalParams
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
 pub use index::{IndexKey, SecondaryIndex, Segment};
-pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing};
+pub use key_rotation::{EncryptionConfig, KeyMaterial, KeyRing, KeyUsageReport};
 pub use lsm::{
     BackendRegistry, ColumnDef, ColumnStats, CompactionReport, DEFAULT_BACKEND_ID, FlushedSSTable, LsmKey,
     LsmMaintenanceConfig, LsmMaintenanceReport, Manifest, ManifestEntry, MemValue, Memtable, Predicate, Schema,

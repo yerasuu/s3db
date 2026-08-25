@@ -118,6 +118,61 @@ async fn forget_key_refuses_to_remove_the_active_key() {
     assert!(forget_key(&b, &ring, ring.active_key_id()).await.is_err());
 }
 
+#[tokio::test]
+async fn scan_key_usage_counts_down_as_objects_get_re_encrypted() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let mut ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+    let old_key_id = ring.active_key_id().to_string();
+
+    for name in ["widgets/a.json", "widgets/b.json"] {
+        let sealed = ring.active().seal(name, b"v", CompressionStrategy::None).unwrap();
+        b.put_cas(name, sealed, None).await.unwrap();
+    }
+    rotate(&b, &mut ring, "second").await.unwrap();
+
+    let report = scan_key_usage(&b, &ring, &old_key_id, "widgets/").await.unwrap();
+    assert_eq!(
+        report,
+        KeyUsageReport {
+            checked: 2,
+            still_encrypted_under_this_key: 2,
+        },
+        "both objects were sealed under the now-retired key"
+    );
+
+    // Re-encrypt one object under the new active key.
+    let (sealed, etag) = b.get("widgets/a.json").await.unwrap();
+    let plain = ring.open("widgets/a.json", &sealed).unwrap();
+    let resealed = ring
+        .active()
+        .seal("widgets/a.json", &plain, CompressionStrategy::None)
+        .unwrap();
+    b.put_cas("widgets/a.json", resealed, etag.as_deref()).await.unwrap();
+
+    let report = scan_key_usage(&b, &ring, &old_key_id, "widgets/").await.unwrap();
+    assert_eq!(
+        report,
+        KeyUsageReport {
+            checked: 2,
+            still_encrypted_under_this_key: 1,
+        },
+        "only the re-encrypted object should drop out of the count"
+    );
+}
+
+#[tokio::test]
+async fn scan_key_usage_refuses_an_unknown_key_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = backend(dir.path());
+    let ring = get_or_create_keyring(&b, "first", &HashMap::new()).await.unwrap();
+
+    let err = scan_key_usage(&b, &ring, "not-a-real-key-id", "widgets/")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not-a-real-key-id"), "{err}");
+}
+
 /// `EncryptionConfig` decides which key is active and which keys exist at
 /// all, so anything able to write to the bucket repointing `active_key_id`
 /// or trimming `keys` has to be caught before any of it is acted on.
