@@ -83,12 +83,16 @@ enum Inner {
 /// astronomically unlikely at any volume this crate could reach, so it is
 /// deliberately not counted against anything.
 ///
-/// **This counter lives in memory and starts at zero each time the process
-/// starts.** It bounds one process's usage of one derived key, not that
-/// key's lifetime total across restarts. Bounding the lifetime total would
-/// take a durable counter alongside the key, which this crate has nowhere
-/// to put; a deployment that seals at a rate where that distinction matters
-/// should be on the default algorithm, not on AES.
+/// **This counter starts at zero each time the process starts, unless a
+/// caller seeds it.** By itself it bounds one process's usage of one
+/// derived key, not that key's lifetime total across restarts -- this
+/// crate has nowhere durable of its own to keep it. [`Cipher::nonces_issued`]/
+/// [`Cipher::seed_nonces_issued`] are the escape hatch: a caller that
+/// persists the count itself (alongside the key material it already
+/// manages) can carry it across restarts and get the true lifetime bound
+/// back. A deployment that doesn't bother is exactly today's behavior, and
+/// one that seals at a rate and restart frequency where the distinction
+/// matters should reach for the default algorithm instead either way.
 const AES_GCM_NONCE_BUDGET: u64 = 1 << 32;
 
 #[derive(Clone)]
@@ -229,14 +233,39 @@ impl Cipher {
         Ok(nonce_field)
     }
 
-    /// Fast-forwards this key's nonce counter, so a test can reach the
-    /// budget's edge without actually issuing four billion nonces. Test-only
-    /// on purpose: nothing in a real deployment has any business moving this
-    /// counter except by sealing.
-    #[cfg(test)]
-    pub(crate) fn set_nonces_issued(&self, issued: u64) {
+    /// How many nonces this key has handed out in this process so far,
+    /// counted against [`AES_GCM_NONCE_BUDGET`] -- `0` under
+    /// [`EncryptionMode::Disabled`] or any algorithm but
+    /// [`CipherAlgorithm::Aes256Gcm`], since nothing else is tracked at all.
+    ///
+    /// The budget lives in memory only and resets to zero on every process
+    /// restart (see [`AES_GCM_NONCE_BUDGET`]'s doc) -- this crate has
+    /// nowhere durable of its own to keep it. A caller sealing under
+    /// AES-256-GCM at a rate and restart frequency where that distinction
+    /// matters can read this before shutting down and hand it back to
+    /// [`Self::seed_nonces_issued`] right after re-deriving the same key on
+    /// the next start, making the budget track this key's true lifetime
+    /// total instead of resetting every restart. Doing nothing here is
+    /// exactly today's behavior -- persisting this is opt-in, not a new
+    /// requirement, and the default [`CipherAlgorithm::XChaCha20Poly1305`]
+    /// never needs it.
+    pub fn nonces_issued(&self) -> u64 {
+        match &self.0 {
+            Inner::Encrypting { nonces_issued, .. } => nonces_issued.load(Ordering::Relaxed),
+            Inner::Plaintext => 0,
+        }
+    }
+
+    /// Seeds this key's nonce-issuance counter -- the write half of
+    /// [`Self::nonces_issued`]. Call it once, right after
+    /// [`Self::derive`]/[`Self::derive_with`]/[`Self::from_key`], before
+    /// sealing anything with the returned `Cipher`; a no-op under
+    /// [`EncryptionMode::Disabled`] or any algorithm but
+    /// [`CipherAlgorithm::Aes256Gcm`]. Also what lets a test reach the
+    /// budget's edge without actually issuing four billion nonces.
+    pub fn seed_nonces_issued(&self, count: u64) {
         if let Inner::Encrypting { nonces_issued, .. } = &self.0 {
-            nonces_issued.store(issued, Ordering::Relaxed);
+            nonces_issued.store(count, Ordering::Relaxed);
         }
     }
 

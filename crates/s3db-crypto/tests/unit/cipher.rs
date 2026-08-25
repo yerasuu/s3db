@@ -247,7 +247,7 @@ fn tampering_with_the_algorithm_header_is_detected() {
 #[test]
 fn aes_gcm_refuses_to_seal_past_its_nonce_budget() {
     let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
-    c.set_nonces_issued((1 << 32) - 1);
+    c.seed_nonces_issued((1 << 32) - 1);
     // The last nonce inside the budget is still handed out.
     assert!(c.seal("k", b"still fine", CompressionStrategy::None).is_ok());
     let err = c
@@ -264,7 +264,7 @@ fn aes_gcm_refuses_to_seal_past_its_nonce_budget() {
 #[test]
 fn the_nonce_budget_is_shared_across_clones() {
     let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
-    c.set_nonces_issued(1 << 32);
+    c.seed_nonces_issued(1 << 32);
     let clone = c.clone();
     assert!(clone.seal("k", b"x", CompressionStrategy::None).is_err());
 }
@@ -274,8 +274,59 @@ fn the_nonce_budget_is_shared_across_clones() {
 #[test]
 fn xchacha_has_no_nonce_budget() {
     let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::XChaCha20Poly1305).unwrap();
-    c.set_nonces_issued(u64::MAX);
+    c.seed_nonces_issued(u64::MAX);
     assert!(c.seal("k", b"x", CompressionStrategy::None).is_ok());
+}
+
+/// `nonces_issued` must reflect real sealing, not just what was seeded --
+/// the read half of the persistence escape hatch has to agree with the
+/// write half.
+#[test]
+fn nonces_issued_reports_real_usage() {
+    let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    assert_eq!(c.nonces_issued(), 0);
+    c.seal("k", b"a", CompressionStrategy::None).unwrap();
+    c.seal("k", b"b", CompressionStrategy::None).unwrap();
+    assert_eq!(c.nonces_issued(), 2);
+}
+
+/// `nonces_issued`/`seed_nonces_issued` only mean anything for the one
+/// algorithm whose budget is tracked at all.
+#[test]
+fn nonces_issued_is_always_zero_off_aes_gcm() {
+    let xchacha = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::XChaCha20Poly1305).unwrap();
+    xchacha.seal("k", b"a", CompressionStrategy::None).unwrap();
+    assert_eq!(xchacha.nonces_issued(), 0);
+
+    let disabled = Cipher::derive_for(EncryptionMode::Disabled, "pw", &[7u8; SALT_LEN]).unwrap();
+    assert_eq!(disabled.nonces_issued(), 0);
+    disabled.seed_nonces_issued(1 << 32); // a no-op, not a panic
+    assert_eq!(disabled.nonces_issued(), 0);
+}
+
+/// The scenario `nonces_issued`/`seed_nonces_issued` exist for: a caller
+/// persists the count somewhere durable of its own before shutting down,
+/// then hands it back to a brand-new `Cipher` (simulating a restart) built
+/// from the same key -- the budget must pick up where the old process left
+/// off instead of resetting to zero.
+#[test]
+fn seeding_a_fresh_cipher_carries_the_budget_across_a_simulated_restart() {
+    let before_restart = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    before_restart.seed_nonces_issued((1 << 32) - 1);
+    before_restart.seal("k", b"last one before shutdown", CompressionStrategy::None).unwrap();
+    let persisted_count = before_restart.nonces_issued();
+
+    // A fresh `Cipher`, as if this were a new process re-deriving the same
+    // key -- without seeding, it would start back at zero and happily
+    // allow another 2^32 nonces this key has no real budget left for.
+    let after_restart = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
+    after_restart.seed_nonces_issued(persisted_count);
+
+    let err = after_restart
+        .seal("k", b"first write after restart", CompressionStrategy::None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("budget"), "{err}");
 }
 
 /// `from_key` takes raw material, so two ciphers built from the same key
@@ -322,6 +373,6 @@ fn cloning_shares_key_state_rather_than_copying_it() {
     let c = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
     let clone = c.clone();
     c.seal("k", b"x", CompressionStrategy::None).unwrap();
-    clone.set_nonces_issued(1 << 32);
+    clone.seed_nonces_issued(1 << 32);
     assert!(c.seal("k", b"x", CompressionStrategy::None).is_err());
 }
