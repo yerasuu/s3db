@@ -818,6 +818,70 @@ async fn flush_does_not_block_a_concurrent_put() {
     assert_eq!(table.get_unflushed(b"b").await, Some(MemValue::Put(b"2".to_vec())));
 }
 
+/// Regression test for the WAL-rotation clobber this crate used to have:
+/// `Wal::rotate` always hands the live file off to the same fixed
+/// `.rotating` sibling name, which is only safe if `Table` really does
+/// serialize whole `flush()` calls (network I/O included) rather than just
+/// the drain+rotate step. Before `flush_lock` existed, two concurrent
+/// `flush()` calls could each rotate, with the second's rename silently
+/// clobbering the first's still-in-flight backup -- a crash before the
+/// first flush's `manifest::append` completed would then lose that flush's
+/// entire WAL generation permanently. This drives two real overlapping
+/// flushes and checks both survive with every row intact.
+#[tokio::test]
+async fn two_concurrent_flushes_do_not_clobber_each_others_wal_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Arc<dyn Backend> = Arc::new(FaultyPutCas {
+        inner: test_backend(dir.path()),
+        delay: Duration::from_millis(200),
+        fail: false,
+    });
+    let cipher = test_cipher();
+    let config = TableConfig::new(
+        backend.clone(),
+        cipher.clone(),
+        "audit_log",
+        dir.path().join("table.wal"),
+    );
+    let table = Arc::new(Table::open(config).await.unwrap());
+    table.put(b"a".to_vec(), b"1".to_vec()).await.unwrap();
+
+    let table_1 = Arc::clone(&table);
+    let started = std::time::Instant::now();
+    let flush_1 = tokio::spawn(async move { table_1.flush().await });
+    // Let flush_1 drain+rotate and sit inside its (delayed) put_cas, so its
+    // WAL rotation has already happened before flush_2 is even attempted.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Lands on the fresh post-rotation memtable/WAL -- exactly what a
+    // second flush would drain if it ran concurrently instead of waiting.
+    table.put(b"b".to_vec(), b"2".to_vec()).await.unwrap();
+    let table_2 = Arc::clone(&table);
+    let flush_2 = tokio::spawn(async move { table_2.flush().await });
+
+    let flushed_1 = flush_1.await.unwrap().unwrap();
+    let flushed_2 = flush_2.await.unwrap().unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_millis(350),
+        "flush_2 must wait for flush_1's entire call, network I/O included, \
+         instead of racing its WAL rotation -- took only {:?}",
+        started.elapsed()
+    );
+
+    let flushed_1 = flushed_1.expect("flush_1 had a row to flush");
+    let flushed_2 = flushed_2.expect("flush_2 had a row to flush");
+    assert_ne!(flushed_1.key, flushed_2.key, "each flush must produce its own SSTable");
+
+    let (manifest, _) = manifest::load(backend.as_ref(), &cipher, "audit_log").await.unwrap();
+    assert_eq!(
+        manifest.sstables.len(),
+        2,
+        "both flushes' SSTables must be referenced, none lost to a clobbered rotation"
+    );
+    assert_eq!(table.get(b"a").await.unwrap(), Some(b"1".to_vec()));
+    assert_eq!(table.get(b"b").await.unwrap(), Some(b"2".to_vec()));
+}
+
 #[tokio::test]
 async fn flush_failure_restores_the_row_into_the_live_memtable() {
     let dir = tempfile::tempdir().unwrap();

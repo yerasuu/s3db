@@ -145,6 +145,19 @@ pub struct Table {
     /// [`Table::renew_lease`] can move the lease through a `&self` — which is
     /// how every other method here is called.
     lease: Mutex<LeaseState>,
+    /// Serializes the *entire* [`Self::flush`] call, network I/O included —
+    /// not just the drain+rotate step `state`'s own lock already covers.
+    /// [`Wal::rotate`] always renames to the same fixed `.rotating` sibling
+    /// name, on the assumption that only one flush is ever mid-flight; that
+    /// assumption used to be nothing but a comment, so two concurrent
+    /// `flush()` calls (a manual flush racing a maintenance tick, or two
+    /// overlapping ticks) could each rotate, with the second's rename
+    /// silently clobbering the first's not-yet-durable backup. A crash
+    /// before the first flush's `manifest::append` completed would then lose
+    /// that flush's whole WAL generation — an already-fsync'd, acknowledged
+    /// write — permanently, since [`super::wal::heal_rotating_wal`] only
+    /// ever finds the survivor. This mutex makes the assumption real.
+    flush_lock: Mutex<()>,
 }
 
 /// This handle's relationship to a [`WriterLease`].
@@ -198,6 +211,7 @@ impl Table {
                 Some(lease) => LeaseState::Held(lease),
                 None => LeaseState::Unleased,
             }),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -226,6 +240,7 @@ impl Table {
             }),
             read_only: true,
             lease: Mutex::new(LeaseState::Unleased),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -562,15 +577,17 @@ impl Table {
     /// row count (see the module doc). `Ok(None)` if there was nothing to
     /// flush.
     ///
-    /// The drain and the WAL rotation happen under `state`'s lock, but the
-    /// SSTable build and the two network calls (`put_cas`, then
-    /// `manifest::append`) run *after* releasing it: rotation (see
-    /// [`super::wal`]'s module doc) hands the WAL's current file off to a
-    /// `.rotating` sibling and puts a fresh, empty one in its place before
-    /// the lock is released, so [`Self::put`]/[`Self::delete`] calls landing
-    /// during this flush's I/O go to that fresh WAL and the now-empty
-    /// memtable, never blocking on (or racing) this flush's own network
-    /// round trips.
+    /// The whole call is serialized by `flush_lock` — a second concurrent
+    /// `flush()` waits rather than racing this one's WAL rotation (see that
+    /// field's doc). Within that, the drain and the WAL rotation happen
+    /// under `state`'s lock, but the SSTable build and the two network calls
+    /// (`put_cas`, then `manifest::append`) run *after* releasing it:
+    /// rotation (see [`super::wal`]'s module doc) hands the WAL's current
+    /// file off to a `.rotating` sibling and puts a fresh, empty one in its
+    /// place before the lock is released, so [`Self::put`]/[`Self::delete`]
+    /// calls landing during this flush's I/O go to that fresh WAL and the
+    /// now-empty memtable, never blocking on (or racing) this flush's own
+    /// network round trips.
     ///
     /// Ordered `put_cas` -> manifest append -> rotated-file cleanup
     /// specifically so each failure mode is at worst wasteful, never
@@ -599,6 +616,10 @@ impl Table {
     /// as the process keeps running.
     pub async fn flush(&self) -> Result<Option<FlushedSSTable>> {
         self.ensure_writable().await?;
+        // Held for this whole call, including the network I/O below --
+        // see the field doc on `flush_lock` for why a second concurrent
+        // flush racing this one is the actual bug being closed here.
+        let _flush_guard = self.flush_lock.lock().await;
         let (drained, rotating_path) = {
             let mut state = self.state.lock().await;
             if state.memtable.is_empty() {

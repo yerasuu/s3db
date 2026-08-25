@@ -60,8 +60,11 @@ const TAG_DELETE: u8 = 1;
 /// The one fixed sibling name [`Wal::rotate`] hands the current file off
 /// to. A single fixed name (not a generation counter) is enough because
 /// [`super::Table`] never has more than one flush in flight at a time --
-/// its own `state` lock only ever gets rotated out from under one flush
-/// attempt before that attempt either finishes or aborts.
+/// its own `flush_lock` serializes the entire flush call, rotation
+/// included, so no second attempt can rename over this one before it
+/// either finishes or aborts. (The `state` lock alone doesn't give this:
+/// it's released after rotation, before the flush's network I/O, which is
+/// exactly the window `flush_lock` covers instead.)
 fn rotating_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".rotating");
