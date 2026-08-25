@@ -20,10 +20,16 @@ use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::collection::{Collection, Tombstone};
 use crate::naming::validate_segment;
-use crate::payload::{get_json, put_json};
+use crate::payload::{delete_object, get_json, put_json};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Entities/tombstones restored per page, and per cursor checkpoint --
+/// same reasoning as [`crate::migrate`]'s `MIGRATE_PAGE`: a crash loses at
+/// most one page's worth of already-redone work, and the checkpoint write
+/// is noise next to the page it covers.
+const RESTORE_PAGE: usize = 200;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -164,6 +170,145 @@ pub async fn backup_collection(
     Ok(manifest)
 }
 
+/// Which half of a restore a [`RestoreProgress`] cursor belongs to.
+/// Entities restore before tombstones (the same order [`backup_collection`]
+/// itself writes them in), so a crash during entities never has to also
+/// redo tombstones that hadn't started yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestorePhase {
+    #[default]
+    Entities,
+    Tombstones,
+}
+
+/// [`restore_collection`]'s own resume cursor, mirroring
+/// [`crate::migrate::InProgress`]'s reasoning: a crash partway through a
+/// large restore must not require redoing everything, and must not leave
+/// the destination in a state indistinguishable from a clean, complete
+/// one. Persisted at `<collection.prefix>/.restore.json` on the
+/// *destination* -- its mere existence marks "a restore is in progress or
+/// was interrupted here", and it's deleted only once every entity and
+/// tombstone the manifest says should exist has been accounted for (see
+/// [`restore_collection`]'s post-restore check).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RestoreProgress {
+    pub backup_id: String,
+    pub started_at_ms: u64,
+    pub phase: RestorePhase,
+    /// Last entity name restored, for [`RestorePhase::Entities`]. A resume
+    /// continues strictly after this one via [`Collection::list_names_page`].
+    pub last_name: Option<String>,
+    /// Last tombstone *key* restored, for [`RestorePhase::Tombstones`] --
+    /// a raw backend key, not a bare name, since that phase resumes via
+    /// [`Backend::list_page`] directly rather than a `Collection` view.
+    pub last_key: Option<String>,
+    pub entities_restored: u64,
+    pub tombstones_restored: u64,
+}
+
+fn restore_progress_key(collection: &Collection) -> String {
+    format!("{}/.restore.json", collection.prefix)
+}
+
+/// Writes the resume cursor and returns its new etag -- a conflict means a
+/// second restore runner is active against the same destination
+/// collection, which is not something to retry into: two runners racing
+/// the same entities would each see the other's writes as the state they
+/// started from.
+async fn checkpoint_restore(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    key: &str,
+    progress: &RestoreProgress,
+    expected_etag: Option<&str>,
+) -> Result<Option<String>> {
+    if put_json(backend, key, progress, expected_etag, cipher).await? == Cas::Conflict {
+        bail!("restore: {key} changed underneath this run -- another restore runner is active");
+    }
+    let (_progress, etag) = get_json::<RestoreProgress>(backend, key, cipher).await?;
+    Ok(etag)
+}
+
+/// Everything one [`restore_collection`] call shares across every entity
+/// and tombstone it restores -- bundled so `restore_one_entity`/
+/// `restore_one_tombstone` take one context argument instead of six
+/// positional ones for what is, per call, always the same fixed set.
+struct RestoreCtx<'a> {
+    backup_backend: &'a dyn Backend,
+    backup_cipher: &'a Cipher,
+    dest_backend: &'a dyn Backend,
+    dest_cipher: &'a Cipher,
+    collection: &'a Collection,
+    backup_id: &'a str,
+}
+
+/// Restores one entity from the backup into `ctx.collection`. CAS-with-
+/// reread, not a single blind attempt: restore overwrites the destination
+/// key unconditionally *by intent* (a deliberate, caller-initiated
+/// overwrite, not a CAS-protected merge), but the etag read here isn't
+/// atomic with the write below, so a write landing on it in between must
+/// not silently leave this entity unrestored.
+async fn restore_one_entity(ctx: &RestoreCtx<'_>, backup_view: &Collection, name: &str) -> Result<()> {
+    let key = backup_view.key(name)?;
+    let (sealed, backup_etag) = ctx.backup_backend.get(&key).await?;
+    // Unlike `backup_collection`'s own scroll (where a vanished entity is
+    // just a live write racing the backup), a backup is meant to be
+    // immutable once taken -- so listed-but-unreadable here means the
+    // backup itself is corrupt or was modified since, and silently
+    // skipping it would restore an incomplete collection with no signal
+    // that anything was wrong.
+    backup_etag.with_context(|| {
+        format!(
+            "{key}: listed as part of backup {} but vanished before it could be read",
+            ctx.backup_id
+        )
+    })?;
+    let plain = ctx.backup_cipher.open(&key, &sealed)?;
+    let dest_key = ctx.collection.key(name)?;
+    let resealed = ctx.dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None)?;
+    let (_, mut current_etag) = ctx.dest_backend.get(&dest_key).await?;
+    for _ in 0..3 {
+        match ctx
+            .dest_backend
+            .put_cas(&dest_key, resealed.clone(), current_etag.as_deref())
+            .await?
+        {
+            Cas::Ok => return Ok(()),
+            Cas::Conflict => current_etag = ctx.dest_backend.get(&dest_key).await?.1,
+        }
+    }
+    bail!("{dest_key}: too many CAS conflicts restoring it (giving up after 3 attempts)")
+}
+
+/// [`restore_one_entity`]'s tombstone counterpart -- same immutable-backup
+/// reasoning for a vanished read, same CAS-with-reread for the write.
+async fn restore_one_tombstone(ctx: &RestoreCtx<'_>, key: &str, name: &str) -> Result<()> {
+    let (tombstone, backup_etag) = get_json::<Tombstone>(ctx.backup_backend, key, ctx.backup_cipher).await?;
+    backup_etag.with_context(|| {
+        format!(
+            "{key}: listed as part of backup {} but vanished before it could be read",
+            ctx.backup_id
+        )
+    })?;
+    let dest_tombstone_key = format!("{}/.deleted/{name}.json", ctx.collection.prefix);
+    let (_, mut current_etag) = ctx.dest_backend.get(&dest_tombstone_key).await?;
+    for _ in 0..3 {
+        match put_json(
+            ctx.dest_backend,
+            &dest_tombstone_key,
+            &tombstone,
+            current_etag.as_deref(),
+            ctx.dest_cipher,
+        )
+        .await?
+        {
+            Cas::Ok => return Ok(()),
+            Cas::Conflict => current_etag = ctx.dest_backend.get(&dest_tombstone_key).await?.1,
+        }
+    }
+    bail!("{dest_tombstone_key}: too many CAS conflicts restoring it (giving up after 3 attempts)")
+}
+
 /// Restores every entity (and tombstone, if the backup has any) from a
 /// prior [`backup_collection`] call back into `collection` at
 /// `(dest_backend, dest_cipher)`. Returns the original manifest, unchanged
@@ -171,6 +316,14 @@ pub async fn backup_collection(
 /// `BackupConsistency::FuzzySnapshot` caveat the backup itself was taken
 /// under, and should treat the restored result with the same care, not
 /// assume a restore somehow adds precision the backup never had.
+///
+/// Resumable and self-verifying, via [`RestoreProgress`]: a crash partway
+/// through picks back up from its last checkpoint on the next call with
+/// the same `backup_id` (a different `backup_id` while one is already in
+/// progress is refused, not silently overridden), and this only returns
+/// `Ok` once the number of entities and tombstones actually restored
+/// matches what the manifest recorded -- never on a guess that reaching
+/// the end of a listing meant everything landed.
 pub async fn restore_collection(
     backup_backend: &dyn Backend,
     backup_cipher: &Cipher,
@@ -197,84 +350,117 @@ pub async fn restore_collection(
         entropy: collection.entropy,
         ..Collection::new_owned(prefix.clone())
     };
+    let ctx = RestoreCtx {
+        backup_backend,
+        backup_cipher,
+        dest_backend,
+        dest_cipher,
+        collection,
+        backup_id,
+    };
 
-    for name in backup_view.list_names(backup_backend).await? {
-        let key = backup_view.key(&name)?;
-        let (sealed, backup_etag) = backup_backend.get(&key).await?;
-        if backup_etag.is_none() {
-            continue;
+    let progress_key = restore_progress_key(collection);
+    let (existing, existing_etag) = get_json::<RestoreProgress>(dest_backend, &progress_key, dest_cipher).await?;
+    let mut progress_etag;
+    let mut progress = if existing_etag.is_some() {
+        if existing.backup_id != backup_id {
+            bail!(
+                "{progress_key}: an unfinished restore of backup {} is already in progress for this \
+                 collection -- finish or clear it before restoring a different backup here",
+                existing.backup_id
+            );
         }
-        let plain = backup_cipher.open(&key, &sealed)?;
-        let dest_key = collection.key(&name)?;
-        let resealed = dest_cipher.seal(&dest_key, &plain, CompressionStrategy::None)?;
-        // Overwrites whatever's currently at `dest_key` -- restore is a
-        // deliberate, caller-initiated overwrite, not a CAS-protected merge.
-        // CAS-with-reread, not a single blind attempt: the etag read above
-        // isn't atomic with the write below, so a write landing on
-        // `dest_key` in between must not silently leave this entity
-        // unrestored.
-        let (_, mut current_etag) = dest_backend.get(&dest_key).await?;
-        let mut restored = false;
-        for _ in 0..3 {
-            match dest_backend
-                .put_cas(&dest_key, resealed.clone(), current_etag.as_deref())
-                .await?
-            {
-                Cas::Ok => {
-                    restored = true;
-                    break;
-                }
-                Cas::Conflict => {
-                    current_etag = dest_backend.get(&dest_key).await?.1;
-                }
+        progress_etag = existing_etag;
+        existing
+    } else {
+        let fresh = RestoreProgress {
+            backup_id: backup_id.to_string(),
+            started_at_ms: now_ms(),
+            ..RestoreProgress::default()
+        };
+        progress_etag = checkpoint_restore(dest_backend, dest_cipher, &progress_key, &fresh, None).await?;
+        fresh
+    };
+
+    if progress.phase == RestorePhase::Entities {
+        let mut after = progress.last_name.clone();
+        loop {
+            let (names, next_after) = backup_view
+                .list_names_page(backup_backend, after.as_deref(), RESTORE_PAGE)
+                .await?;
+            for name in &names {
+                restore_one_entity(&ctx, &backup_view, name).await?;
+                progress.entities_restored += 1;
+            }
+            progress.last_name = names.last().cloned().or(progress.last_name);
+            progress_etag =
+                checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref())
+                    .await?;
+            match next_after {
+                Some(next) => after = Some(next),
+                None => break,
             }
         }
-        if !restored {
-            bail!("{dest_key}: too many CAS conflicts restoring it (giving up after 3 attempts)");
-        }
+        progress.phase = RestorePhase::Tombstones;
+        progress_etag =
+            checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref()).await?;
     }
 
     if manifest.includes_tombstones {
         let tombstones_prefix = format!("{prefix}/.deleted/");
-        for key in crate::payload::list_all_keys(backup_backend, &tombstones_prefix).await? {
-            let Some(name) = key
-                .strip_prefix(&tombstones_prefix)
-                .and_then(|s| s.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            let (tombstone, backup_etag) = get_json::<Tombstone>(backup_backend, &key, backup_cipher).await?;
-            if backup_etag.is_none() {
-                continue;
+        let mut after = progress.last_key.clone();
+        loop {
+            let page = backup_backend
+                .list_page(&tombstones_prefix, after.as_deref(), RESTORE_PAGE)
+                .await?;
+            if page.entries.is_empty() {
+                break;
             }
-            let dest_tombstone_key = format!("{}/.deleted/{name}.json", collection.prefix);
-            let (_, mut current_etag) = dest_backend.get(&dest_tombstone_key).await?;
-            let mut restored = false;
-            for _ in 0..3 {
-                match put_json(
-                    dest_backend,
-                    &dest_tombstone_key,
-                    &tombstone,
-                    current_etag.as_deref(),
-                    dest_cipher,
-                )
-                .await?
-                {
-                    Cas::Ok => {
-                        restored = true;
-                        break;
-                    }
-                    Cas::Conflict => {
-                        current_etag = dest_backend.get(&dest_tombstone_key).await?.1;
-                    }
-                }
+            for (key, _size) in &page.entries {
+                let Some(name) = key.strip_prefix(&tombstones_prefix).and_then(|s| s.strip_suffix(".json")) else {
+                    continue; // a foreign key under this namespace -- left alone, not guessed at
+                };
+                restore_one_tombstone(&ctx, key, name).await?;
+                progress.tombstones_restored += 1;
             }
-            if !restored {
-                bail!("{dest_tombstone_key}: too many CAS conflicts restoring it (giving up after 3 attempts)");
+            progress.last_key = page.entries.last().map(|(key, _)| key.clone()).or(progress.last_key);
+            progress_etag =
+                checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref())
+                    .await?;
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
             }
         }
     }
 
+    // Never declare a restore complete on "the listing ran out" alone --
+    // only once the counts actually match what the backup's own manifest
+    // recorded for it. `entity_count`/`tombstone_count` are only what this
+    // *backup* newly wrote; a name already occupied at backup time
+    // (`entity_conflicts`/`tombstone_conflicts`) is still a real object
+    // under the backup's prefix today, so both figure into what a restore
+    // must account for.
+    let expected_entities = (manifest.entity_count + manifest.entity_conflicts) as u64;
+    if progress.entities_restored != expected_entities {
+        bail!(
+            "restore: backup {backup_id}'s manifest accounts for {expected_entities} entities but only \
+             {} were found and restored -- not marking this restore complete",
+            progress.entities_restored
+        );
+    }
+    if manifest.includes_tombstones {
+        let expected_tombstones = (manifest.tombstone_count + manifest.tombstone_conflicts) as u64;
+        if progress.tombstones_restored != expected_tombstones {
+            bail!(
+                "restore: backup {backup_id}'s manifest accounts for {expected_tombstones} tombstones but \
+                 only {} were found and restored -- not marking this restore complete",
+                progress.tombstones_restored
+            );
+        }
+    }
+
+    delete_object(dest_backend, &progress_key).await;
     Ok(manifest)
 }
 

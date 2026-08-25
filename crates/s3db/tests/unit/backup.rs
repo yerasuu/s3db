@@ -126,6 +126,148 @@ async fn backup_reencrypts_under_a_different_destination_key() {
 }
 
 #[tokio::test]
+async fn restore_cleans_up_its_progress_marker_once_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 51);
+    let coll = Collection::new("widgets");
+    coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+    backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+        .await
+        .unwrap();
+    backend.delete(&coll.key("a").unwrap()).await.unwrap();
+
+    restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+        .await
+        .unwrap();
+
+    let (_, etag) = get_json::<RestoreProgress>(&backend, &restore_progress_key(&coll), &cipher)
+        .await
+        .unwrap();
+    assert!(
+        etag.is_none(),
+        "a completed, verified restore must not leave its progress marker behind"
+    );
+}
+
+/// The core resumability guarantee: a checkpoint left by an interrupted run
+/// makes the next call skip exactly what it already covered, not redo it
+/// and not skip past what still needs restoring.
+#[tokio::test]
+async fn restore_resumes_from_a_checkpoint_instead_of_redoing_completed_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 53);
+    let coll = Collection::new("widgets");
+    for (name, count) in [("a", 1), ("b", 2)] {
+        coll.put(&backend, &cipher, name, &Widget { count }, None)
+            .await
+            .unwrap();
+    }
+    backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+        .await
+        .unwrap();
+    for name in ["a", "b"] {
+        backend.delete(&coll.key(name).unwrap()).await.unwrap();
+    }
+
+    // Simulate a crash right after "a" was restored: a checkpoint whose
+    // cursor already points past it, plus a sentinel value at "a" that a
+    // real restore of "a" would have overwritten -- if resume actually
+    // skips it as already done, the sentinel survives.
+    coll.put(&backend, &cipher, "a", &Widget { count: 999 }, None)
+        .await
+        .unwrap();
+    let progress = RestoreProgress {
+        backup_id: "backup1".to_string(),
+        started_at_ms: now_ms(),
+        phase: RestorePhase::Entities,
+        last_name: Some("a".to_string()),
+        last_key: None,
+        entities_restored: 1,
+        tombstones_restored: 0,
+    };
+    put_json(&backend, &restore_progress_key(&coll), &progress, None, &cipher)
+        .await
+        .unwrap();
+
+    restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+        .await
+        .unwrap();
+
+    let (a, _) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
+    assert_eq!(
+        a,
+        Some(Widget { count: 999 }),
+        "resume must skip an entity the checkpoint already covered"
+    );
+    let (b, _) = coll.get::<Widget>(&backend, &cipher, "b").await.unwrap();
+    assert_eq!(
+        b,
+        Some(Widget { count: 2 }),
+        "resume must still restore what came after the checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn restore_refuses_a_different_backup_id_while_one_is_in_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 57);
+    let coll = Collection::new("widgets");
+    coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+    backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+        .await
+        .unwrap();
+    backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup2", true)
+        .await
+        .unwrap();
+
+    let progress = RestoreProgress {
+        backup_id: "backup1".to_string(),
+        started_at_ms: now_ms(),
+        ..RestoreProgress::default()
+    };
+    put_json(&backend, &restore_progress_key(&coll), &progress, None, &cipher)
+        .await
+        .unwrap();
+
+    let err = restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup2")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("backup1"), "{err}");
+}
+
+/// A backup's own promise -- its manifest's counts -- must actually be
+/// checked against what restore found, not assumed true because the
+/// listing eventually ran out.
+#[tokio::test]
+async fn restore_refuses_to_complete_if_the_backup_is_missing_something_its_manifest_promised() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 61);
+    let coll = Collection::new("widgets");
+    for (name, count) in [("a", 1), ("b", 2)] {
+        coll.put(&backend, &cipher, name, &Widget { count }, None)
+            .await
+            .unwrap();
+    }
+    backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+        .await
+        .unwrap();
+
+    // Corrupt the backup itself: delete one of the two backed-up objects
+    // out from under its own manifest.
+    let prefix = backup_prefix("backup1", "widgets").unwrap();
+    backend.delete(&format!("{prefix}/b.json")).await.unwrap();
+
+    let err = restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("manifest accounts for"), "{err}");
+}
+
+#[tokio::test]
 async fn a_backup_id_that_would_escape_its_namespace_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path(), 47);
