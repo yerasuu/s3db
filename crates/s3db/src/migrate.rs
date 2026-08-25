@@ -135,6 +135,44 @@ pub async fn schema_state(backend: &dyn Backend, cipher: &Cipher, collection: &C
         .0)
 }
 
+/// Refuses if `collection`'s persisted migration version is higher than
+/// `max_known_version` -- the highest migration this running binary's code
+/// actually understands (the caller's own compile-time constant).
+///
+/// Call this once per collection at startup, before serving any traffic
+/// through it. Nothing below this module can catch the risk it guards
+/// against: [`Collection::get`]/[`Collection::put`] deserialize whatever's
+/// stored directly into the caller's own struct, with no envelope and no
+/// version stamp (see this module's own doc comment on why serde tolerates
+/// that for a *forward*-compatible field addition/removal). An old binary
+/// started up again after a migration already ran -- a rollback -- has no
+/// way to notice on its own that the shape it's about to deserialize has
+/// moved on: serde will happily leave a renamed-away field at its
+/// `Default` instead of erroring, silently misinterpreting the row rather
+/// than refusing it. `migrate_entries` can't be that checkpoint either --
+/// an old binary that predates a migration never calls it, by definition.
+/// This is the one place a caller actually can check, so it's on the
+/// caller to call it, the same way [`crate::key_rotation`]'s `KDF_VERSION`
+/// is checked once at cipher construction rather than on every read.
+pub async fn require_max_known_version(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    collection: &Collection,
+    max_known_version: u32,
+) -> Result<()> {
+    let state = schema_state(backend, cipher, collection).await?;
+    if state.version > max_known_version {
+        bail!(
+            "{}: migration version {} is newer than this binary understands (up to {max_known_version}) -- this \
+             looks like a rollback to older code after a migration already ran here; reading or writing entries \
+             with a stale struct shape would silently misinterpret them, refusing to proceed",
+            collection.prefix,
+            state.version,
+        );
+    }
+    Ok(())
+}
+
 /// Declares a collection to already be at `version` without rewriting
 /// anything — for adopting this mechanism on data that predates it. Refuses
 /// to lower a recorded version, since that would re-run migrations over

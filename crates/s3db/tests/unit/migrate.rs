@@ -285,6 +285,58 @@ async fn version_zero_is_rejected_as_a_migration() {
     assert!(err.to_string().contains("version 0"), "{err}");
 }
 
+#[tokio::test]
+async fn require_max_known_version_allows_a_binary_that_is_current_or_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    seed(&backend, &cipher, 2).await;
+    crate::migrate::migrate_entries::<WorkV1, WorkV2, _>(&backend, &cipher, &WORKS, 1, "v1", |old| {
+        Ok(Rewrite::Write(WorkV2 {
+            title: old.name,
+            lang: "en".to_string(),
+        }))
+    })
+    .await
+    .unwrap();
+
+    // Exactly caught up, and ahead of what's recorded -- both fine.
+    crate::migrate::require_max_known_version(backend.as_ref(), &cipher, &WORKS, 1)
+        .await
+        .unwrap();
+    crate::migrate::require_max_known_version(backend.as_ref(), &cipher, &WORKS, 5)
+        .await
+        .unwrap();
+}
+
+/// The scenario this guards against: an old binary, built before a
+/// migration existed, started up again against a collection that migration
+/// already ran on. Without this check the old binary's own `Collection::get`
+/// calls would deserialize the migrated (new-shape) entries into its own
+/// stale struct with no error, serde quietly leaving the removed/renamed
+/// field at its default.
+#[tokio::test]
+async fn require_max_known_version_refuses_a_binary_older_than_the_recorded_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    seed(&backend, &cipher, 2).await;
+    crate::migrate::migrate_entries::<WorkV1, WorkV2, _>(&backend, &cipher, &WORKS, 1, "v1", |old| {
+        Ok(Rewrite::Write(WorkV2 {
+            title: old.name,
+            lang: "en".to_string(),
+        }))
+    })
+    .await
+    .unwrap();
+
+    // This binary's code only knows about version 0 (as if it predated the
+    // migration above) -- it must refuse rather than let its caller read
+    // WorkV2-shaped data as WorkV1.
+    let err = crate::migrate::require_max_known_version(backend.as_ref(), &cipher, &WORKS, 0)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rollback"), "{err}");
+}
+
 /// More entries than one page, so the cursor path is exercised end to end.
 #[tokio::test]
 async fn a_pass_spanning_several_pages_migrates_all_of_them() {
