@@ -297,6 +297,163 @@ async fn an_expiry_on_a_nonexistent_entry_is_allowed_and_harmless() {
     );
 }
 
+/// Forces exactly one `Cas::Conflict` on a `put_cas` to a chosen key, then
+/// delegates normally -- lets a test drive `set_expiry`'s CAS-with-reread
+/// loop through a real conflict instead of only ever seeing a clean write.
+#[derive(Debug)]
+struct ConflictOnceOn {
+    inner: LocalBackend,
+    key: String,
+    triggered: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Backend for ConflictOnceOn {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        if key == self.key && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(Cas::Conflict);
+        }
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+}
+
+/// Regression test: `set_expiry` used to discard a `Cas::Conflict` on the
+/// reverse marker's write silently, returning `Ok(())` while the actually
+/// stored deadline was whichever concurrent writer won -- a caller had no
+/// way to know its own call did not take effect. It must now retry past a
+/// transient conflict and land its own value.
+#[tokio::test]
+async fn set_expiry_retries_past_a_conflict_instead_of_silently_dropping_the_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inner, cipher) = test_backend_and_cipher(dir.path());
+    put(&inner, &cipher, "a").await;
+    let reverse_key = expiry_at_key(&SESSIONS, "a").unwrap();
+
+    let backend = ConflictOnceOn {
+        inner,
+        key: reverse_key,
+        triggered: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    crate::ttl::set_expiry(&backend, &cipher, &SESSIONS, "a", 9_000)
+        .await
+        .expect("must retry past the injected conflict, not silently give up");
+
+    assert_eq!(
+        crate::ttl::expiry_of(&backend.inner, &cipher, &SESSIONS, "a")
+            .await
+            .unwrap(),
+        Some(9_000),
+        "the caller's own deadline must actually be the one stored"
+    );
+}
+
+/// Injects a real, concurrent-looking renewal in the instant right after
+/// `expire_due` reads the reverse marker but before it acts -- exactly the
+/// window that used to let a sweep destroy a renewal that raced it (the
+/// renewal's own fresh deadline, and the reverse marker recording it, both
+/// deleted along with the entry). With the claim-before-delete fix, the
+/// sweep's own CAS must lose to the renewal's, so it backs off instead.
+#[derive(Debug)]
+struct ConcurrentRenewalOnFirstGet {
+    inner: LocalBackend,
+    cipher: Cipher,
+    reverse_key: String,
+    triggered: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Backend for ConcurrentRenewalOnFirstGet {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        let result = self.inner.get(key).await?;
+        if key == self.reverse_key && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            crate::ttl::set_expiry(&self.inner, &self.cipher, &SESSIONS, "a", 9_000)
+                .await
+                .unwrap();
+        }
+        Ok(result)
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+}
+
+#[tokio::test]
+async fn expire_due_does_not_destroy_a_renewal_that_races_the_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let (inner, cipher) = test_backend_and_cipher(dir.path());
+    put(&inner, &cipher, "a").await;
+    crate::ttl::set_expiry(&inner, &cipher, &SESSIONS, "a", 1_000)
+        .await
+        .unwrap();
+
+    let backend = ConcurrentRenewalOnFirstGet {
+        inner,
+        cipher: cipher.clone(),
+        reverse_key: expiry_at_key(&SESSIONS, "a").unwrap(),
+        triggered: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    let report = crate::ttl::expire_due(&backend, &cipher, &SESSIONS, 5_000, &ExpiryConfig::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        (report.expired, report.stale_markers),
+        (0, 1),
+        "the sweep must back off once its claim loses the race: {report:?}"
+    );
+    assert!(
+        SESSIONS
+            .get::<Session>(&backend.inner, &cipher, "a")
+            .await
+            .unwrap()
+            .0
+            .is_some(),
+        "the entry must survive -- the renewal raced the sweep and must win"
+    );
+    assert_eq!(
+        crate::ttl::expiry_of(&backend.inner, &cipher, &SESSIONS, "a")
+            .await
+            .unwrap(),
+        Some(9_000),
+        "the renewal's own deadline must survive intact, not be deleted along with the entry"
+    );
+}
+
 #[tokio::test]
 async fn a_foreign_key_under_the_expiry_namespace_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();

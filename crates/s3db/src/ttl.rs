@@ -26,7 +26,7 @@
 //! single-key operations rather than a scan, and so a re-scheduled expiry can
 //! find and drop the deadline it replaces.
 
-use crate::backend::Backend;
+use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
 use crate::collection::Collection;
 use crate::naming::validate_path;
@@ -39,6 +39,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Due markers examined per page. They carry no body, so a page is pure key
 /// listing.
 const EXPIRY_PAGE: usize = 500;
+
+/// Reserved `expires_at_ms` no real deadline is ever set to (see
+/// [`set_expiry`]/[`set_ttl`], both derived from a real clock reading).
+/// [`expire_due`] CAS-writes the reverse marker to this value, under the
+/// etag it just read, before deleting anything -- seeing `Cas::Ok` back is
+/// the only way it can know nothing else (a concurrent [`set_expiry`] or
+/// [`clear_expiry`]) touched that marker since. [`Backend`] has no
+/// conditional *delete*, only a conditional write, so this is what turns
+/// "read, then three unconditioned deletes" into something that can't
+/// destroy a renewal that raced it.
+const CLAIMED_FOR_PURGE_MS: u64 = u64::MAX;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -109,28 +120,46 @@ pub async fn set_expiry(
     expires_at_ms: u64,
 ) -> Result<()> {
     let reverse_key = expiry_at_key(collection, name)?;
-    let (previous, reverse_etag) = get_json::<ExpiryAt>(backend, &reverse_key, cipher).await?;
-    let previous = reverse_etag.is_some().then_some(previous);
 
-    // New due marker first: if this process dies between the two writes, the
-    // worst case is a superseded marker that the sweep recognizes as stale,
-    // never an entry whose expiry was forgotten.
+    // New due marker first: if this process dies before the reverse marker
+    // below lands, the worst case is a superseded marker that the sweep
+    // recognizes as stale, never an entry whose expiry was forgotten. Its
+    // content is fixed (`()`), so a `Cas::Conflict` here just means an
+    // earlier, otherwise-identical attempt (this call's own retry below, or
+    // a resolved race) already created it -- fine either way.
     put_json(backend, &due_key(collection, name, expires_at_ms)?, &(), None, cipher).await?;
-    put_json(
-        backend,
-        &reverse_key,
-        &ExpiryAt { expires_at_ms },
-        reverse_etag.as_deref(),
-        cipher,
-    )
-    .await?;
 
-    if let Some(previous) = previous
-        && previous.expires_at_ms != expires_at_ms
-    {
-        delete_object(backend, &due_key(collection, name, previous.expires_at_ms)?).await;
+    let (mut previous_value, mut reverse_etag) = get_json::<ExpiryAt>(backend, &reverse_key, cipher).await?;
+    // CAS-with-reread, not a single blind attempt: a `Cas::Conflict` means a
+    // concurrent `set_expiry`/`clear_expiry` (or `expire_due`'s own claim,
+    // see `CLAIMED_FOR_PURGE_MS`) changed this name's reverse marker since
+    // the read above. Silently returning `Ok(())` on that (as this used to)
+    // would leave the caller believing its deadline is now live when the
+    // real one is whoever else's won.
+    for _ in 0..3 {
+        match put_json(
+            backend,
+            &reverse_key,
+            &ExpiryAt { expires_at_ms },
+            reverse_etag.as_deref(),
+            cipher,
+        )
+        .await?
+        {
+            Cas::Ok => {
+                if reverse_etag.is_some() && previous_value.expires_at_ms != expires_at_ms {
+                    delete_object(backend, &due_key(collection, name, previous_value.expires_at_ms)?).await;
+                }
+                return Ok(());
+            }
+            Cas::Conflict => {
+                let (fresh_value, fresh_etag) = get_json::<ExpiryAt>(backend, &reverse_key, cipher).await?;
+                previous_value = fresh_value;
+                reverse_etag = fresh_etag;
+            }
+        }
     }
-    Ok(())
+    anyhow::bail!("{name}: lost the race to set its expiry to {expires_at_ms}ms too many times, try again")
 }
 
 /// Convenience over [`set_expiry`]: a deadline `ttl_ms` from now.
@@ -203,23 +232,47 @@ pub async fn expire_due(
             if deadline > now {
                 break 'pages;
             }
-            match expiry_of(backend, cipher, collection, &name).await? {
-                // The reverse marker agrees this deadline is the live one.
-                Some(current) if current == deadline => {
-                    if config.soft {
-                        collection.delete(backend, cipher, &name).await?;
-                    } else {
-                        delete_object(backend, &collection.key(&name)?).await;
-                    }
-                    delete_object(backend, &expiry_at_key(collection, &name)?).await;
-                    delete_object(backend, key).await;
-                    report.expired += 1;
-                }
-                _ => {
-                    delete_object(backend, key).await;
-                    report.stale_markers += 1;
-                }
+            let reverse_key = expiry_at_key(collection, &name)?;
+            let (current, etag) = get_json::<ExpiryAt>(backend, &reverse_key, cipher).await?;
+            if etag.is_none() || current.expires_at_ms != deadline {
+                // The reverse marker disagrees (re-scheduled, cleared, or
+                // never existed) -- this due marker is stale, and nothing
+                // else here has been touched, so there's nothing to race.
+                delete_object(backend, key).await;
+                report.stale_markers += 1;
+                continue;
             }
+            // Claim the reverse marker before deleting anything: a `Backend`
+            // has no conditional delete, only a conditional write, so this
+            // CAS (against the exact etag just read) is what stands in for
+            // one. `Cas::Ok` means nothing else touched it in between --
+            // only then is it safe to actually delete the entry. `Conflict`
+            // means a concurrent `set_expiry`/`clear_expiry` won the race
+            // since the read above; treat this due marker as stale instead
+            // of deleting an entry whose real, current deadline just moved.
+            let claim = put_json(
+                backend,
+                &reverse_key,
+                &ExpiryAt {
+                    expires_at_ms: CLAIMED_FOR_PURGE_MS,
+                },
+                etag.as_deref(),
+                cipher,
+            )
+            .await?;
+            if claim == Cas::Conflict {
+                delete_object(backend, key).await;
+                report.stale_markers += 1;
+                continue;
+            }
+            if config.soft {
+                collection.delete(backend, cipher, &name).await?;
+            } else {
+                delete_object(backend, &collection.key(&name)?).await;
+            }
+            delete_object(backend, &reverse_key).await;
+            delete_object(backend, key).await;
+            report.expired += 1;
         }
         match page.next_after {
             Some(next) => after = Some(next),
