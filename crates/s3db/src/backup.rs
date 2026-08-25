@@ -19,7 +19,7 @@
 use crate::backend::{Backend, Cas};
 use crate::cipher::{Cipher, CompressionStrategy};
 use crate::collection::{Collection, Tombstone};
-use crate::naming::validate_segment;
+use crate::naming::{validate_path, validate_segment};
 use crate::payload::{delete_object, get_json, put_json};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -283,6 +283,14 @@ async fn restore_one_entity(ctx: &RestoreCtx<'_>, backup_view: &Collection, name
 /// [`restore_one_entity`]'s tombstone counterpart -- same immutable-backup
 /// reasoning for a vanished read, same CAS-with-reread for the write.
 async fn restore_one_tombstone(ctx: &RestoreCtx<'_>, key: &str, name: &str) -> Result<()> {
+    // `name` is a raw backend key stripped of its prefix/suffix, not a name
+    // that's been through `Collection::key`/`tombstone_key` yet -- unlike
+    // `restore_one_entity`, which gets that validation for free from
+    // `backup_view.key`/`ctx.collection.key`. Skipping it here would let a
+    // `/`, leading-`.`, or `..` component in a backup's own tombstone key
+    // relocate the restored object into a sibling namespace on `dest_backend`
+    // instead of refusing it outright.
+    validate_path(name, "entity name")?;
     let (tombstone, backup_etag) = get_json::<Tombstone>(ctx.backup_backend, key, ctx.backup_cipher).await?;
     backup_etag.with_context(|| {
         format!(

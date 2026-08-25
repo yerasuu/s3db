@@ -285,3 +285,41 @@ async fn a_backup_id_that_would_escape_its_namespace_is_refused() {
         );
     }
 }
+
+#[tokio::test]
+async fn restore_one_tombstone_refuses_a_name_that_would_escape_the_deleted_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 53);
+    let coll = Collection::new("widgets");
+
+    // A well-formed key holding the tombstone content -- what matters here
+    // is the `name` argument below, which in the real restore loop comes
+    // straight from stripping a *listed* backup key with no validation of
+    // its own. A tampered or untrusted backup source can list anything.
+    let key = ".conf/backups/backup1/widgets/.deleted/evil.json";
+    let tombstone = Tombstone {
+        deleted_at_ms: 1,
+        purge_state: crate::collection::PurgeState::Purged,
+        restore_etag: None,
+    };
+    put_json(&backend, key, &tombstone, None, &cipher).await.unwrap();
+
+    let ctx = RestoreCtx {
+        backup_backend: &backend,
+        backup_cipher: &cipher,
+        dest_backend: &backend,
+        dest_cipher: &cipher,
+        collection: &coll,
+        backup_id: "backup1",
+    };
+    let err = restore_one_tombstone(&ctx, key, "../../evil").await.unwrap_err();
+    assert!(err.to_string().contains("entity name"), "unexpected error: {err}");
+    assert!(
+        crate::payload::get_json::<Tombstone>(&backend, "evil.json", &cipher)
+            .await
+            .unwrap()
+            .1
+            .is_none(),
+        "the crafted name must never have been written anywhere"
+    );
+}
