@@ -178,6 +178,16 @@ impl Backend for AzureBackend {
             .collect()
             .await
             .with_context(|| format!("reading ranged body of {key}"))?;
+        // The trait's own contract (see `Backend::get_range`'s doc) is that
+        // a short read is an error, never truncated-but-silently-accepted
+        // data -- a provider or proxy returning fewer bytes than asked must
+        // not be allowed to feed the LSM read path corrupted content with
+        // no signal.
+        anyhow::ensure!(
+            bytes.len() as u64 == len,
+            "get_range: {key} returned {} bytes for a {len}-byte request at offset {offset}",
+            bytes.len()
+        );
         Ok(bytes.to_vec())
     }
 
