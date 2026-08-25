@@ -267,13 +267,18 @@ fn unwrap_and_verify(wrapper: &Cipher, material: &KeyMaterial) -> Result<Cipher>
     let wrapped = BASE64
         .decode(&material.wrapped_key)
         .context(".conf/encryption.json: invalid wrapped key (not base64)")?;
-    let key_bytes = wrapper.open(WRAP_AAD, &wrapped).with_context(|| {
+    // `Zeroizing` immediately, not after the length check: `wrapper.open`
+    // hands back a plain `Vec<u8>` holding the real data key, and dropping a
+    // `Vec` only frees its allocation, never wipes it -- an unwiped copy of
+    // the key would otherwise sit in freed heap memory for as long as
+    // something else happens to reuse that allocation.
+    let key_bytes = Zeroizing::new(wrapper.open(WRAP_AAD, &wrapped).with_context(|| {
         format!(
             "the passphrase supplied for key {} doesn't match the one used to encrypt it \
              (check the passphrase config for this key)",
             material.key_id
         )
-    })?;
+    })?);
     if key_bytes.len() != KEY_LEN {
         bail!(
             ".conf/encryption.json: key {} has a wrapped key of the wrong length",
