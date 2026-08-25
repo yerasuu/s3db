@@ -46,6 +46,93 @@ async fn flush_wins_over_a_write_that_landed_during_the_debounce_window() {
     );
 }
 
+/// Forces the *first* `put_cas` for a chosen key to report `Cas::Conflict`
+/// -- and, as a side effect right before doing so, drives a second,
+/// independent `write`+`flush` for that same key to completion through the
+/// coalescer itself. Lets a test put a `flush` call's own conflict-retry
+/// exactly where a genuinely newer write already landed, instead of only
+/// ever seeing a conflict caused by an unrelated third party.
+struct ConflictThenSupersede {
+    inner: Arc<dyn Backend>,
+    coalescer: std::sync::OnceLock<Arc<WriteCoalescer>>,
+    key: String,
+    newer_value: Vec<u8>,
+    triggered: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for ConflictThenSupersede {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictThenSupersede").finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for ConflictThenSupersede {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        if key == self.key && !self.triggered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let coalescer = self.coalescer.get().expect("set right after construction").clone();
+            coalescer.write(self.key.clone(), self.newer_value.clone());
+            coalescer.flush(&self.key).await.unwrap();
+            return Ok(Cas::Conflict);
+        }
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+}
+
+/// Regression test: a `flush` that loses a CAS used to always retry with
+/// its own stale captured value, blind to whether a newer write had
+/// already landed in the meantime -- letting it win a later retry and
+/// silently clobber that newer write. It must now recognize its value has
+/// been superseded and abandon instead.
+#[tokio::test]
+async fn flush_abandons_a_stale_value_instead_of_clobbering_a_write_that_landed_during_its_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(ConflictThenSupersede {
+        inner: Arc::new(crate::local::test_support::files_backend(dir.path())),
+        coalescer: std::sync::OnceLock::new(),
+        key: "k".to_string(),
+        newer_value: b"v2".to_vec(),
+        triggered: std::sync::atomic::AtomicBool::new(false),
+    });
+    let coalescer = WriteCoalescer::new(backend.clone(), Duration::from_secs(60));
+    backend
+        .coalescer
+        .set(coalescer.clone())
+        .unwrap_or_else(|_| panic!("set exactly once, before any flush runs"));
+
+    coalescer.write("k".to_string(), b"v1".to_vec());
+    let outcome = coalescer.flush("k").await.unwrap();
+
+    assert_eq!(
+        outcome,
+        Cas::Conflict,
+        "must report giving way to the newer write, not a false success"
+    );
+    let (bytes, _) = coalescer.inner.get("k").await.unwrap();
+    assert_eq!(
+        bytes, b"v2",
+        "the write that landed during the retry must survive, not be clobbered by the stale value"
+    );
+}
+
 #[tokio::test]
 async fn write_schedules_exactly_one_flush_task_per_debounce_window() {
     let dir = tempfile::tempdir().unwrap();

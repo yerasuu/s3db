@@ -11,20 +11,44 @@
 //! the race, drop this write silently". Neither is acceptable for
 //! something that exists purely to save requests, not to change what
 //! "every write eventually lands" means. `flush` re-reads the current etag
-//! and retries instead.
+//! and retries instead -- but retrying isn't automatically safe either: a
+//! sequence number tags every pending value, so a `flush` that hits a
+//! conflict can tell "nothing fresher has been queued since I captured
+//! this" (safe to keep retrying) from "a newer `write` has happened since,
+//! whose own flush should land instead" (abandon, rather than risk this
+//! stale value winning its own retry and clobbering what that newer write
+//! already applied).
 
 use crate::backend::{Backend, Cas};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Default)]
+struct Pending {
+    /// The value currently queued for a key, tagged with the sequence
+    /// number [`WriteCoalescer::write`] assigned it. Removed once a
+    /// [`WriteCoalescer::flush`] captures it.
+    values: HashMap<String, (u64, Vec<u8>)>,
+    /// The sequence number of the *most recent* `write` call for a key,
+    /// kept even after `values` has given that value up to a `flush` --
+    /// unlike `values`, this never goes away once a key has been written.
+    /// What a `flush` that just lost a CAS checks to tell "nothing fresher
+    /// has been queued since I captured my value" (safe to retry) from
+    /// "abandon: a newer write has happened, and its own flush -- already
+    /// run, or still to come -- is the one that should land here."
+    last_seq: HashMap<String, u64>,
+}
 
 pub struct WriteCoalescer {
     inner: Arc<dyn Backend>,
     flush_interval: Duration,
-    pending: Mutex<HashMap<String, Vec<u8>>>,
+    pending: Mutex<Pending>,
+    next_seq: AtomicU64,
 }
 
 impl std::fmt::Debug for WriteCoalescer {
@@ -45,7 +69,8 @@ impl WriteCoalescer {
         Arc::new(WriteCoalescer {
             inner,
             flush_interval,
-            pending: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Pending::default()),
+            next_seq: AtomicU64::new(0),
         })
     }
 
@@ -56,8 +81,10 @@ impl WriteCoalescer {
     /// before that flush runs just updates the pending value in place;
     /// only the last one actually gets written.
     pub fn write(self: &Arc<Self>, key: String, value: Vec<u8>) {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.pending.lock().unwrap();
-        let already_scheduled = pending.insert(key.clone(), value).is_some();
+        let already_scheduled = pending.values.insert(key.clone(), (seq, value)).is_some();
+        pending.last_seq.insert(key.clone(), seq);
         drop(pending);
         if !already_scheduled {
             let this = Arc::clone(self);
@@ -87,7 +114,7 @@ impl WriteCoalescer {
     /// type-erased one.
     pub fn flush<'a>(self: &'a Arc<Self>, key: &'a str) -> Pin<Box<dyn Future<Output = Result<Cas>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(value) = self.pending.lock().unwrap().remove(key) else {
+            let Some((seq, value)) = self.pending.lock().unwrap().values.remove(key) else {
                 return Ok(Cas::Ok);
             };
             let (_, mut expected_etag) = self.inner.get(key).await?;
@@ -95,12 +122,32 @@ impl WriteCoalescer {
                 match self.inner.put_cas(key, value.clone(), expected_etag.as_deref()).await? {
                     Cas::Ok => return Ok(Cas::Ok),
                     Cas::Conflict => {
+                        // A `write` for `key` newer than the one this flush
+                        // captured may have happened since -- if so, that
+                        // write's own flush (already run, or still
+                        // scheduled) is the one that should land, not this
+                        // now-stale value. Retrying it here could still win
+                        // its own CAS against whatever that newer write
+                        // already wrote and silently clobber it -- exactly
+                        // the "drop a write silently" failure this module's
+                        // own doc comment says a blind CAS would risk, just
+                        // one retry removed. Abandon instead.
+                        let superseded = self
+                            .pending
+                            .lock()
+                            .unwrap()
+                            .last_seq
+                            .get(key)
+                            .is_some_and(|&latest| latest > seq);
+                        if superseded {
+                            return Ok(Cas::Conflict);
+                        }
                         let (_, etag) = self.inner.get(key).await?;
                         expected_etag = etag;
                     }
                 }
             }
-            self.pending.lock().unwrap().entry(key.to_string()).or_insert(value);
+            self.pending.lock().unwrap().values.entry(key.to_string()).or_insert((seq, value));
             let this = Arc::clone(self);
             let retry_key = key.to_string();
             tokio::spawn(async move {
