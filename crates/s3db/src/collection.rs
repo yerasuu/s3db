@@ -432,13 +432,19 @@ impl Collection {
     /// instead of a lost fire-and-forget with no trace anyone could act on.
     pub async fn delete(&self, backend: &dyn Backend, cipher: &Cipher, name: &str) -> Result<()> {
         let key = self.key(name)?;
-        let (sealed, etag) = match backend.get(&key).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("warning: couldn't read {name} before deleting it: {e:#}");
-                (Vec::new(), None)
-            }
-        };
+        // A real, hard error here (not `Ok((_, None))`, which is `get`'s own
+        // documented "doesn't exist" sentinel) must not be treated the same
+        // as "nothing to archive": a transient read failure silently
+        // swallowed here used to feed `archive_for_delete` an empty etag,
+        // skip archiving whatever was actually still there, and then still
+        // run the unconditional `backend.delete` below -- turning a network
+        // blip into a real object destroyed with no backup and no trace
+        // beyond a warning. Refusing to delete without a confirmed read is
+        // the only safe response.
+        let (sealed, etag) = backend
+            .get(&key)
+            .await
+            .with_context(|| format!("reading {name} before deleting it -- refusing to delete without a confirmed read"))?;
         let restore_etag = self
             .archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref())
             .await?;

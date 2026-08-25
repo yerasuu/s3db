@@ -158,6 +158,73 @@ async fn delete_of_a_never_written_name_leaves_nothing_to_restore() {
     assert!(coll.restore::<Widget>(&backend, &cipher, "ghost").await.is_err());
 }
 
+/// Fails every `get` with a plain (non-404, non-"missing") error, so a test
+/// can drive `Collection::delete` through a transient read failure instead
+/// of a real "this key doesn't exist" — the distinction the fix under test
+/// (a network blip must never be treated as the [`Backend::get`] "doesn't
+/// exist yet" sentinel) depends on.
+#[derive(Debug)]
+struct GetAlwaysFailsBackend {
+    inner: LocalBackend,
+}
+
+#[async_trait::async_trait]
+impl Backend for GetAlwaysFailsBackend {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, _key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        anyhow::bail!("simulated transient read failure")
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<crate::backend::DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+#[tokio::test]
+async fn delete_refuses_rather_than_destroying_data_when_the_pre_delete_read_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    let coll = Collection::new("widgets");
+    coll.put(&backend, &cipher, "a", &Widget { count: 1 }, None)
+        .await
+        .unwrap();
+
+    let flaky = GetAlwaysFailsBackend {
+        inner: test_backend_and_cipher(dir.path()).0,
+    };
+    assert!(
+        coll.delete(&flaky, &cipher, "a").await.is_err(),
+        "a transient read failure must surface as an error, not silently proceed as if the key was absent"
+    );
+
+    // The real object must still be exactly there -- a swallowed read error
+    // used to let this fall through to an unconditional `backend.delete`
+    // with no archive, destroying it with no way back.
+    let (value, _etag) = coll.get::<Widget>(&backend, &cipher, "a").await.unwrap();
+    assert_eq!(value, Some(Widget { count: 1 }));
+}
+
 #[tokio::test]
 async fn restore_brings_back_the_deleted_value_and_clears_the_tombstone() {
     let dir = tempfile::tempdir().unwrap();
