@@ -120,6 +120,37 @@ fn txn_key(txn_id: &str) -> String {
     format!("{TXN_PREFIX}/{txn_id}.json")
 }
 
+/// Whether some *other* transaction's still-durable record claims to have
+/// written `value` at `key` -- the actual evidence [`run_with_publisher`]'s
+/// crash recovery needs to recognize its own prior attempt landing after a
+/// crash. Comparing the stored value to `op.value` alone isn't enough: two
+/// unrelated transactions that happen to write byte-identical content to the
+/// same key (a low-entropy create-only "claim" marker, say) would otherwise
+/// let the second one walk away believing it owns a key the first one
+/// actually holds. A record only survives here while its transaction is
+/// still `Preparing` (or was and crashed) -- [`rollback`] deletes it the
+/// moment a transaction is undone, and a successful commit deletes it right
+/// after -- so this can't mistake an unrelated, already-finished transaction
+/// for the caller's own retry, only a genuinely still-in-flight one.
+async fn find_claiming_record(
+    backend: &dyn Backend,
+    cipher: &Cipher,
+    exclude_txn_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<bool> {
+    for record_key in list_all_keys(backend, &format!("{TXN_PREFIX}/")).await? {
+        let (record, etag) = get_json::<TxnRecord>(backend, &record_key, cipher).await?;
+        if etag.is_none() || record.txn_id == exclude_txn_id {
+            continue;
+        }
+        if record.ops.iter().any(|op| op.key == key && op.value == *value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Real wall-clock time, not a deterministic-replay clock: this is only ever
 /// compared against `max_age` on this same process's later wall-clock time,
 /// never persisted anywhere that needs reproducibility.
@@ -252,7 +283,11 @@ pub async fn run_with_publisher(
                 let is_ours = if existing_etag.is_some() {
                     let existing_plain = cipher.open(&op.key, &existing_sealed)?;
                     let existing_value: serde_json::Value = rmp_serde::from_slice(&existing_plain)?;
+                    // Value equality alone isn't identity -- see
+                    // `find_claiming_record`'s doc. Only trust "ours" once a
+                    // still-durable record (not this one) backs it up.
                     existing_value == op.value
+                        && find_claiming_record(backend, cipher, &txn_id, &op.key, &op.value).await?
                 } else {
                     false
                 };

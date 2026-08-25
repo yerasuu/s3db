@@ -130,9 +130,28 @@ async fn rerun_after_partial_crash_treats_the_already_applied_op_as_ours() {
         TxnOp::create("b.json".to_string(), &Widget { count: 2 }).unwrap(),
         TxnOp::create("c.json".to_string(), &Widget { count: 3 }).unwrap(),
     ];
-    // Simulates a crash after a previous `run` applied only this one op
-    // directly, bypassing `run`'s own txn record entirely -- the exact
-    // content `run` would have produced, so this must read as "ours".
+    // Simulates a crash after a previous `run` wrote its own txn record and
+    // applied only this one op, then died before reaching the next op --
+    // the record is what makes this a genuine "my own prior attempt",
+    // distinct from some unrelated write that merely happens to match.
+    let crashed_record = TxnRecord {
+        txn_id: "crashed-attempt".to_string(),
+        status: TxnStatus::Preparing,
+        started_at_ms: 0,
+        ops: ops.clone(),
+    };
+    assert_eq!(
+        put_json(
+            &backend,
+            &txn_key(&crashed_record.txn_id),
+            &crashed_record,
+            None,
+            &cipher
+        )
+        .await
+        .unwrap(),
+        Cas::Ok
+    );
     let sealed = cipher
         .seal(
             &ops[0].key,
@@ -149,7 +168,13 @@ async fn rerun_after_partial_crash_treats_the_already_applied_op_as_ours() {
         assert_eq!(value.count, expected);
         assert!(etag.is_some());
     }
-    assert!(list_all_keys(&backend, ".conf/txn/").await.unwrap().is_empty());
+    // The crashed attempt's own record isn't this `run` call's to clean up
+    // -- that's `recover_stale`'s job, once it's old enough. `run` only ever
+    // deletes the record it itself wrote.
+    assert_eq!(
+        list_all_keys(&backend, ".conf/txn/").await.unwrap(),
+        vec![txn_key(&crashed_record.txn_id)]
+    );
 }
 
 #[tokio::test]
@@ -303,5 +328,26 @@ async fn two_overlapping_transactions_on_redb_exactly_one_wins() {
             .1
             .is_none(),
         "the loser's non-conflicting op must not have landed either"
+    );
+}
+
+#[tokio::test]
+async fn two_independent_transactions_with_identical_low_entropy_values_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path());
+    // A create-only "claim this name" marker, exactly the pattern the
+    // module's own doc frames this primitive for -- and exactly the case
+    // where two entirely unrelated transactions can write byte-identical
+    // content. Neither transaction here has any relation to the other; the
+    // second must never be told it "already" owns what the first holds.
+    let marker = serde_json::json!({});
+    let claim_a = vec![TxnOp::create("reservations/alice.json".to_string(), &marker).unwrap()];
+    let claim_b = vec![TxnOp::create("reservations/alice.json".to_string(), &marker).unwrap()];
+
+    assert_eq!(run(&backend, &cipher, claim_a).await.unwrap(), Cas::Ok);
+    assert_eq!(
+        run(&backend, &cipher, claim_b).await.unwrap(),
+        Cas::Conflict,
+        "an unrelated transaction must not be able to mistake someone else's identical-content claim for its own"
     );
 }
