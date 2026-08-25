@@ -340,18 +340,48 @@ impl RetryBackend {
         loop {
             match self.inner.put_cas(key, body.clone(), expected_etag).await {
                 Ok(Cas::Conflict) if retried_after_failure => {
-                    if let Ok((current_body, _etag)) = self.inner.get(key).await
-                        && current_body == body
-                    {
-                        return Ok(Cas::Ok);
+                    // The confirming read matters more here than an
+                    // ordinary request: a transient failure on it must not
+                    // be mistaken for "no, this wasn't my own write" -- it
+                    // means this can't tell either way yet, not that it
+                    // already knows the answer is `Conflict`. So it gets
+                    // the same retry treatment as the write itself, not a
+                    // single, unretried attempt that a read-after-write
+                    // hiccup could turn into a false `Conflict` for a write
+                    // that actually landed.
+                    match self.confirm_own_write(key, &body).await {
+                        Ok(true) => return Ok(Cas::Ok),
+                        Ok(false) => return Ok(Cas::Conflict),
+                        Err(_) => return Ok(Cas::Conflict),
                     }
-                    return Ok(Cas::Conflict);
                 }
                 Ok(value) => return Ok(value),
                 Err(err) if crate::backend::is_permanent(&err) => return Err(err),
                 Err(err) if attempt >= self.max_retries => return Err(err),
                 Err(_) => {
                     retried_after_failure = true;
+                    tokio::time::sleep(self.backoff_for(attempt)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Re-reads `key` up to `max_retries` times (same backoff as
+    /// everywhere else here), reporting whether its body matches `body` --
+    /// [`Self::run_put_cas`]'s way of telling "this was my own retried
+    /// write landing" from "a real competing writer" apart. A confirming
+    /// read that keeps failing is genuinely unknown, not evidence either
+    /// way, so it comes back as `Err` rather than being coerced into a
+    /// guess -- the caller decides what unknown should mean.
+    async fn confirm_own_write(&self, key: &str, body: &[u8]) -> Result<bool> {
+        let mut attempt = 0;
+        loop {
+            match self.inner.get(key).await {
+                Ok((current_body, _etag)) => return Ok(current_body == *body),
+                Err(err) if crate::backend::is_permanent(&err) => return Err(err),
+                Err(err) if attempt >= self.max_retries => return Err(err),
+                Err(_) => {
                     tokio::time::sleep(self.backoff_for(attempt)).await;
                     attempt += 1;
                 }

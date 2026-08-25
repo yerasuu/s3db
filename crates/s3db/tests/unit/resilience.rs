@@ -78,6 +78,85 @@ async fn retry_backend_gives_up_after_max_retries() {
     assert!(retry.get("k").await.is_err());
 }
 
+/// Simulates the exact scenario `run_put_cas`'s confirming read exists for:
+/// the very first `put_cas` attempt actually commits server-side (delegates
+/// for real), but the client never sees that response (a dropped
+/// connection) -- so `RetryBackend` retries the same conditional write,
+/// which now fails its own precondition against the object it just wrote.
+/// `get` additionally fails a fixed number of times, so a test can prove
+/// the confirming read itself now retries past a transient failure instead
+/// of reporting a false `Conflict` on the first hiccup.
+#[derive(Debug)]
+struct FirstWriteLandsButReportsFailure {
+    inner: Arc<dyn Backend>,
+    get_fail_next: AtomicUsize,
+    put_cas_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Backend for FirstWriteLandsButReportsFailure {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
+        if self.get_fail_next.load(Ordering::SeqCst) > 0 {
+            self.get_fail_next.fetch_sub(1, Ordering::SeqCst);
+            anyhow::bail!("simulated transient failure on the confirming read");
+        }
+        self.inner.get(key).await
+    }
+    async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
+        if self.put_cas_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.inner.put_cas(key, body, expected_etag).await.unwrap();
+            anyhow::bail!("simulated dropped connection after the write actually committed");
+        }
+        self.inner.put_cas(key, body, expected_etag).await
+    }
+    async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
+        self.inner.delete(key).await
+    }
+    async fn delete_many(&self, keys: &[String]) -> Result<DeleteOutcome> {
+        self.inner.delete_many(keys).await
+    }
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        self.inner.list_prefix(prefix).await
+    }
+    async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
+}
+
+/// Regression test: the confirming read used to be a single, unretried
+/// `get` -- a transient failure on it fell through to reporting `Conflict`
+/// even though the write had actually landed, misleading the caller into
+/// believing it lost a race it really won.
+#[tokio::test]
+async fn run_put_cas_retries_the_confirming_read_instead_of_reporting_a_false_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let flaky: Arc<dyn Backend> = Arc::new(FirstWriteLandsButReportsFailure {
+        inner: local(dir.path()),
+        get_fail_next: AtomicUsize::new(2),
+        put_cas_calls: AtomicUsize::new(0),
+    });
+    let retry = RetryBackend::new(flaky, 5, Duration::from_millis(1));
+
+    let outcome = retry.put_cas("k", b"v".to_vec(), None).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        Cas::Ok,
+        "must recognize its own write landed despite the confirming read's transient failures"
+    );
+}
+
 #[derive(Debug, Default)]
 struct AlwaysPermanentFailure {
     calls: AtomicUsize,
