@@ -13,6 +13,17 @@
 //! never touches the actual data key, only its own bookkeeping entry. Using
 //! it is opt-in ([`put_cas_with_wal`] instead of a bare `Backend::put_cas`)
 //! -- nothing elsewhere in this crate requires it.
+//!
+//! **Deprecated**, in favor of [`crate::spool::SpooledBackend`]: since
+//! [`crate::resilience::build_resilient_backend`] wraps every non-local
+//! backend in it unconditionally, its guarantee is now a strict superset of
+//! this module's — it retries automatically instead of only diagnosing, and
+//! nothing has to opt in. Confirmed zero callers of [`put_cas_with_wal`]
+//! anywhere outside this module's own tests. Kept, not removed: removing a
+//! `pub` item is a breaking change for this library, and [`recover_stale`]
+//! is deliberately left undeprecated for now, since it's still the only
+//! recovery for a WAL entry an *existing* caller already wrote before this
+//! deprecation.
 
 use crate::backend::{Backend, Cas};
 use crate::cipher::Cipher;
@@ -93,6 +104,9 @@ async fn complete(backend: &dyn Backend, op_id: &str) {
 /// returns `Err` (the ambiguous case this whole module exists for), the WAL
 /// entry is deliberately left behind for [`recover_stale`] to resolve later
 /// -- this function does not retry.
+#[deprecated(
+    note = "superseded by crate::spool::SpooledBackend, unconditional for non-local backends and retries automatically instead of only diagnosing"
+)]
 pub async fn put_cas_with_wal(
     backend: &dyn Backend,
     cipher: &Cipher,

@@ -1,3 +1,5 @@
+#![allow(deprecated)] // exercises put_cas_with_wal, deprecated but still functional
+
 use super::*;
 use crate::local::LocalBackend;
 
