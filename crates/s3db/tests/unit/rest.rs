@@ -3,6 +3,7 @@ use crate::local::LocalBackend;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+#[allow(deprecated)] // just needs *a* working local backend, same as everywhere else
 fn test_backend_and_cipher(root: &std::path::Path) -> (LocalBackend, Cipher) {
     let backend = LocalBackend::new(&crate::config::LocalParams {
         bucket: root.to_string_lossy().to_string(),

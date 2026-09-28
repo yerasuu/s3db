@@ -333,6 +333,14 @@ impl Backend for ConflictOnceOn {
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.inner.get_range(key, offset, len).await
     }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
+    }
 }
 
 /// Regression test: `set_expiry` used to discard a `Cas::Conflict` on the
@@ -408,6 +416,14 @@ impl Backend for ConcurrentRenewalOnFirstGet {
     }
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.inner.get_range(key, offset, len).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn put_stream(&self, key: &str, source: &std::path::Path) -> Result<()> {
+        self.inner.put_stream(key, source).await
+    }
+    #[cfg(feature = "streaming")]
+    async fn get_stream(&self, key: &str, dest: &std::path::Path) -> Result<()> {
+        self.inner.get_stream(key, dest).await
     }
 }
 
