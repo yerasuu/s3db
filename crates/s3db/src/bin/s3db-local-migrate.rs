@@ -10,11 +10,15 @@
 //! bucket.
 //!
 //! Reads every real key with [`FilesBackend`] (its own `list_prefix`
-//! already skips the CAS sidecars), then hands them all to
+//! already skips the CAS sidecars), hands them all to
 //! [`RedbBackend::bulk_load_fresh`] for a single write transaction --
-//! either every key lands, or none of them do. Old per-key files are left
-//! untouched; this tool only ever adds `s3db.redb`, never deletes anything,
-//! so a failed or aborted run leaves the bucket exactly as it found it.
+//! either every key lands, or none do -- then reads every key back out of
+//! that fresh `redb` file and compares it byte-for-byte against what was
+//! just read from `Files`, so a successful run means "confirmed
+//! identical," not just "the write transaction committed." Old per-key
+//! files are left untouched; this tool only ever adds `s3db.redb`, never
+//! deletes anything, so a failed or aborted run leaves the bucket exactly
+//! as it found it.
 
 use anyhow::{Context, Result, bail};
 use s3db::{Backend, FilesBackend, LocalEngine, LocalParams, RedbBackend};
@@ -62,9 +66,26 @@ async fn main() -> Result<()> {
         bucket: root.clone(),
         engine: LocalEngine::Redb,
     });
-    let migrated = redb.bulk_load_fresh(entries).await.context("bulk-loading into redb")?;
+    let migrated = redb
+        .bulk_load_fresh(entries.clone())
+        .await
+        .context("bulk-loading into redb")?;
 
-    println!("migrated {migrated} key(s) into {root}/s3db.redb");
+    for (key, original_body) in &entries {
+        let (migrated_body, etag) = redb
+            .get(key)
+            .await
+            .with_context(|| format!("reading back {key} from the migrated redb file"))?;
+        if etag.is_none() || &migrated_body != original_body {
+            bail!(
+                "verification failed: {key} doesn't read back identical from {root}/s3db.redb -- \
+                 old per-key files under {root} were left untouched, nothing was deleted, do not \
+                 switch `engine` to \"redb\" yet"
+            );
+        }
+    }
+
+    println!("migrated and verified {migrated} key(s) into {root}/s3db.redb, byte-for-byte identical to the original");
     println!(
         "old per-key files under {root} were left untouched -- verify the new engine works, \
          then either remove them yourself or set `engine = \"files\"` again to roll back"
