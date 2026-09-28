@@ -298,6 +298,41 @@ async fn recovery_rolls_a_stale_committed_record_forward() {
     assert!(records(&backend).await.is_empty());
 }
 
+/// Regression test for a real bug, not just an efficiency gap: comparing
+/// re-sealed *ciphertext* to decide "did our own earlier attempt already
+/// write this?" can never work, since `Cipher::seal` issues a fresh random
+/// nonce every call -- two seals of identical plaintext are never
+/// byte-equal. `apply` must compare what the bytes decrypt to instead, or
+/// every retry falls through to a redundant re-write and gets misreported
+/// in `overwrote_unlocked` as if an unlocked writer had touched the key.
+#[tokio::test]
+async fn apply_recognizes_an_op_already_applied_by_a_prior_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = backend_and_cipher(dir.path(), LocalEngine::Files);
+    put_json(&backend, "a", &1i64, None, &cipher).await.unwrap();
+    let original_etag = etag_of(&backend, "a").await.unwrap();
+    // A prior (crashed) attempt already applied this exact op.
+    put_json(&backend, "a", &2i64, Some(&original_etag), &cipher)
+        .await
+        .unwrap();
+
+    let record = UpdateRecord {
+        txn_id: "retry".into(),
+        status: UpdateStatus::Committed,
+        started_at_ms: 1,
+        ops: vec![UpdateOp::update("a".into(), &2i64, &original_etag).unwrap()],
+    };
+
+    let overwrote = apply(&backend, &cipher, &record).await.unwrap();
+
+    assert!(
+        overwrote.is_empty(),
+        "a value that already matches this op's own target must be recognized as ours, not \
+         reported as an unlocked overwrite: {overwrote:?}"
+    );
+    assert_eq!(value_at(&backend, &cipher, "a").await, Some(2));
+}
+
 #[tokio::test]
 async fn recovery_leaves_a_young_transaction_alone() {
     let dir = tempfile::tempdir().unwrap();

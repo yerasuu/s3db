@@ -294,7 +294,16 @@ async fn apply(backend: &dyn Backend, cipher: &Cipher, record: &UpdateRecord) ->
                 // committed and a half-applied result is not an option, so it
                 // wins -- and says so.
                 let (current_sealed, current_etag) = backend.get(&op.key).await?;
-                let already_ours = current_etag.is_some() && current_sealed == seal_op(cipher, op)?;
+                // Ciphertext equality would never match here: `Cipher::seal`
+                // issues a fresh random nonce every call, so two seals of
+                // the identical plaintext are never byte-equal. Compare
+                // what the bytes actually decrypt to instead.
+                let already_ours = current_etag.is_some()
+                    && cipher
+                        .open(&op.key, &current_sealed)
+                        .ok()
+                        .and_then(|plain| rmp_serde::from_slice::<serde_json::Value>(&plain).ok())
+                        .is_some_and(|value| value == op.value);
                 if !already_ours {
                     let sealed = seal_op(cipher, op)?;
                     if backend.put_cas(&op.key, sealed, current_etag.as_deref()).await? == Cas::Ok {
@@ -318,9 +327,10 @@ async fn apply(backend: &dyn Backend, cipher: &Cipher, record: &UpdateRecord) ->
 
 /// Same wire format as [`crate::payload::put_json`] -- a `Collection` reads
 /// these keys back through `get_json`, so both paths must produce
-/// byte-identical objects. Deterministic for a given op, which is what makes
-/// the "did our own earlier attempt already write this?" check in [`apply`]
-/// possible.
+/// byte-identical objects. Not deterministic across calls for the same op
+/// (`Cipher::seal` issues a fresh random nonce every time), which is why
+/// [`apply`]'s "did our own earlier attempt already write this?" check
+/// compares decrypted plaintext, never these bytes directly.
 fn seal_op(cipher: &Cipher, op: &UpdateOp) -> Result<Vec<u8>> {
     let plain = rmp_serde::to_vec_named(&op.value)?;
     cipher.seal(&op.key, &plain, CompressionStrategy::None)
