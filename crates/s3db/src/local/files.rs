@@ -53,11 +53,12 @@ pub struct FilesBackend {
 
 impl FilesBackend {
     pub fn new(cfg: &LocalParams) -> Self {
-        eprintln!(
-            "warning: local storage at {} is using the deprecated `files` engine \
-             (one file plus two CAS sidecars per key) -- migrate with \
-             `s3db-local-migrate` to `redb` (a single file, real ACID CAS)",
-            cfg.bucket
+        tracing::warn!(
+            target: "s3db::local::files",
+            bucket = cfg.bucket,
+            "local storage is using the deprecated `files` engine (one file plus two CAS \
+             sidecars per key) -- migrate with `s3db-local-migrate` to `redb` (a single file, \
+             real ACID CAS)"
         );
         FilesBackend {
             root: PathBuf::from(&cfg.bucket),
@@ -334,7 +335,7 @@ impl Backend for FilesBackend {
         let lock_file = match lock_key(&self.lock_path(key), true).await {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("warning: couldn't delete {key}: {e:#}");
+                tracing::warn!(target: "s3db::local::files", key, error = %e, "couldn't delete key");
                 return Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,

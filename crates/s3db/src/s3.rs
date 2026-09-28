@@ -234,7 +234,7 @@ impl Backend for S3Backend {
                 confirmed: 1,
             }),
             Err(err) => {
-                eprintln!("s3db: warning: couldn't delete {key} from S3: {err}");
+                tracing::warn!(target: "s3db::s3", key, error = %err, "couldn't delete object from S3");
                 Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,
@@ -276,10 +276,11 @@ impl Backend for S3Backend {
             };
             outcome.confirmed += out.deleted().len();
             for err in out.errors() {
-                eprintln!(
-                    "s3db: warning: couldn't delete {} from S3: {}",
-                    err.key().unwrap_or("?"),
-                    err.message().unwrap_or("unknown error")
+                tracing::warn!(
+                    target: "s3db::s3",
+                    key = err.key().unwrap_or("?"),
+                    error = err.message().unwrap_or("unknown error"),
+                    "couldn't delete object from S3"
                 );
             }
         }

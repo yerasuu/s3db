@@ -288,7 +288,7 @@ impl Backend for RedbBackend {
                 confirmed: 1,
             }),
             Err(e) => {
-                eprintln!("warning: couldn't delete {key_for_log}: {e:#}");
+                tracing::warn!(target: "s3db::local::redb", key = key_for_log, error = %e, "couldn't delete key");
                 Ok(DeleteOutcome {
                     attempted: 1,
                     confirmed: 0,
@@ -327,7 +327,7 @@ impl Backend for RedbBackend {
         match result {
             Ok(confirmed) => Ok(DeleteOutcome { attempted, confirmed }),
             Err(e) => {
-                eprintln!("warning: couldn't delete a batch of {attempted} keys: {e:#}");
+                tracing::warn!(target: "s3db::local::redb", attempted, error = %e, "couldn't delete a batch of keys");
                 Ok(DeleteOutcome {
                     attempted,
                     confirmed: 0,

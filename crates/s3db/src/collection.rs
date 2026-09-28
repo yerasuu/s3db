@@ -545,7 +545,7 @@ impl Collection {
         let plaintext = match cipher.open(key, sealed) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: couldn't decrypt {name} to archive it before deleting: {e:#}");
+                tracing::warn!(target: "s3db::collection", name, error = %e, "couldn't decrypt entry to archive it before deleting");
                 return Ok(None);
             }
         };
@@ -561,7 +561,7 @@ impl Collection {
                 Ok(Some(etag.to_string()))
             }
             Err(e) => {
-                eprintln!("warning: couldn't archive {name} before deleting it: {e:#}");
+                tracing::warn!(target: "s3db::collection", name, error = %e, "couldn't archive entry before deleting it");
                 Ok(None)
             }
         }

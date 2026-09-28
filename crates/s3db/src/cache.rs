@@ -182,10 +182,7 @@ impl Store {
                 // still land on the real driver same as always.
                 let _ = std::fs::remove_dir_all(dir);
                 if let Err(e) = std::fs::create_dir_all(dir) {
-                    eprintln!(
-                        "s3db: warning: cache: failed to create disk cache dir {}: {e}",
-                        dir.display()
-                    );
+                    tracing::warn!(target: "s3db::cache", dir = %dir.display(), error = %e, "failed to create disk cache dir");
                 }
                 Store::Disk {
                     dir: dir.clone(),
@@ -206,10 +203,7 @@ impl Store {
                 let db = match opened {
                     Ok(db) => Some(Arc::new(db)),
                     Err(e) => {
-                        eprintln!(
-                            "s3db: warning: cache: failed to open redb cache db {}: {e:#}",
-                            path.display()
-                        );
+                        tracing::warn!(target: "s3db::cache", path = %path.display(), error = %e, "failed to open redb cache db");
                         None
                     }
                 };
@@ -333,7 +327,7 @@ impl Store {
                     // driver (this only ever runs after that succeeded) --
                     // a disk-cache write failure just means this key stays
                     // cold, not a failed request.
-                    eprintln!("s3db: warning: cache: failed to write disk cache entry for {key:?}: {e}");
+                    tracing::warn!(target: "s3db::cache", key, error = %e, "failed to write disk cache entry");
                     return;
                 }
                 let mut evict_paths = Vec::new();
@@ -423,9 +417,9 @@ impl Store {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        eprintln!("s3db: warning: cache: failed to write redb cache entry for {key:?}: {e:#}");
+                        tracing::warn!(target: "s3db::cache", key, error = %e, "failed to write redb cache entry");
                     }
-                    Err(e) => eprintln!("s3db: warning: cache: redb insert task panicked: {e}"),
+                    Err(e) => tracing::warn!(target: "s3db::cache", error = %e, "redb insert task panicked"),
                 }
             }
         }
@@ -481,7 +475,7 @@ impl Store {
                 })
                 .await;
                 if let Ok(Err(e)) = result {
-                    eprintln!("s3db: warning: cache: failed to remove redb cache entry for {key:?}: {e:#}");
+                    tracing::warn!(target: "s3db::cache", key, error = %e, "failed to remove redb cache entry");
                 }
             }
         }
