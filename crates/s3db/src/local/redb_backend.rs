@@ -43,6 +43,42 @@ use tokio::sync::OnceCell;
 const TABLE: TableDefinition<&str, (u64, &[u8])> = TableDefinition::new("s3db");
 const DB_FILENAME: &str = "s3db.redb";
 
+/// `create_dir_all`, but owner-only on unix — same reasoning as
+/// [`crate::local::files`] applies per key-directory there: object *keys*
+/// describe what a deployment holds (`repos/acme/private-thing`), and the
+/// default `0755` hands that map to every account on the machine. Applies
+/// only to the directory this driver creates; one that already exists
+/// keeps whatever mode it was made with.
+fn create_dir_private(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+/// `redb::Database::create` writes a new file with whatever the process
+/// umask leaves it (typically `0644`, world-readable) -- every row's body
+/// is sealed regardless, but a key name is not nothing either, so this
+/// closes the one part of a fresh local bucket that was readable without
+/// the passphrase, same as [`create_dir_private`] does for the directory.
+/// Harmless against a file that already existed under some other mode —
+/// chmod is idempotent, and this runs once per process, the first time
+/// [`RedbBackend::database`] opens it.
+fn restrict_to_owner(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct RedbBackend {
     /// Directory holding `s3db.redb` — kept rather than the open `Database`
@@ -67,13 +103,14 @@ impl RedbBackend {
             .get_or_try_init(|| async {
                 let root = self.root.clone();
                 tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+                    create_dir_private(&root).with_context(|| format!("creating {}", root.display()))?;
                     let path = root.join(DB_FILENAME);
                     // `Database::create` opens the file if it's already a
                     // valid redb database, and initializes a fresh one if
                     // it's missing or empty -- there's no separate
                     // "does this already exist" branch to write here.
                     let db = Database::create(&path).with_context(|| format!("opening {}", path.display()))?;
+                    restrict_to_owner(&path).with_context(|| format!("restricting permissions on {}", path.display()))?;
                     Ok(Arc::new(db))
                 })
                 .await

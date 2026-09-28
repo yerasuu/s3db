@@ -324,3 +324,29 @@ async fn get_range_errors_when_the_range_exceeds_the_stored_size() {
     b.put_cas("k", b"short".to_vec(), None).await.unwrap();
     assert!(b.get_range("k", 0, 1000).await.is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_bucket_directory_and_database_file_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("bucket");
+    let b = backend(&root);
+    b.put_cas("repos/acme/secret-thing", b"x".to_vec(), None)
+        .await
+        .unwrap();
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+            .permissions()
+            .mode()
+    };
+    assert_eq!(mode(&root) & 0o077, 0, "the bucket directory is group/world readable");
+    assert_eq!(
+        mode(&root.join("s3db.redb")) & 0o077,
+        0,
+        "s3db.redb is group/world readable"
+    );
+}
