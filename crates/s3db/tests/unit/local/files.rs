@@ -140,3 +140,60 @@ async fn get_range_errors_when_the_range_exceeds_the_stored_size() {
     b.put_cas("k", b"short".to_vec(), None).await.unwrap();
     assert!(b.get_range("k", 0, 1000).await.is_err());
 }
+
+/// Regression test for the live half of the two-file tear this module's
+/// own doc describes: before `get` took the shared lock too, it could read
+/// the body and the version-counter sidecar at two different moments, and
+/// a `put_cas` racing in between could hand it a body/etag pair that never
+/// existed together. Simulates that race directly against the same
+/// `<key>.s3dblock` `put_cas` itself locks, instead of trying to land a
+/// real concurrent `put_cas` inside the exact write window -- there is no
+/// reliable way to pause `put_cas` mid-write from outside it.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_waits_out_an_exclusive_lock_instead_of_racing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = std::sync::Arc::new(backend(dir.path()));
+    b.put_cas("k", b"v1".to_vec(), None).await.unwrap();
+    let etag = b.get("k").await.unwrap().1.unwrap();
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+    let lock_path = b.lock_path("k");
+    let hold_events = events.clone();
+    let holder = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::lock(&file).unwrap();
+        hold_events.lock().unwrap().push("locked");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        hold_events.lock().unwrap().push("unlocked");
+        // Dropping `file` here releases the flock.
+    });
+    // Gives the holder above a moment to actually acquire the lock before
+    // the read below tries to race it -- otherwise both could plausibly
+    // start from "unlocked" and this would pass for the wrong reason.
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let get_events = events.clone();
+    let reader = std::sync::Arc::clone(&b);
+    let getter = tokio::spawn(async move {
+        let result = reader.get("k").await.unwrap();
+        get_events.lock().unwrap().push("got");
+        result
+    });
+
+    holder.await.unwrap();
+    let (bytes, got_etag) = getter.await.unwrap();
+
+    assert_eq!(bytes, b"v1");
+    assert_eq!(got_etag.as_deref(), Some(etag.as_str()));
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["locked", "unlocked", "got"],
+        "get must wait for the exclusive lock to be released, not race it"
+    );
+}

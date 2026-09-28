@@ -134,10 +134,15 @@ async fn refuses_an_unbootstrapped_bucket_and_leaves_it_untouched() {
 
     assert!(!out.success);
     assert!(out.stderr.contains("never bootstrapped"), "{}", out.stderr);
-    assert_eq!(
-        std::fs::read_dir(dir.path()).unwrap().count(),
-        0,
-        "nothing may have been created"
+    // The read this refusal takes along the way now locks the key it looked
+    // for (`get` takes a shared lock too, see `local::files::lock_key`'s own
+    // doc for why) -- an empty `.s3dblock` sidecar and the directory that
+    // holds it are the harmless cost of that, not a bucket config. The
+    // actual invariant this test guards is narrower: the encryption config
+    // a real bootstrap would have written must not exist.
+    assert!(
+        !dir.path().join(s3db::bootstrap::ENCRYPTION_META_KEY).exists(),
+        "must never write a bucket's encryption config just from being asked to read it"
     );
 }
 

@@ -19,10 +19,15 @@
 //!
 //! The version counter is also its own crash hazard: `put_cas` writes the
 //! body and the counter as two *separate* atomic files
-//! ([`FilesBackend::put_cas`], not one transaction), so a crash between
-//! them leaves the new body readable under the old etag until the next
-//! successful write on that key happens to resync them. `RedbBackend`
-//! doesn't have this window — body and version commit together, one
+//! ([`FilesBackend::put_cas`], not one transaction). A concurrent `get`
+//! can no longer observe that tear *live* — every read now takes the same
+//! `<key>.s3dblock` in shared mode, so it waits out an in-flight `put_cas`
+//! rather than racing it (see [`lock_key`]'s own doc for exactly what this
+//! does and doesn't cover). What no lock can fix: a process that crashes
+//! between the two writes leaves the new body readable under the old etag
+//! until the next successful write on that key happens to resync them —
+//! there is no lock left to wait on once the holder is dead. `RedbBackend`
+//! doesn't have this window at all — body and version commit together, one
 //! transaction, always. See [`crate::local::redb_backend`] for the
 //! alternative that replaces all of this hand-rolled CAS with a real
 //! embedded transaction engine.
@@ -203,9 +208,24 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
     fsync_dir(dir).await
 }
 
-/// Opens (creating if missing) and exclusively locks `<key>.s3dblock`,
-/// serializing every write to this one key — across processes on this
-/// machine (see module doc), and across tasks within this one.
+/// Opens (creating if missing) and locks `<key>.s3dblock`, serializing
+/// access to this one key — across processes on this machine (see module
+/// doc), and across tasks within this one. `exclusive` picks the mode: a
+/// writer needs [`Backend::put_cas`]/[`Backend::delete`] to be the only
+/// one touching the key, a reader ([`Backend::get`] and friends) only needs
+/// to keep a writer from being mid-way through its own two-file update —
+/// concurrent readers don't conflict with each other, so they take the
+/// shared lock instead and never wait on one another.
+///
+/// This closes the *live* half of the two-file tear
+/// [`FilesBackend::put_cas`]'s own doc describes (a `get` racing a `put_cas`
+/// on the same key can no longer observe the new body under the old
+/// version, since it now waits for that `put_cas` to release the exclusive
+/// lock first). It does **not** close the crash-only half: a process that
+/// dies between the two writes releases the lock along with everything
+/// else, so the *next* reader still finds whatever the crash left, body and
+/// version out of sync — there is no lock that survives the holder dying.
+/// Only `RedbBackend`'s real transaction removes that window entirely.
 ///
 /// `flock` is a blocking syscall, and `fs4`'s tokio support only forwards
 /// to it directly rather than offloading it, so waiting for a contended
@@ -222,7 +242,7 @@ async fn write_atomic_from_file(path: &Path, source: &Path) -> Result<()> {
 /// expected cost, and the runtime stays free to drive the lock holder to
 /// completion. The lock lives on the file descriptor, and `from_std` keeps
 /// the same one, so the returned handle still owns it.
-async fn lock_key(lock_path: &Path) -> Result<File> {
+async fn lock_key(lock_path: &Path, exclusive: bool) -> Result<File> {
     if let Some(dir) = lock_path.parent() {
         create_dir_private(dir).await?;
     }
@@ -234,10 +254,15 @@ async fn lock_key(lock_path: &Path) -> Result<File> {
         .open(lock_path)
         .await
         .with_context(|| format!("opening {}", lock_path.display()))?;
-    let context = format!("taking exclusive lock on {}", lock_path.display());
+    let mode = if exclusive { "exclusive" } else { "shared" };
+    let context = format!("taking {mode} lock on {}", lock_path.display());
     let std_file = file.into_std().await;
     let locked = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-        fs4::FileExt::lock(&std_file)?;
+        if exclusive {
+            fs4::FileExt::lock(&std_file)?;
+        } else {
+            fs4::FileExt::lock_shared(&std_file)?;
+        }
         Ok(std_file)
     })
     .await
@@ -254,19 +279,25 @@ impl Backend for FilesBackend {
 
     async fn get(&self, key: &str) -> Result<(Vec<u8>, Option<String>)> {
         validate_key(key)?;
+        let lock_file = lock_key(&self.lock_path(key), false).await?;
         let data_path = self.data_path(key);
         let bytes = match fs::read(&data_path).await {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                drop(lock_file);
+                return Ok((Vec::new(), None));
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", data_path.display())),
         };
         let etag = read_rev(&self.rev_path(key)).await?.map(|n| n.to_string());
+        drop(lock_file);
         Ok((bytes, etag))
     }
 
     async fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         validate_key(key)?;
+        let lock_file = lock_key(&self.lock_path(key), false).await?;
         let data_path = self.data_path(key);
         let mut file = File::open(&data_path)
             .await
@@ -278,12 +309,13 @@ impl Backend for FilesBackend {
         file.read_exact(&mut buf)
             .await
             .with_context(|| format!("reading {len} bytes at offset {offset} of {}", data_path.display()))?;
+        drop(lock_file);
         Ok(buf)
     }
 
     async fn put_cas(&self, key: &str, body: Vec<u8>, expected_etag: Option<&str>) -> Result<Cas> {
         validate_key(key)?;
-        let lock_file = lock_key(&self.lock_path(key)).await?;
+        let lock_file = lock_key(&self.lock_path(key), true).await?;
         let rev_path = self.rev_path(key);
         let current = read_rev(&rev_path).await?;
         let current_etag = current.map(|n| n.to_string());
@@ -299,7 +331,7 @@ impl Backend for FilesBackend {
 
     async fn delete(&self, key: &str) -> Result<DeleteOutcome> {
         validate_key(key)?;
-        let lock_file = match lock_key(&self.lock_path(key)).await {
+        let lock_file = match lock_key(&self.lock_path(key), true).await {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("warning: couldn't delete {key}: {e:#}");
@@ -351,7 +383,7 @@ impl Backend for FilesBackend {
     #[cfg(feature = "streaming")]
     async fn put_stream(&self, key: &str, source: &Path) -> Result<()> {
         validate_key(key)?;
-        let lock_file = lock_key(&self.lock_path(key)).await?;
+        let lock_file = lock_key(&self.lock_path(key), true).await?;
         let rev_path = self.rev_path(key);
         let next = read_rev(&rev_path).await?.unwrap_or(0) + 1;
         write_atomic_from_file(&self.data_path(key), source).await?;
@@ -363,12 +395,17 @@ impl Backend for FilesBackend {
     #[cfg(feature = "streaming")]
     async fn get_stream(&self, key: &str, dest: &Path) -> Result<()> {
         validate_key(key)?;
+        let lock_file = lock_key(&self.lock_path(key), false).await?;
         let data_path = self.data_path(key);
-        match fs::copy(&data_path, dest).await {
+        let result = match fs::copy(&data_path, dest).await {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("{key} doesn't exist in local storage"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(anyhow::anyhow!("{key} doesn't exist in local storage"))
+            }
             Err(e) => Err(e).with_context(|| format!("reading {}", data_path.display())),
-        }
+        };
+        drop(lock_file);
+        result
     }
 }
 
