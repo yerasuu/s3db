@@ -315,8 +315,21 @@ impl Collection {
                 // so `Cas::Conflict` here just means someone else already
                 // wrote this exact archive entry — fine. Only a genuine `Err`
                 // (backend/crypto failure) needs to propagate.
-                backend.put_cas(&history_key, resealed, None).await?;
-                self.archive_history_timestamp(backend, cipher, name, etag).await?;
+                //
+                // Run concurrently with its own timestamp write: both derive
+                // entirely from the *old* value already read above, so
+                // neither depends on the other's completion. The main `put`
+                // below stays strictly sequential after both, though --
+                // `ReadSnapshot::get` falls back to the live value whenever
+                // it finds no archived version retired after its `as_of_ms`,
+                // so a racing snapshot read must never observe the new
+                // value live before this archive has actually landed.
+                let (archive, timestamp) = tokio::join!(
+                    backend.put_cas(&history_key, resealed, None),
+                    self.archive_history_timestamp(backend, cipher, name, etag),
+                );
+                archive?;
+                timestamp?;
             }
         }
         let cas = self.put(backend, cipher, name, value, expected_etag).await?;
