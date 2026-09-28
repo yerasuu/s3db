@@ -1,6 +1,6 @@
 # s3db
 
-Typed, encrypted, CAS-consistent database over S3-compatible object storage (S3, R2, Azure Blob, GCS, or a plain local directory). A `Backend`, a passphrase, and typed values in and out is the whole surface — no daemon, no coordination service.
+Typed, encrypted, CAS-consistent database over S3-compatible object storage (S3, R2, or a plain local directory). A `Backend`, a passphrase, and typed values in and out is the whole surface — no daemon, no coordination service.
 
 Full reasoning and trade-offs for everything below live in the module docs (`cargo doc --open`, or [docs.rs](https://docs.rs/s3db)). This is the map, not the territory.
 
@@ -23,8 +23,6 @@ USERS.put(&backend, &cipher, "alice", &user, etag.as_deref()).await?;
 |---|---|
 | `s3` | `S3Params { bucket, region, endpoint_url, access_key_id, secret_access_key, path_style }` |
 | `r2` | `R2Params { bucket, account_id, access_key_id, secret_access_key }` |
-| `azure` | `AzureParams { bucket, account_name, tenant_id, client_id, client_secret }` |
-| `gcs` | `GcsParams { bucket, service_account_json_path }` |
 | `local` | `LocalParams { bucket, engine }` — a filesystem directory, `engine = "redb"` (single file, real ACID CAS) or the deprecated `"files"` |
 
 Every tuning type — `ResilienceConfig`, `CacheConfig`, `GcConfig`, `ExpiryConfig`, `LsmMaintenanceConfig`, `MemoryBudget`, `EncryptionMode` — loads from the same config file, `#[serde(default)]` so it only spells out what it changes:

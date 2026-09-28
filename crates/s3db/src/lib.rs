@@ -1,9 +1,9 @@
-//! `s3db`: a typed database over S3-compatible object storage (S3, R2,
-//! Azure Blob, GCS, or a plain local directory), encryption mandatory,
-//! CAS-consistent. A `Backend`, a passphrase, and typed values in and out
-//! is the whole surface.
+//! `s3db`: a typed database over S3-compatible object storage (S3, R2, or a
+//! plain local directory), encryption mandatory, CAS-consistent. A
+//! `Backend`, a passphrase, and typed values in and out is the whole
+//! surface.
 //!
-//! [`backend::Backend`] is the storage abstraction (5 implementors, one per
+//! [`backend::Backend`] is the storage abstraction (3 implementors, one per
 //! driver); [`cipher::Cipher`]/[`bootstrap`] handle mandatory encryption at
 //! rest; [`payload`] is the raw encrypted-object primitive everything else
 //! builds on (MessagePack on the wire, see [`cipher::CompressionStrategy`]
@@ -57,8 +57,6 @@ pub mod txn;
 pub mod txn_update;
 pub mod wal;
 
-mod azure;
-mod gcs;
 mod local;
 mod s3;
 
@@ -71,7 +69,7 @@ pub use cache::{CacheBacking, CacheConfig, CachedBackend, TypedCache};
 pub use cipher::{Cipher, CipherAlgorithm, CompressionStrategy, EncryptionMode};
 pub use coalescer::WriteCoalescer;
 pub use collection::{Collection, KeyEntropy, MAX_UPDATE_ATTEMPTS, PurgeState, Singleton, Tombstone, Update};
-pub use config::{AzureParams, BackendConfig, GcsParams, LocalEngine, LocalParams, R2Params, S3Params};
+pub use config::{BackendConfig, LocalEngine, LocalParams, R2Params, S3Params};
 pub use gc::{GcConfig, GcReport};
 pub use health::HealthProbe;
 pub use index::{IndexKey, SecondaryIndex, Segment};
@@ -105,7 +103,5 @@ pub use txn_update::{UpdateOp, UpdateReport, recover_stale_updates, run_update};
 /// (`#[entity(collection = "...")]`, `#[entity(key)]`, `#[entity(index)]`).
 pub use s3db_macros::Entity;
 
-pub use azure::AzureBackend;
-pub use gcs::GcsBackend;
 pub use local::{FilesBackend, LocalBackend, RedbBackend};
 pub use s3::S3Backend;

@@ -10,7 +10,7 @@
 //!
 //! On [`crate::atomic::AtomicBackend`] (today `redb`) none of this is needed —
 //! [`run_update`] delegates to the native transaction. What follows is for
-//! S3/R2/Azure/GCS, where `put_cas` is the only primitive there is.
+//! S3/R2, where `put_cas` is the only primitive there is.
 //!
 //! # The protocol
 //!

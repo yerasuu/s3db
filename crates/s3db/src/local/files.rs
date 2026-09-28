@@ -15,7 +15,7 @@
 //! no meaning across a network filesystem shared by two different hosts,
 //! so this driver is scoped to "one deployment, one machine", not a
 //! shared/clustered setup. Don't point two separate machines at the same
-//! NFS-mounted root and expect the same safety S3/R2/Azure/GCS give.
+//! NFS-mounted root and expect the same safety S3/R2 give.
 //!
 //! The version counter is also its own crash hazard: `put_cas` writes the
 //! body and the counter as two *separate* atomic files

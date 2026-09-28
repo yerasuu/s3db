@@ -139,10 +139,10 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// (`docs/s3db-fulldb-roadmap.md` phase 2): a point lookup or range scan
     /// fetches only the footer and the one or two blocks it actually needs,
     /// never a whole multi-megabyte SSTable object. Every driver here
-    /// already speaks HTTP and supports native byte-range reads (S3/R2/GCS/
-    /// Azure via the standard `Range` header, `Local`/`Redb` via a seek or a
-    /// slice) — mechanical per driver, not a capability that had to be
-    /// invented. Required (not feature-gated like streaming): unlike large
+    /// already speaks HTTP and supports native byte-range reads (S3/R2 via
+    /// the standard `Range` header, `Local`/`Redb` via a seek or a slice) —
+    /// mechanical per driver, not a capability that had to be invented.
+    /// Required (not feature-gated like streaming): unlike large
     /// blobs, every existing driver can give this for free, there's no
     /// dependency or memory-profile tradeoff to opt out of.
     ///
@@ -208,9 +208,7 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// The cursor is a **key**, not an opaque provider token, so it is
     /// portable and stateless: a caller can persist one, resume a sweep in
     /// another process, or hand it to a different driver over the same
-    /// data. That costs the drivers whose SDKs only offer opaque
-    /// continuation tokens (Azure, GCS) the ability to push the cursor
-    /// down, which is what the default body below is for.
+    /// data.
     ///
     /// **The default body bounds the caller, not the driver.** It lists the
     /// whole prefix, sorts it, and slices out the page -- so every driver is
@@ -282,8 +280,6 @@ pub fn build_backend(cfg: &BackendConfig) -> Result<Arc<dyn Backend>> {
     Ok(match cfg {
         BackendConfig::S3(params) => Arc::new(crate::s3::S3Backend::new(params)?),
         BackendConfig::R2(params) => Arc::new(crate::s3::S3Backend::new_r2(params)?),
-        BackendConfig::Azure(params) => Arc::new(crate::azure::AzureBackend::new(params)),
-        BackendConfig::Gcs(params) => Arc::new(crate::gcs::GcsBackend::new(params)),
         BackendConfig::Local(params) => Arc::new(crate::local::LocalBackend::new(params)),
     })
 }

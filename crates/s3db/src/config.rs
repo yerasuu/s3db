@@ -26,8 +26,6 @@ pub type Secret = Zeroizing<String>;
 pub enum BackendConfig {
     S3(S3Params),
     R2(R2Params),
-    Azure(AzureParams),
-    Gcs(GcsParams),
     Local(LocalParams),
 }
 
@@ -139,44 +137,3 @@ pub enum LocalEngine {
     Redb,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct AzureParams {
-    /// The literal Azure Blob container name — same reasoning as
-    /// [`S3Params::bucket`] (kept as `bucket` rather than `container` so
-    /// every driver's config shares one field name for its physical
-    /// storage target).
-    pub bucket: String,
-    /// Storage account name — still needed to build the
-    /// `https://<account_name>.blob.core.windows.net/` service URL even
-    /// though auth itself no longer goes through this account (see below).
-    pub account_name: String,
-    /// Entra ID app registration's directory (tenant) id. The
-    /// `azure_storage_blob` crate line paired with `azure_core` 1.x dropped
-    /// account-key/HMAC auth entirely — only `azure_identity` credentials
-    /// are supported, so `account_key` is gone in favor of these three.
-    pub tenant_id: String,
-    pub client_id: String,
-    pub client_secret: Secret,
-}
-
-impl std::fmt::Debug for AzureParams {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AzureParams")
-            .field("bucket", &self.bucket)
-            .field("account_name", &self.account_name)
-            .field("tenant_id", &self.tenant_id)
-            .field("client_id", &self.client_id)
-            .field("client_secret", &"REDACTED")
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GcsParams {
-    /// The literal GCS bucket name — same reasoning as [`S3Params::bucket`].
-    pub bucket: String,
-    /// Path to a service-account JSON key file. Read lazily, on this
-    /// driver's first real request (see [`crate::gcs`]'s module doc), not
-    /// at startup.
-    pub service_account_json_path: String,
-}

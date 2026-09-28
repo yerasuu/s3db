@@ -12,7 +12,7 @@
 //! [`Blob`] is the middle: a value that spans several objects but is still
 //! addressed, encrypted, and compare-and-swapped as *one* thing. It needs no
 //! feature flag and no driver support beyond [`Backend`]'s required surface,
-//! so it works identically on S3, R2, Azure, GCS, and a local directory.
+//! so it works identically on S3, R2, and a local directory.
 //!
 //! ```text
 //! <prefix>/<name>.json                      manifest (sealed, CAS'd, the blob's identity)

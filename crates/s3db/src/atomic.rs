@@ -2,8 +2,8 @@
 //! several ops (including updates, not just creates) in one real
 //! transaction, all-or-nothing. Only a backend with a native transaction can
 //! honestly give this — see `docs/s3db-local-mode.md` for why that's
-//! [`crate::local::RedbBackend`] and nothing else today. `S3`/`R2`/`Azure`/
-//! `Gcs` keep relying on [`crate::txn::run`]'s CAS-sequential protocol
+//! [`crate::local::RedbBackend`] and nothing else today. `S3`/`R2` keep
+//! relying on [`crate::txn::run`]'s CAS-sequential protocol
 //! (`TxnRecord` + crash recovery), which is the only way to approximate
 //! atomicity without a native transaction to lean on.
 //!

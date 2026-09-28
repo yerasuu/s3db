@@ -59,21 +59,6 @@ aws-sdk-s3 = { version = "1.140.0", default-features = false, features = [
     "rt-tokio",
 ] }
 aws-smithy-runtime-api = { version = "1.14.0", features = ["client"] }
-azure_core = { version = "1.1.0", default-features = false, features = [
-    "reqwest_rustls",
-    "tokio",
-] }
-# azure_storage/azure_storage_blobs topped out at 0.21 (permanently pinned to azure_core
-# ^0.21) — the account-key/HMAC generation. azure_core ^1.1 is a different, typespec-based
-# generation that only ships auth via azure_identity (Entra ID/OAuth), hence the credential
-# switch in AzureParams from account_key to tenant/client id/secret.
-azure_storage_blob = { version = "1.1.0-beta.1", default-features = false, features = [
-    "tokio",
-] }
-azure_identity = { version = "1.0.0", default-features = false }
-google-cloud-auth = "1.15.0"
-google-cloud-gax = "1.13.0"
-google-cloud-storage = "1.17.0"
 
 getrandom = "0.4.3"
 

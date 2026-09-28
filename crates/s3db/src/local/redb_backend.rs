@@ -46,11 +46,10 @@ const DB_FILENAME: &str = "s3db.redb";
 #[derive(Debug)]
 pub struct RedbBackend {
     /// Directory holding `s3db.redb` — kept rather than the open `Database`
-    /// itself so construction stays synchronous and infallible, matching
-    /// every other driver's `new()` (see [`crate::gcs`]'s module doc for the
-    /// same deferred-construction reasoning; opening a redb file is a
-    /// blocking filesystem call, not an async one, but the "don't fail at
-    /// construction" principle is the same).
+    /// itself so construction stays synchronous and infallible, deferring
+    /// the real filesystem work to first use: opening a redb file is a
+    /// blocking call, not an async one, but the "don't fail at
+    /// construction" principle is the same as every other driver's `new()`.
     root: PathBuf,
     db: OnceCell<Arc<Database>>,
 }

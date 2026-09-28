@@ -1,6 +1,6 @@
 # s3db
 
-Typed, encrypted, CAS-consistent database over object storage — S3, R2, Azure Blob, GCS, or a plain local directory. No daemon, no coordination service, no extra port: a `Backend`, a passphrase, and typed values in and out is the whole surface.
+Typed, encrypted, CAS-consistent database over object storage — S3, R2, or a plain local directory. No daemon, no coordination service, no extra port: a `Backend`, a passphrase, and typed values in and out is the whole surface.
 
 Extracted from gitquarry, where it started as storage plumbing that turned out to have no dependency on the host application at all.
 

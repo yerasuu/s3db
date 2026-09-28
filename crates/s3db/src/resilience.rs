@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Sizing/policy for the whole stack. Connection-pool sizing for the
-/// underlying HTTP client (`s3`/`azure`/`gcs`'s own driver construction)
+/// underlying HTTP client (`s3`'s own driver construction)
 /// isn't a field here -- it's configured once, at driver-construction time,
 /// not per-call -- but it should be sized to match (not exceed)
 /// `max_concurrent_get + max_concurrent_put + max_concurrent_list`, with
