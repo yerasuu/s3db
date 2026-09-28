@@ -120,6 +120,18 @@ impl Default for ResilienceConfig {
     }
 }
 
+/// What [`build_resilient_backend`] hands back. [`Self::backend`] is what
+/// every caller (`Collection`, `SecondaryIndex`, `txn::run`, ...) uses.
+/// [`Self::spool`] is `Some` exactly when the stack actually wrapped `inner`
+/// in a [`crate::spool::SpooledBackend`] (a non-local driver — see
+/// [`build_resilient_backend`]'s own doc) — the concrete handle
+/// [`crate::spool::SpooledBackend::recover_pending`] needs, which is
+/// otherwise unreachable once erased into `Arc<dyn Backend>`.
+pub struct ResilientBackend {
+    pub backend: Arc<dyn Backend>,
+    pub spool: Option<Arc<crate::spool::SpooledBackend>>,
+}
+
 /// Builds the fixed composition order this module's doc comment describes.
 ///
 /// [`crate::spool::SpooledBackend`] wraps every `inner` except one that's
@@ -130,20 +142,21 @@ pub fn build_resilient_backend(
     inner: Arc<dyn Backend>,
     config: ResilienceConfig,
     metrics: SharedMetrics,
-) -> Arc<dyn Backend> {
+) -> ResilientBackend {
     let is_local = inner.as_any().downcast_ref::<crate::local::LocalBackend>().is_some();
     let throttled: Arc<dyn Backend> = Arc::new(ThrottledBackend::new(inner, &config));
     let retried: Arc<dyn Backend> = Arc::new(RetryBackend::new(throttled, config.max_retries, config.base_backoff));
     let cached: Arc<dyn Backend> = Arc::new(CachedBackend::new(retried, config.cache.clone()));
-    let spooled: Arc<dyn Backend> = if is_local {
-        cached
+    let (spooled, spool): (Arc<dyn Backend>, Option<Arc<crate::spool::SpooledBackend>>) = if is_local {
+        (cached, None)
     } else {
-        Arc::new(crate::spool::SpooledBackend::new(
-            cached,
-            config.local_dir.join("spool"),
-        ))
+        let spool = Arc::new(crate::spool::SpooledBackend::new(cached, config.local_dir.join("spool")));
+        (Arc::clone(&spool) as Arc<dyn Backend>, Some(spool))
     };
-    Arc::new(MeteredBackend::new(spooled, metrics))
+    ResilientBackend {
+        backend: Arc::new(MeteredBackend::new(spooled, metrics)),
+        spool,
+    }
 }
 
 /// Records a counter per call (`s3db_backend_<op>_total`) and per outcome

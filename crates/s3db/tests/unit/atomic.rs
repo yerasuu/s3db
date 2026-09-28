@@ -211,7 +211,8 @@ async fn the_transaction_survives_the_whole_resilience_stack() {
         raw,
         crate::resilience::ResilienceConfig::default(),
         Arc::new(crate::metrics::NoopMetrics),
-    );
+    )
+    .backend;
 
     let atomic = stacked
         .as_atomic()
@@ -290,7 +291,8 @@ async fn a_backend_without_the_capability_still_answers_none() {
         files,
         crate::resilience::ResilienceConfig::default(),
         Arc::new(crate::metrics::NoopMetrics),
-    );
+    )
+    .backend;
     assert!(
         stacked.as_atomic().is_none(),
         "a decorator must not invent a capability its inner backend lacks"

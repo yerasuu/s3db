@@ -89,7 +89,8 @@ pub use payload::{
 pub use range::RangeBackend;
 pub use request_cache::RequestCache;
 pub use resilience::{
-    CircuitBreakerConfig, MeteredBackend, ResilienceConfig, RetryBackend, ThrottledBackend, build_resilient_backend,
+    CircuitBreakerConfig, MeteredBackend, ResilienceConfig, ResilientBackend, RetryBackend, ThrottledBackend,
+    build_resilient_backend,
 };
 pub use sharded_index::{ShardEpoch, ShardedIndex};
 pub use snapshot::{ReadSnapshot, SnapshotLease};

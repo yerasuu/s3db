@@ -376,7 +376,7 @@ async fn a_cached_read_is_served_while_the_circuit_breaker_is_open() {
         },
         ..ResilienceConfig::default()
     };
-    let stack = build_resilient_backend(flaky.clone(), config, Arc::new(RecordingMetrics::default()));
+    let stack = build_resilient_backend(flaky.clone(), config, Arc::new(RecordingMetrics::default())).backend;
 
     // Write-through populates the cache with the confirmed bytes.
     stack.put_cas("cached", b"v1".to_vec(), None).await.unwrap();
@@ -404,7 +404,9 @@ async fn build_resilient_backend_roundtrips_through_the_whole_stack() {
     let dir = tempfile::tempdir().unwrap();
     let inner = local(dir.path());
     let metrics = Arc::new(RecordingMetrics::default());
-    let stack = build_resilient_backend(inner, ResilienceConfig::default(), metrics);
+    let built = build_resilient_backend(inner, ResilienceConfig::default(), metrics);
+    assert!(built.spool.is_none(), "a LocalBackend inner must never be spooled");
+    let stack = built.backend;
 
     assert_eq!(stack.put_cas("k", b"v1".to_vec(), None).await.unwrap(), Cas::Ok);
     let (bytes, etag) = stack.get("k").await.unwrap();
@@ -462,7 +464,9 @@ async fn a_local_inner_never_gets_spooled() {
         local_dir: local_dir.clone(),
         ..ResilienceConfig::default()
     };
-    let stack = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+    let built = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+    assert!(built.spool.is_none());
+    let stack = built.backend;
 
     stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
 
@@ -483,12 +487,22 @@ async fn a_non_local_inner_is_always_spooled() {
         local_dir: local_dir.clone(),
         ..ResilienceConfig::default()
     };
-    let stack = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+    let built = build_resilient_backend(inner, config, Arc::new(RecordingMetrics::default()));
+    let spool = built.spool.clone().expect("a non-local inner must always be spooled");
+    let stack = built.backend;
 
     stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
 
     assert!(
         local_dir.join("spool").join("spool.redb").exists(),
         "spooling must be unconditional for anything that isn't actually local"
+    );
+    assert_eq!(
+        spool.recover_pending().await.unwrap(),
+        crate::spool::RecoveryReport {
+            resolved: 0,
+            still_pending: 0
+        },
+        "a normal successful write must leave nothing pending"
     );
 }
