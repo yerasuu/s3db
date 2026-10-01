@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.6.1
+
+### Resilience
+
+- `spool::SpooledBackend`: one `redb` file per instance
+  (`<spool_root>/<random>.redb`) instead of a fixed `spool.redb`. `redb`
+  locks its file exclusively, so a second backend on the same directory —
+  in the same process or another one — failed every `put_cas` with
+  "Database already open".
+- `SpooledBackend::recover_pending` also adopts sibling files nobody holds
+  open and older than `MIN_ORPHAN_AGE` (60 s), replays them onto its own
+  `inner`, and deletes each once drained. Picks up a pre-0.6.1
+  `spool.redb` the same way.
+- `WriteSpool` removes its own file on drop when nothing is pending.
+- `ResilienceConfig::local_dir`: documented as one directory per backend.
+
 ## v0.6.0
 
 ### Backend drivers
