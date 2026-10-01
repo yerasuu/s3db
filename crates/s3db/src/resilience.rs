@@ -93,6 +93,11 @@ pub struct ResilienceConfig {
     /// protection this crate now always provides for a remote driver. Still
     /// fully configurable — a config file overrides it like any other field
     /// here, this just removes the option to end up with nothing set.
+    ///
+    /// One directory per backend: several processes may share it (each
+    /// spools to its own file), but two *different* backends must not, since
+    /// recovery replays every orphaned file under it onto its own `inner` —
+    /// see [`crate::spool`].
     pub local_dir: PathBuf,
     pub max_concurrent_get: usize,
     pub max_concurrent_put: usize,

@@ -471,7 +471,7 @@ async fn a_local_inner_never_gets_spooled() {
     stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
 
     assert!(
-        !local_dir.join("spool").join("spool.redb").exists(),
+        !local_dir.join("spool").exists(),
         "a local inner must never be wrapped in SpooledBackend"
     );
 }
@@ -494,7 +494,7 @@ async fn a_non_local_inner_is_always_spooled() {
     stack.put_cas("k", b"v".to_vec(), None).await.unwrap();
 
     assert!(
-        local_dir.join("spool").join("spool.redb").exists(),
+        std::fs::read_dir(local_dir.join("spool")).unwrap().count() == 1,
         "spooling must be unconditional for anything that isn't actually local"
     );
     assert_eq!(
