@@ -186,17 +186,17 @@ async fn get_entry(
     Ok(Json(rmpv_to_json(raw)))
 }
 
-/// Convierte cualquier `rmpv::Value` a `serde_json::Value`. Los dos tipos que
-/// JSON no tiene se codifican como string en vez de hacer fallar la
-/// conversión entera:
-/// - `Binary` → `"base64:<...>"` (el caso real: un `Uuid` u otro campo que
-///   serializa como bytes crudos en MessagePack).
-/// - `Ext` (tipo, bytes) → `"ext:<tipo>:base64:<...>"` — este crate no
-///   escribe extensiones msgpack hoy, pero un lector genérico no debería
-///   asumirlo para siempre.
-/// Un entero fuera del rango de `i64`/`u64` (posible en teoría, msgpack
-/// soporta hasta u64 completo y esto ya lo cubre) cae a su representación en
-/// texto antes que perder precisión silenciosamente redondeando a `f64`.
+/// Converts any `rmpv::Value` to a `serde_json::Value`. The two types JSON
+/// lacks are encoded as strings instead of failing the whole conversion:
+/// - `Binary` → `"base64:<...>"` (the real case: a `Uuid` or another field
+///   that serializes as raw bytes in MessagePack).
+/// - `Ext` (type, bytes) → `"ext:<type>:base64:<...>"` — this crate writes
+///   no msgpack extensions today, but a generic reader shouldn't assume
+///   that forever.
+///
+/// An integer outside the `i64`/`u64` range (possible in theory; msgpack
+/// goes up to a full u64 and that is already covered) falls back to its text
+/// form rather than silently losing precision by rounding to `f64`.
 fn rmpv_to_json(value: rmpv::Value) -> serde_json::Value {
     use rmpv::Value as V;
     use serde_json::Value as J;

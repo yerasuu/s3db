@@ -104,10 +104,7 @@ impl Bloom {
             body.len(),
             word_count * 8
         );
-        let bits = body
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let bits = body.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c)).collect();
         Ok(Bloom { bits, num_bits, k })
     }
 }
