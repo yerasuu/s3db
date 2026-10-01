@@ -150,7 +150,10 @@ pub fn build_resilient_backend(
     let (spooled, spool): (Arc<dyn Backend>, Option<Arc<crate::spool::SpooledBackend>>) = if is_local {
         (cached, None)
     } else {
-        let spool = Arc::new(crate::spool::SpooledBackend::new(cached, config.local_dir.join("spool")));
+        let spool = Arc::new(crate::spool::SpooledBackend::new(
+            cached,
+            config.local_dir.join("spool"),
+        ));
         (Arc::clone(&spool) as Arc<dyn Backend>, Some(spool))
     };
     ResilientBackend {

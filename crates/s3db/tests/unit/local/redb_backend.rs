@@ -333,9 +333,7 @@ async fn the_bucket_directory_and_database_file_are_owner_only() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("bucket");
     let b = backend(&root);
-    b.put_cas("repos/acme/secret-thing", b"x".to_vec(), None)
-        .await
-        .unwrap();
+    b.put_cas("repos/acme/secret-thing", b"x".to_vec(), None).await.unwrap();
 
     let mode = |p: &std::path::Path| {
         std::fs::metadata(p)

@@ -136,4 +136,3 @@ pub enum LocalEngine {
     /// Real ACID transactions, native range scans, no CAS emulation.
     Redb,
 }
-

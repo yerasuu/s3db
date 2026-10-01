@@ -110,7 +110,8 @@ impl RedbBackend {
                     // it's missing or empty -- there's no separate
                     // "does this already exist" branch to write here.
                     let db = Database::create(&path).with_context(|| format!("opening {}", path.display()))?;
-                    restrict_to_owner(&path).with_context(|| format!("restricting permissions on {}", path.display()))?;
+                    restrict_to_owner(&path)
+                        .with_context(|| format!("restricting permissions on {}", path.display()))?;
                     Ok(Arc::new(db))
                 })
                 .await

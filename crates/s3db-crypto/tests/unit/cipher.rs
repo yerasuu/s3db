@@ -313,7 +313,9 @@ fn nonces_issued_is_always_zero_off_aes_gcm() {
 fn seeding_a_fresh_cipher_carries_the_budget_across_a_simulated_restart() {
     let before_restart = Cipher::derive_with("pw", &[7u8; SALT_LEN], CipherAlgorithm::Aes256Gcm).unwrap();
     before_restart.seed_nonces_issued((1 << 32) - 1);
-    before_restart.seal("k", b"last one before shutdown", CompressionStrategy::None).unwrap();
+    before_restart
+        .seal("k", b"last one before shutdown", CompressionStrategy::None)
+        .unwrap();
     let persisted_count = before_restart.nonces_issued();
 
     // A fresh `Cipher`, as if this were a new process re-deriving the same

@@ -147,7 +147,12 @@ impl WriteCoalescer {
                     }
                 }
             }
-            self.pending.lock().unwrap().values.entry(key.to_string()).or_insert((seq, value));
+            self.pending
+                .lock()
+                .unwrap()
+                .values
+                .entry(key.to_string())
+                .or_insert((seq, value));
             let this = Arc::clone(self);
             let retry_key = key.to_string();
             tokio::spawn(async move {

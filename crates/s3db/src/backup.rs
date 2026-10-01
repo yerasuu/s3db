@@ -401,17 +401,28 @@ pub async fn restore_collection(
                 progress.entities_restored += 1;
             }
             progress.last_name = names.last().cloned().or(progress.last_name);
-            progress_etag =
-                checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref())
-                    .await?;
+            progress_etag = checkpoint_restore(
+                dest_backend,
+                dest_cipher,
+                &progress_key,
+                &progress,
+                progress_etag.as_deref(),
+            )
+            .await?;
             match next_after {
                 Some(next) => after = Some(next),
                 None => break,
             }
         }
         progress.phase = RestorePhase::Tombstones;
-        progress_etag =
-            checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref()).await?;
+        progress_etag = checkpoint_restore(
+            dest_backend,
+            dest_cipher,
+            &progress_key,
+            &progress,
+            progress_etag.as_deref(),
+        )
+        .await?;
     }
 
     if manifest.includes_tombstones {
@@ -425,16 +436,24 @@ pub async fn restore_collection(
                 break;
             }
             for (key, _size) in &page.entries {
-                let Some(name) = key.strip_prefix(&tombstones_prefix).and_then(|s| s.strip_suffix(".json")) else {
+                let Some(name) = key
+                    .strip_prefix(&tombstones_prefix)
+                    .and_then(|s| s.strip_suffix(".json"))
+                else {
                     continue; // a foreign key under this namespace -- left alone, not guessed at
                 };
                 restore_one_tombstone(&ctx, key, name).await?;
                 progress.tombstones_restored += 1;
             }
             progress.last_key = page.entries.last().map(|(key, _)| key.clone()).or(progress.last_key);
-            progress_etag =
-                checkpoint_restore(dest_backend, dest_cipher, &progress_key, &progress, progress_etag.as_deref())
-                    .await?;
+            progress_etag = checkpoint_restore(
+                dest_backend,
+                dest_cipher,
+                &progress_key,
+                &progress,
+                progress_etag.as_deref(),
+            )
+            .await?;
             match page.next_after {
                 Some(next) => after = Some(next),
                 None => break,

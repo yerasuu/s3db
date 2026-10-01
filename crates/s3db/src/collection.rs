@@ -454,10 +454,9 @@ impl Collection {
         // blip into a real object destroyed with no backup and no trace
         // beyond a warning. Refusing to delete without a confirmed read is
         // the only safe response.
-        let (sealed, etag) = backend
-            .get(&key)
-            .await
-            .with_context(|| format!("reading {name} before deleting it -- refusing to delete without a confirmed read"))?;
+        let (sealed, etag) = backend.get(&key).await.with_context(|| {
+            format!("reading {name} before deleting it -- refusing to delete without a confirmed read")
+        })?;
         let restore_etag = self
             .archive_for_delete(backend, cipher, name, &key, &sealed, etag.as_deref())
             .await?;
@@ -804,7 +803,9 @@ impl Collection {
         let mut names: Vec<String> = Vec::new();
         let mut backend_exhausted = false;
         loop {
-            let page = backend.list_page(&scan_prefix, after_key.as_deref(), limit.max(SCAN_BATCH)).await?;
+            let page = backend
+                .list_page(&scan_prefix, after_key.as_deref(), limit.max(SCAN_BATCH))
+                .await?;
             for (key, _size) in &page.entries {
                 if let Some(name) = self.name_from_key(key, &scan_prefix) {
                     names.push(name);

@@ -80,7 +80,10 @@ async fn a_raw_binary_field_becomes_a_base64_string_instead_of_failing_the_whole
     let dir = tempfile::tempdir().unwrap();
     let (backend, cipher) = test_backend_and_cipher(dir.path());
     let coll = Collection::new("has-uuid-like-field");
-    let value = HasRawBytes { name: "alice".to_string(), id: vec![0xDE, 0xAD, 0xBE, 0xEF] };
+    let value = HasRawBytes {
+        name: "alice".to_string(),
+        id: vec![0xDE, 0xAD, 0xBE, 0xEF],
+    };
     coll.put(&backend, &cipher, "one", &value, None).await.unwrap();
 
     let backend: Arc<dyn Backend> = Arc::new(backend);
