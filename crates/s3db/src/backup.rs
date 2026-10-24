@@ -348,16 +348,11 @@ pub async fn restore_collection(
     .await?;
     etag.with_context(|| format!("no backup {backup_id} found for collection {}", collection.prefix))?;
     let prefix = backup_prefix(backup_id, &collection.prefix)?;
-    // A `Collection` over the backup's own nested prefix -- the backup
-    // lives at the same relative shape (`{prefix}/{name}{suffix}`) as the
-    // live collection, just under `.conf/backups/<id>/` instead of at the
-    // live collection's own prefix, so this is what actually has to be
-    // scanned, not `collection` itself.
-    let backup_view = Collection {
-        suffix: collection.suffix,
-        entropy: collection.entropy,
-        ..Collection::new_owned(prefix.clone())
-    };
+    // A `Collection` over the backup's own nested prefix. `backup_collection`
+    // always writes `{prefix}/{name}.json`, flat, whatever suffix or key
+    // entropy the live collection has, so this must not inherit either: with
+    // them, no backup key matched and restore found nothing, without error.
+    let backup_view = Collection::new_owned(prefix.clone());
     let ctx = RestoreCtx {
         backup_backend,
         backup_cipher,

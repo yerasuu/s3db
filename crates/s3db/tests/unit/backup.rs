@@ -45,6 +45,37 @@ async fn backup_then_restore_roundtrips_every_entity() {
     assert_eq!(value, Some(Widget { count: 2 }));
 }
 
+/// Like gitquarry's per-repo `RepoConfig` (`{prefix}/{name}/.conf/config.json`): the live
+/// keys carry a suffix the backup's own `{name}.json` layout doesn't.
+#[tokio::test]
+async fn backup_then_restore_roundtrips_a_collection_with_a_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, cipher) = test_backend_and_cipher(dir.path(), 32);
+    let coll = Collection::new_with_suffix("configs", "/.conf/config.json");
+    for (name, count) in [("a", 1), ("b", 2)] {
+        coll.put(&backend, &cipher, name, &Widget { count }, None)
+            .await
+            .unwrap();
+    }
+
+    let manifest = backup_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1", true)
+        .await
+        .unwrap();
+    assert_eq!(manifest.entity_count, 2);
+
+    for name in ["a", "b"] {
+        backend.delete(&coll.key(name).unwrap()).await.unwrap();
+    }
+    restore_collection(&backend, &cipher, &backend, &cipher, &coll, "backup1")
+        .await
+        .unwrap();
+    let mut restored = coll.list_names(&backend).await.unwrap();
+    restored.sort();
+    assert_eq!(restored, vec!["a", "b"]);
+    let (value, _) = coll.get::<Widget>(&backend, &cipher, "b").await.unwrap();
+    assert_eq!(value, Some(Widget { count: 2 }));
+}
+
 #[tokio::test]
 async fn backup_includes_tombstones_by_default_and_restore_brings_them_back() {
     let dir = tempfile::tempdir().unwrap();
